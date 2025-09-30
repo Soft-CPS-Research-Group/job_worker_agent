@@ -1,0 +1,25 @@
+[project]
+name = "job-worker-agent"
+version = "0.1.0"
+description = "Worker agent for the OPEVA job queue"
+authors = [
+    {name = "OPEVA Team"}
+]
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "docker>=7.0"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-mock>=3.10"
+]
+
+[project.scripts]
+job-worker-agent = "worker_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=62", "wheel"]
+build-backend = "setuptools.build_meta"
