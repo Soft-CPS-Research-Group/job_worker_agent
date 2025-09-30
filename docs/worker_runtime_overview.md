@@ -30,6 +30,12 @@ worker service.
    `status_poll_interval`, the worker polls `GET /status/<job_id>`.
    - If the response JSON contains `{"status": "stopped"|"canceled"}` the
      worker stops the container and reports that status to the backend.
+7. **Graceful shutdown:** operators can set `WORKER_EXIT_AFTER_JOB=1` (or pass
+   `--exit-after-job`) to terminate after the next job finishes. At runtime a
+   `SIGUSR1` signal triggers the same behaviour.
+
+Worker logs (agent control flow) go to stdout/stderr, while job stdout/stderr is
+persisted to `<shared_dir>/jobs/<job_id>/logs/<job_id>.log`.
 
 ## Job payload contract
 
@@ -68,6 +74,7 @@ reads matching environment variables:
 | `--poll-interval` | `POLL_INTERVAL` | `5` seconds |
 | `--heartbeat-interval` | `WORKER_HEARTBEAT_INTERVAL` | `30` seconds |
 | `--status-poll-interval` | `STATUS_POLL_INTERVAL` | `10` seconds |
+| `--exit-after-job` | `WORKER_EXIT_AFTER_JOB` | `False` |
 | `--log-level` | `LOG_LEVEL` | `INFO` |
 
 Setting `--status-poll-interval 0` disables cooperative cancellation checks but

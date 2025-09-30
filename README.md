@@ -70,8 +70,18 @@ Environment variables:
 | `WORKER_HEARTBEAT_INTERVAL` | Heartbeat interval in seconds. |
 | `STATUS_POLL_INTERVAL` | How often to check job status while running (seconds). |
 | `LOG_LEVEL` | Python logging level (`INFO`, `DEBUG`, …). |
+| `WORKER_EXIT_AFTER_JOB` | Set to `1`/`true` to stop polling after the next job finishes. |
 
 Start additional containers if you need multiple jobs running in parallel.
+
+### Monitoring and control
+
+- The worker writes its own logs to stdout/stderr—inspect them with
+  `docker logs job-worker-<worker_id>`.
+- Job payload logs are persisted to the shared directory at
+  `<shared_dir>/jobs/<job_id>/logs/<job_id>.log`.
+- Send `SIGUSR1` to the container (e.g. `docker kill --signal=USR1 job-worker-<id>`) to
+  request a graceful shutdown after the current job completes.
 
 ## Tests (optional)
 

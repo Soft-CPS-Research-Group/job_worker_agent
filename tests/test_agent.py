@@ -162,6 +162,54 @@ def test_poll_once_dispatches_job(monkeypatch):
     assert handled is True
 
 
+def test_exit_after_job_stops_worker(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    job_payload = {"job_id": "job-exit", "config_path": "cfg.yaml", "job_name": "Demo"}
+    session.next_job_responses.append(DummyResponse(200, job_payload))
+    container = DummyContainer(exit_code=0)
+    docker_client = DummyDockerClient(container)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="img",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        exit_after_job=True,
+        status_poll_interval=0.0,
+        heartbeat_interval=0,
+    )
+
+    handled = agent.poll_once()
+    assert handled is True
+    assert agent._stop_event.is_set() is True
+
+
+def test_request_exit_after_current_job_when_idle(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    container = DummyContainer(exit_code=0)
+    docker_client = DummyDockerClient(container)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="img",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.0,
+        heartbeat_interval=0,
+    )
+
+    agent.request_exit_after_current_job()
+    assert agent._stop_event.is_set() is True
+
+
 def test_poll_once_no_job(monkeypatch):
     session = DummySession()
     agent = WorkerAgent(

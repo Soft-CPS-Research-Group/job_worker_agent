@@ -21,6 +21,13 @@ except ImportError:  # pragma: no cover - tests inject a fake client
 _LOGGER = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class WorkerAgent:
     """Agent that polls the OPEVA backend for work and executes Docker jobs."""
 
@@ -33,6 +40,7 @@ class WorkerAgent:
         poll_interval: float = 5.0,
         heartbeat_interval: float = 30.0,
         status_poll_interval: float = 10.0,
+        exit_after_job: bool = False,
         session: Optional[requests.Session] = None,
         docker_client_factory: Optional[Callable[[], "docker.DockerClient"]] = None,
     ) -> None:
@@ -48,11 +56,13 @@ class WorkerAgent:
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
         self.status_poll_interval = status_poll_interval
+        self._exit_after_job = exit_after_job
         self._last_heartbeat = 0.0
         self._stop_event = threading.Event()
         self._session = session or requests.Session()
         self._docker_client_factory = docker_client_factory
         self._docker_client_instance: Optional["docker.DockerClient"] = None
+        self._active_job_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -84,6 +94,9 @@ class WorkerAgent:
             return False
         _LOGGER.info("Received job %s", job["job_id"])
         self._run_job(job)
+        if self._exit_after_job:
+            _LOGGER.info("Exit-after-job flag set; stopping worker once current job completes")
+            self.stop()
         return True
 
     # ------------------------------------------------------------------
@@ -163,6 +176,7 @@ class WorkerAgent:
         monitor_state = {"status": None}
         monitor_stop = threading.Event()
         try:
+            self._active_job_id = job_id
             container_name = self._build_container_name(job_id, job_name)
             command = self._build_command(job_id, config_path)
             volumes = {self.shared_dir: {"bind": "/data", "mode": "rw"}}
@@ -200,6 +214,7 @@ class WorkerAgent:
                 monitor_thread.start()
 
             log_path = self._prepare_log_file(job_id)
+            _LOGGER.info("Streaming logs for job %s into %s", job_id, log_path)
             with open(log_path, "a", encoding="utf-8") as log_file:
                 for chunk in container.logs(stream=True, follow=True):
                     text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
@@ -213,9 +228,11 @@ class WorkerAgent:
             final_status = monitor_state.get("status")
             if final_status in {"stopped", "canceled"}:
                 self._post_status(job_id, final_status, exit_code=exit_code)
+                _LOGGER.info("Job %s completed with backend status '%s' (exit code %s)", job_id, final_status, exit_code)
             else:
                 status = "finished" if exit_code == 0 else "failed"
                 self._post_status(job_id, status, exit_code=exit_code)
+                _LOGGER.info("Job %s exited with status '%s' (exit code %s)", job_id, status, exit_code)
         except Exception as exc:
             _LOGGER.exception("Job %s failed: %s", job_id, exc)
             self._post_status(job_id, "failed", error=str(exc))
@@ -229,6 +246,7 @@ class WorkerAgent:
                 except Exception:  # pragma: no cover
                     pass
             self._send_heartbeat(force=True)
+            self._active_job_id = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -243,6 +261,13 @@ class WorkerAgent:
         logs_dir = Path(self.shared_dir) / "jobs" / job_id / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         return logs_dir / f"{job_id}.log"
+
+    def request_exit_after_current_job(self) -> None:
+        """Ensure the worker stops after the currently running job."""
+        self._exit_after_job = True
+        if self._active_job_id is None:
+            _LOGGER.info("Exit-after-job requested while idle; stopping worker immediately")
+            self.stop()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -261,6 +286,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--status-poll-interval",
         type=float,
         default=float(os.environ.get("STATUS_POLL_INTERVAL", "10")),
+    )
+    parser.add_argument(
+        "--exit-after-job",
+        action="store_true",
+        default=_env_flag("WORKER_EXIT_AFTER_JOB", False),
+        help="Stop the worker after completing the next job",
     )
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     return parser

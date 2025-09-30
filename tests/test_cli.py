@@ -26,6 +26,7 @@ def test_cli_uses_worker_id(monkeypatch):
     monkeypatch.setenv("WORKER_IMAGE", "image")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("WORKER_HEARTBEAT_INTERVAL", "10")
+    monkeypatch.setenv("WORKER_EXIT_AFTER_JOB", "1")
 
     argv = ["cli", "--poll-interval", "1"]
     monkeypatch.setattr(sys, "argv", argv)
@@ -41,6 +42,7 @@ def test_cli_uses_worker_id(monkeypatch):
     assert agent_kwargs["poll_interval"] == 1.0
     assert agent_kwargs["status_poll_interval"] == 10.0
     assert agent_kwargs["heartbeat_interval"] == 10.0
+    assert agent_kwargs["exit_after_job"] is True
 
 
 def test_cli_defaults_hostname(monkeypatch):
@@ -57,3 +59,4 @@ def test_cli_defaults_hostname(monkeypatch):
     cli.main()
 
     assert DummyAgent.instances[0].kwargs["worker_id"] == "host-name"
+    assert DummyAgent.instances[0].kwargs["exit_after_job"] is False
