@@ -118,34 +118,41 @@ class ScriptedContainer:
 
 
 class ScriptedDockerClient:
-    def __init__(self, jobs: List[ScriptedJob]):
+    def __init__(self, jobs: List[ScriptedJob], fail_on_gpu: bool = False):
         self._containers: Dict[str, ScriptedContainer] = {
             job.job_id: ScriptedContainer(job) for job in jobs
         }
         self.run_calls: List[Dict[str, object]] = []
         self.containers = self
+        self.fail_on_gpu = fail_on_gpu
 
     def run(self, **kwargs):
         command = kwargs.get("command", "")
         job_id = self._extract_job_id(command)
         container = self._containers[job_id]
         container.name = kwargs.get("name", container.name)
+        device_requests = kwargs.get("device_requests")
         self.run_calls.append(
             {
                 "job_id": job_id,
                 "command": command,
                 "volumes": kwargs.get("volumes"),
                 "image": kwargs.get("image"),
+                "labels": kwargs.get("labels"),
+                "device_requests": device_requests,
             }
         )
+        if self.fail_on_gpu and device_requests:
+            raise RuntimeError("device requests not supported")
         return container
 
     def _extract_job_id(self, command: str) -> str:
         parts = command.split()
-        if "--job_id" in parts:
-            idx = parts.index("--job_id")
-            if idx + 1 < len(parts):
-                return parts[idx + 1]
+        for flag in ("--job-id", "--job_id"):
+            if flag in parts:
+                idx = parts.index(flag)
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
         raise AssertionError(f"Job id not found in command: {command}")
 
     def close(self):
@@ -215,7 +222,10 @@ def test_worker_run_forever_integration(tmp_path):
     # Containers should have been started with correct command and volume mapping.
     run_commands = {call["job_id"]: call for call in docker_client.run_calls}
     assert "--config /data/cfg/success.yaml" in run_commands["job-success"]["command"]
+    assert "--job_id job-success" in run_commands["job-success"]["command"]
     assert run_commands["job-success"]["volumes"] == {str(shared_dir): {"bind": "/data", "mode": "rw"}}
+    assert run_commands["job-success"]["labels"]["opeva.job_id"] == "job-success"
+    assert run_commands["job-success"]["labels"]["opeva.worker_id"] == "worker-int"
 
     # Log files created for each job.
     success_log = shared_dir / "jobs" / "job-success" / "logs" / "job-success.log"
@@ -229,3 +239,43 @@ def test_worker_run_forever_integration(tmp_path):
     cancel_container = docker_client._containers["job-cancel"]
     assert cancel_container.stop_called.is_set(), "cancel container should receive stop()"
     assert cancel_container.removed is True
+
+
+def test_worker_gpu_auto_fallback(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-gpu",
+        config_path="cfg/gpu.yaml",
+        job_name="Job GPU",
+        exit_code=0,
+        logs=[b"gpu job\n"],
+        status_sequence=[],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient([job], fail_on_gpu=True)
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="worker-gpu",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+    )
+    agent._gpu_request_enabled = True  # type: ignore[attr-defined]
+    agent._build_device_requests = lambda: ["gpu-request"]  # type: ignore[assignment]
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    assert len(docker_client.run_calls) >= 2
+    assert docker_client.run_calls[0]["device_requests"], "first attempt should request GPU"
+    assert docker_client.run_calls[-1]["device_requests"] is None, "fallback should omit GPU request"

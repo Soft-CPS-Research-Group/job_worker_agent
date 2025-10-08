@@ -117,6 +117,8 @@ def test_run_job_success(tmp_path):
 
     assert docker_client.last_kwargs["image"] == "my-image"
     assert "--config /data/configs/demo.yaml" in docker_client.last_kwargs["command"]
+    assert docker_client.last_kwargs["labels"]["opeva.job_id"] == "job1"
+    assert docker_client.last_kwargs["labels"]["opeva.worker_id"] == "worker-a"
 
 
 def test_run_job_failure(tmp_path):

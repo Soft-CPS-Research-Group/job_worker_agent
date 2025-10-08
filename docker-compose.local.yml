@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  worker_agent:
+    image: ${WORKER_IMAGE:-calof/job_worker_agent:latest}
+    container_name: ${WORKER_CONTAINER_NAME:-worker-agent-local}
+    environment:
+      OPEVA_SERVER: ${OPEVA_SERVER:-http://localhost:8000}
+      WORKER_ID: ${WORKER_ID:-local}
+      OPEVA_SHARED_DIR: ${OPEVA_SHARED_DIR:-/mnt/opeva_shared}
+      POLL_INTERVAL: ${POLL_INTERVAL:-5}
+      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-30}
+      STATUS_POLL_INTERVAL: ${STATUS_POLL_INTERVAL:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ${LOCAL_SHARED_DIR:-/mnt/opeva_shared}:${OPEVA_SHARED_DIR:-/mnt/opeva_shared}
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

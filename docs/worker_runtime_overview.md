@@ -56,7 +56,10 @@ updates.
   (default `calof/opeva_simulator:latest`).
 - **Command:** `--config /data/<config_path> --job_id <job_id>`.
 - **Volume:** the shared directory is mounted read/write to `/data`.
+- **GPU support:** the worker requests GPUs when the Docker runtime supports
+  them and automatically retries without GPUs if allocation fails.
 - **Container name:** `job_<worker_id>_<job_name_forced_snake_case>_<job_id[:8]>`.
+- **Labels:** `opeva.worker_id` and `opeva.job_id` are attached to each job container.
 - **Log file:** `<shared_dir>/jobs/<job_id>/logs/<job_id>.log` (directories are
   created automatically).
 

@@ -13,9 +13,14 @@ import requests
 try:  # docker is optional at import time for tooling
     import docker
     from docker.models.containers import Container
+    try:
+        from docker.types import DeviceRequest
+    except ImportError:  # pragma: no cover - older docker SDK
+        DeviceRequest = None  # type: ignore
 except ImportError:  # pragma: no cover - tests inject a fake client
     docker = None  # type: ignore
     Container = object  # type: ignore
+    DeviceRequest = None  # type: ignore
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -63,6 +68,7 @@ class WorkerAgent:
         self._docker_client_factory = docker_client_factory
         self._docker_client_instance: Optional["docker.DockerClient"] = None
         self._active_job_id: Optional[str] = None
+        self._gpu_request_enabled = DeviceRequest is not None
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -180,14 +186,32 @@ class WorkerAgent:
             container_name = self._build_container_name(job_id, job_name)
             command = self._build_command(job_id, config_path)
             volumes = {self.shared_dir: {"bind": "/data", "mode": "rw"}}
+            device_requests = self._build_device_requests()
+            labels = {
+                "opeva.worker_id": self.worker_id,
+                "opeva.job_id": job_id,
+            }
             _LOGGER.info("Starting container %s for job %s", container_name, job_id)
-            container = self._get_docker_client().containers.run(
-                image=self.image,
-                command=command,
-                name=container_name,
-                volumes=volumes,
-                detach=True,
-            )
+            client = self._get_docker_client()
+            run_kwargs = {
+                "image": self.image,
+                "command": command,
+                "name": container_name,
+                "volumes": volumes,
+                "labels": labels,
+                "detach": True,
+            }
+            if device_requests:
+                run_kwargs["device_requests"] = device_requests
+            try:
+                container = client.containers.run(**run_kwargs)
+            except Exception as exc:
+                if device_requests:
+                    _LOGGER.info("GPU request failed (%s); retrying without GPU", exc)
+                    run_kwargs.pop("device_requests", None)
+                    container = client.containers.run(**run_kwargs)
+                else:
+                    raise
             self._post_status(
                 job_id,
                 "running",
@@ -252,6 +276,14 @@ class WorkerAgent:
     # Helpers
     def _build_command(self, job_id: str, config_path: str) -> str:
         return f"--config /data/{config_path} --job_id {job_id}"
+
+    def _build_device_requests(self) -> Optional[list]:
+        if not self._gpu_request_enabled:
+            return None
+        try:
+            return [DeviceRequest(count=-1, capabilities=[["gpu"]])]
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _build_container_name(self, job_id: str, job_name: str) -> str:
         safe_job = job_name.replace(" ", "_")
