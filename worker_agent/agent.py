@@ -64,6 +64,7 @@ class WorkerAgent:
         self._exit_after_job = exit_after_job
         self._last_heartbeat = 0.0
         self._stop_event = threading.Event()
+        self._external_session = session is not None
         self._session = session or requests.Session()
         self._docker_client_factory = docker_client_factory
         self._docker_client_instance: Optional["docker.DockerClient"] = None
@@ -121,7 +122,7 @@ class WorkerAgent:
             )
             self._last_heartbeat = now
         except requests.RequestException as exc:  # pragma: no cover - network issues
-            _LOGGER.warning("Failed to send heartbeat: %s", exc)
+            self._handle_request_exception("heartbeat", exc, warning=True)
 
     def _request_next_job(self) -> Optional[Dict[str, str]]:
         try:
@@ -131,7 +132,7 @@ class WorkerAgent:
                 timeout=30,
             )
         except requests.RequestException as exc:  # pragma: no cover
-            _LOGGER.error("Error requesting next job: %s", exc)
+            self._handle_request_exception("next-job", exc, warning=True)
             return None
 
         if response.status_code == 204:
@@ -149,7 +150,7 @@ class WorkerAgent:
                 timeout=10,
             )
         except requests.RequestException as exc:  # pragma: no cover
-            _LOGGER.warning("Failed to post status for %s: %s", job_id, exc)
+            self._handle_request_exception(f"job-status({job_id})", exc, warning=True)
 
     def _fetch_status(self, job_id: str) -> Optional[str]:
         try:
@@ -284,6 +285,21 @@ class WorkerAgent:
             return [DeviceRequest(count=-1, capabilities=[["gpu"]])]
         except Exception:  # pragma: no cover - defensive
             return None
+
+    def _reset_session(self) -> None:
+        if self._external_session:
+            return
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
+
+    def _handle_request_exception(self, context: str, exc: requests.RequestException, warning: bool = False) -> None:
+        log_func = _LOGGER.warning if warning else _LOGGER.error
+        log_func("Request to %s failed: %s", context, exc)
+        self._reset_session()
+        _LOGGER.debug("HTTP session reset after %s failure", context)
 
     def _build_container_name(self, job_id: str, job_name: str) -> str:
         safe_job = job_name.replace(" ", "_")
