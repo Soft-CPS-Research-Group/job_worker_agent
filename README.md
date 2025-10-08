@@ -67,6 +67,8 @@ While the worker runs you can:
 - Inspect active job containers: `sudo docker ps --filter name=job_tiago-laptop`.
 - Watch job logs: `sudo tail -f /mnt/opeva_shared/jobs/<job_id>/logs/<job_id>.log`.
 - Check the worker state/mount: `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh status`.
+- logs `sudo docker logs -f job-worker-tiago-laptop`
+- pull latest image `docker pull calof/job_worker_agent:latest`
 
 Need to abort immediately? `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh stop --force`
 removes the worker and any job containers without waiting for the current job to finish,

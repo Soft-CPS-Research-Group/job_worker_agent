@@ -70,6 +70,7 @@ class WorkerAgent:
         self._docker_client_instance: Optional["docker.DockerClient"] = None
         self._active_job_id: Optional[str] = None
         self._gpu_request_enabled = DeviceRequest is not None
+        self._last_request_failure: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -121,6 +122,7 @@ class WorkerAgent:
                 timeout=10,
             )
             self._last_heartbeat = now
+            self._last_request_failure = None
         except requests.RequestException as exc:  # pragma: no cover - network issues
             self._handle_request_exception("heartbeat", exc, warning=True)
 
@@ -131,6 +133,7 @@ class WorkerAgent:
                 json={"worker_id": self.worker_id},
                 timeout=30,
             )
+            self._last_request_failure = None
         except requests.RequestException as exc:  # pragma: no cover
             self._handle_request_exception("next-job", exc, warning=True)
             return None
@@ -149,6 +152,7 @@ class WorkerAgent:
                 json=payload,
                 timeout=10,
             )
+            self._last_request_failure = None
         except requests.RequestException as exc:  # pragma: no cover
             self._handle_request_exception(f"job-status({job_id})", exc, warning=True)
 
@@ -296,10 +300,12 @@ class WorkerAgent:
         self._session = requests.Session()
 
     def _handle_request_exception(self, context: str, exc: requests.RequestException, warning: bool = False) -> None:
-        log_func = _LOGGER.warning if warning else _LOGGER.error
+        is_repeat = self._last_request_failure == context
+        log_func = _LOGGER.warning if warning and not is_repeat else (_LOGGER.debug if is_repeat else _LOGGER.error)
         log_func("Request to %s failed: %s", context, exc)
         self._reset_session()
         _LOGGER.debug("HTTP session reset after %s failure", context)
+        self._last_request_failure = context
 
     def _build_container_name(self, job_id: str, job_name: str) -> str:
         safe_job = job_name.replace(" ", "_")
