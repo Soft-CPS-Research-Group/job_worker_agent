@@ -8,11 +8,12 @@ streams status/log updates back to the server.
 
 - Polls `/api/agent/next-job`, `/api/agent/job-status`, and `/api/agent/heartbeat`.
 - Writes logs to `jobs/<job_id>/logs/<job_id>.log` inside the shared directory.
-- Backend provides only `job_id`, `job_name`, and `config_path`; the worker owns
-  the Docker image/command.
+- Backend provides the full container payload (image, command, container name,
+  volumes, env) and the worker runs it as-is.
 - One job at a time per agent instance—run multiple containers for parallelism.
-- Heartbeat and cooperative cancellation support (agent stops the container when
-  status becomes `stopped`/`canceled`).
+- Heartbeat and cooperative stop support (agent stops the container when status
+  becomes `stop_requested` or `canceled`).
+- Periodic `job-status` updates while running to avoid stale-job handling.
 
 ## Quick start (recommended)
 

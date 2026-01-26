@@ -213,8 +213,12 @@ def test_worker_run_forever_integration(tmp_path):
     for call in backend.job_status_posts:
         job_status_by_id.setdefault(call["job_id"], []).append(call)
 
-    assert [entry["status"] for entry in job_status_by_id["job-success"]] == ["running", "finished"]
-    assert [entry["status"] for entry in job_status_by_id["job-cancel"]][-1] == "canceled"
+    success_statuses = [entry["status"] for entry in job_status_by_id["job-success"]]
+    assert success_statuses[0] == "running"
+    assert success_statuses[-1] == "finished"
+    cancel_statuses = [entry["status"] for entry in job_status_by_id["job-cancel"]]
+    assert cancel_statuses[0] == "running"
+    assert cancel_statuses[-1] == "canceled"
 
     cancel_final = job_status_by_id["job-cancel"][-1]
     assert cancel_final["exit_code"] == 137

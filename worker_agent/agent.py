@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Any
 
 import requests
 
@@ -64,12 +64,13 @@ class WorkerAgent:
         self._exit_after_job = exit_after_job
         self._last_heartbeat = 0.0
         self._stop_event = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
         self._external_session = session is not None
         self._session = session or requests.Session()
         self._docker_client_factory = docker_client_factory
         self._docker_client_instance: Optional["docker.DockerClient"] = None
         self._active_job_id: Optional[str] = None
-        self._gpu_request_enabled = DeviceRequest is not None
+        self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", DeviceRequest is not None)
         self._last_request_failure: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -79,6 +80,7 @@ class WorkerAgent:
 
     def run_forever(self) -> None:
         _LOGGER.info("Starting worker '%s' polling %s", self.worker_id, self.server_url)
+        self._start_heartbeat_loop()
         try:
             while not self._stop_event.is_set():
                 handled = self.poll_once()
@@ -88,6 +90,9 @@ class WorkerAgent:
         except KeyboardInterrupt:
             _LOGGER.info("Worker interrupted, shutting down")
         finally:
+            self._stop_event.set()
+            if self._heartbeat_thread:
+                self._heartbeat_thread.join(timeout=2)
             client = self._docker_client_instance
             if client is not None:
                 try:
@@ -188,10 +193,14 @@ class WorkerAgent:
         monitor_stop = threading.Event()
         try:
             self._active_job_id = job_id
-            container_name = self._build_container_name(job_id, job_name)
-            command = self._build_command(job_id, config_path)
-            volumes = {self.shared_dir: {"bind": "/data", "mode": "rw"}}
-            device_requests = self._build_device_requests()
+            container_name = job.get("container_name") or self._build_container_name(job_id, job_name)
+            command = job.get("command") or self._build_command(job_id, config_path)
+            volumes = self._build_volumes(job.get("volumes"))
+            env = job.get("env", {}) or {}
+            try:
+                device_requests = self._build_device_requests(job)
+            except TypeError:
+                device_requests = self._build_device_requests()
             labels = {
                 "opeva.worker_id": self.worker_id,
                 "opeva.job_id": job_id,
@@ -199,10 +208,11 @@ class WorkerAgent:
             _LOGGER.info("Starting container %s for job %s", container_name, job_id)
             client = self._get_docker_client()
             run_kwargs = {
-                "image": self.image,
+                "image": job.get("image", self.image),
                 "command": command,
                 "name": container_name,
                 "volumes": volumes,
+                "environment": env,
                 "labels": labels,
                 "detach": True,
             }
@@ -217,11 +227,13 @@ class WorkerAgent:
                     container = client.containers.run(**run_kwargs)
                 else:
                     raise
+            container_id = getattr(container, "id", None)
+            container_name = getattr(container, "name", None)
             self._post_status(
                 job_id,
                 "running",
-                container_id=getattr(container, "id", None),
-                container_name=getattr(container, "name", None),
+                container_id=container_id,
+                container_name=container_name,
             )
 
             if self.status_poll_interval > 0:
@@ -229,7 +241,7 @@ class WorkerAgent:
                 def _monitor() -> None:
                     while not monitor_stop.wait(self.status_poll_interval):
                         status = self._fetch_status(job_id)
-                        if status in {"stopped", "canceled"}:
+                        if status in {"stop_requested", "canceled"}:
                             monitor_state["status"] = status
                             try:
                                 if hasattr(container, "stop"):
@@ -237,6 +249,12 @@ class WorkerAgent:
                             except Exception:  # pragma: no cover
                                 pass
                             break
+                        self._post_status(
+                            job_id,
+                            "running",
+                            container_id=container_id,
+                            container_name=container_name,
+                        )
 
                 monitor_thread = threading.Thread(target=_monitor, name=f"monitor-{job_id}")
                 monitor_thread.daemon = True
@@ -255,9 +273,15 @@ class WorkerAgent:
             if isinstance(result, dict):
                 exit_code = result.get("StatusCode")
             final_status = monitor_state.get("status")
-            if final_status in {"stopped", "canceled"}:
-                self._post_status(job_id, final_status, exit_code=exit_code)
-                _LOGGER.info("Job %s completed with backend status '%s' (exit code %s)", job_id, final_status, exit_code)
+            if final_status in {"stop_requested", "canceled"}:
+                reported_status = "stopped" if final_status == "stop_requested" else "canceled"
+                self._post_status(job_id, reported_status, exit_code=exit_code)
+                _LOGGER.info(
+                    "Job %s completed with backend status '%s' (exit code %s)",
+                    job_id,
+                    reported_status,
+                    exit_code,
+                )
             else:
                 status = "finished" if exit_code == 0 else "failed"
                 self._post_status(job_id, status, exit_code=exit_code)
@@ -282,13 +306,32 @@ class WorkerAgent:
     def _build_command(self, job_id: str, config_path: str) -> str:
         return f"--config /data/{config_path} --job_id {job_id}"
 
-    def _build_device_requests(self) -> Optional[list]:
-        if not self._gpu_request_enabled:
+    def _build_device_requests(self, job: Optional[Dict[str, Any]] = None) -> Optional[list]:
+        job = job or {}
+        if not self._gpu_request_enabled and not job.get("device_requests"):
             return None
         try:
+            if job.get("device_requests"):
+                return job["device_requests"]
             return [DeviceRequest(count=-1, capabilities=[["gpu"]])]
         except Exception:  # pragma: no cover - defensive
             return None
+
+    def _build_volumes(self, vols: Optional[Any]) -> Dict[str, Dict[str, str]]:
+        if isinstance(vols, list):
+            out: Dict[str, Dict[str, str]] = {}
+            for v in vols:
+                try:
+                    host = v.get("host")
+                    container = v.get("container")
+                    mode = v.get("mode", "rw")
+                    if host and container:
+                        out[host] = {"bind": container, "mode": mode}
+                except Exception:
+                    continue
+            if out:
+                return out
+        return {self.shared_dir: {"bind": "/data", "mode": "rw"}}
 
     def _reset_session(self) -> None:
         if self._external_session:
@@ -308,7 +351,7 @@ class WorkerAgent:
         self._last_request_failure = context
 
     def _build_container_name(self, job_id: str, job_name: str) -> str:
-        safe_job = job_name.replace(" ", "_")
+        safe_job = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in job_name)[:40]
         return f"job_{self.worker_id}_{safe_job}_{job_id[:8]}"
 
     def _prepare_log_file(self, job_id: str) -> Path:
@@ -322,6 +365,17 @@ class WorkerAgent:
         if self._active_job_id is None:
             _LOGGER.info("Exit-after-job requested while idle; stopping worker immediately")
             self.stop()
+
+    def _start_heartbeat_loop(self) -> None:
+        if self.heartbeat_interval <= 0:
+            return
+
+        def _loop() -> None:
+            while not self._stop_event.wait(self.heartbeat_interval):
+                self._send_heartbeat()
+        t = threading.Thread(target=_loop, name="heartbeat-loop", daemon=True)
+        t.start()
+        self._heartbeat_thread = t
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

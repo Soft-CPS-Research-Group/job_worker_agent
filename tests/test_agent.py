@@ -267,3 +267,41 @@ def test_run_job_canceled(tmp_path):
     assert container.stop_called is True
     status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["json"]["status"] == "canceled"
+
+
+def test_run_job_stop_requested(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses = ["running", "stop_requested"]
+
+    class StopContainer(DummyContainer):
+        def __init__(self):
+            super().__init__(exit_code=137, logs=[b"start\n"])
+
+        def wait(self):
+            for _ in range(20):
+                if self.stop_called:
+                    return {"StatusCode": 137}
+                time.sleep(0.01)
+            return {"StatusCode": 0}
+
+    container = StopContainer()
+    docker_client = DummyDockerClient(container)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.05,
+        heartbeat_interval=0.0,
+    )
+
+    agent._run_job({"job_id": "job-stop", "config_path": "cfg.yaml", "job_name": "Demo"})
+
+    assert container.stop_called is True
+    status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls[-1]["json"]["status"] == "stopped"

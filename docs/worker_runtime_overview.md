@@ -23,13 +23,17 @@ worker service.
 5. **Status updates:**
    - The worker posts `POST /api/agent/job-status` with
      `{"job_id": <id>, "worker_id": <id>, "status": <status>, ...}`.
-   - Status transitions follow: `running` → `finished|failed|stopped|canceled`.
+   - While running, it sends periodic `status="running"` updates to refresh
+     `status_updated_at` on the server (avoids stale-job handling).
+   - Terminal transitions: `finished`, `failed`, `stopped`, or `canceled`.
    - The worker includes `container_id`, `container_name`, and `exit_code` when
      available.
-6. **Cooperative cancellation:** when configured with a positive
+6. **Cooperative stop/cancel:** when configured with a positive
    `status_poll_interval`, the worker polls `GET /status/<job_id>`.
-   - If the response JSON contains `{"status": "stopped"|"canceled"}` the
-     worker stops the container and reports that status to the backend.
+   - If the response JSON contains `{"status": "stop_requested"}` the
+     worker stops the container and reports `status="stopped"`.
+   - If the response JSON contains `{"status": "canceled"}` the
+     worker stops the container and reports `status="canceled"`.
 7. **Graceful shutdown:** operators can set `WORKER_EXIT_AFTER_JOB=1` (or pass
    `--exit-after-job`) to terminate after the next job finishes. At runtime a
    `SIGUSR1` signal triggers the same behaviour.
@@ -44,18 +48,23 @@ Responses from `/api/agent/next-job` must include:
 - `job_id` *(str, required)* – unique identifier for the job.
 - `config_path` *(str, required)* – path within the shared directory that the
   container should read (`/data/<config_path>` inside the container).
-- `job_name` *(str, optional)* – human-friendly name used for log readability
-  and container naming (defaults to `job_id` when missing).
+- `job_name` *(str, optional)* – human-friendly name used for log readability.
+- `image` *(str, optional)* – container image; falls back to worker default.
+- `command` *(str, optional)* – container command; falls back to
+  `--config /data/<config_path> --job_id <job_id>`.
+- `container_name` *(str, optional)* – explicit name for the container.
+- `volumes` *(list, optional)* – explicit volume mappings.
+- `env` *(dict, optional)* – environment variables to pass to the container.
 
 Extra fields are ignored by the worker but are preserved when reporting status
 updates.
 
 ## Container execution details
 
-- **Image:** configured per worker via CLI flags or environment variables
+- **Image:** provided by payload or configured per worker via CLI flags
   (default `calof/opeva_simulator:latest`).
-- **Command:** `--config /data/<config_path> --job_id <job_id>`.
-- **Volume:** the shared directory is mounted read/write to `/data`.
+- **Command:** provided by payload or `--config /data/<config_path> --job_id <job_id>`.
+- **Volume:** provided by payload or the shared directory is mounted read/write to `/data`.
 - **GPU support:** the worker requests GPUs when the Docker runtime supports
   them and automatically retries without GPUs if allocation fails.
 - **Container name:** `job_<worker_id>_<job_name_forced_snake_case>_<job_id[:8]>`.
