@@ -120,6 +120,7 @@ class WorkerAgent:
             if self.heartbeat_interval > 0 and (now - self._last_heartbeat) < self.heartbeat_interval:
                 return
         payload = {"worker_id": self.worker_id}
+        _LOGGER.info("POST /api/agent/heartbeat payload=%s", payload)
         try:
             self._session.post(
                 f"{self.server_url}/api/agent/heartbeat",
@@ -132,6 +133,7 @@ class WorkerAgent:
             self._handle_request_exception("heartbeat", exc, warning=True)
 
     def _request_next_job(self) -> Optional[Dict[str, str]]:
+        _LOGGER.info("POST /api/agent/next-job payload=%s", {"worker_id": self.worker_id})
         try:
             response = self._session.post(
                 f"{self.server_url}/api/agent/next-job",
@@ -144,6 +146,7 @@ class WorkerAgent:
             return None
 
         if response.status_code == 204:
+            _LOGGER.info("No job available (204)")
             return None
         response.raise_for_status()
         return response.json()
@@ -151,6 +154,7 @@ class WorkerAgent:
     def _post_status(self, job_id: str, status: str, **extra: object) -> None:
         payload = {"job_id": job_id, "status": status, "worker_id": self.worker_id}
         payload.update({k: v for k, v in extra.items() if v is not None})
+        _LOGGER.info("POST /api/agent/job-status payload=%s", payload)
         try:
             self._session.post(
                 f"{self.server_url}/api/agent/job-status",
@@ -162,6 +166,7 @@ class WorkerAgent:
             self._handle_request_exception(f"job-status({job_id})", exc, warning=True)
 
     def _fetch_status(self, job_id: str) -> Optional[str]:
+        _LOGGER.info("GET /status/%s", job_id)
         try:
             response = self._session.get(
                 f"{self.server_url}/status/{job_id}", timeout=10
