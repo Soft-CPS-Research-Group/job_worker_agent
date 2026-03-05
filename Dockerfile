@@ -8,6 +8,10 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY worker_agent ./worker_agent
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir .
 
 ENTRYPOINT ["job-worker-agent"]

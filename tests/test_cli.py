@@ -40,6 +40,7 @@ def test_cli_uses_worker_id(monkeypatch):
     assert agent_kwargs["shared_dir"] == "/shared"
     assert agent_kwargs["image"] == "image"
     assert agent_kwargs["poll_interval"] == 1.0
+    assert agent_kwargs["executor"] == "docker"
     assert agent_kwargs["status_poll_interval"] == 10.0
     assert agent_kwargs["heartbeat_interval"] == 10.0
     assert agent_kwargs["exit_after_job"] is True

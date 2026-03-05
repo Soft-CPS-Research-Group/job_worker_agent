@@ -19,6 +19,7 @@ def main() -> None:
         worker_id=worker_id,
         shared_dir=args.shared_dir,
         image=args.image,
+        executor=args.executor,
         poll_interval=args.poll_interval,
         heartbeat_interval=args.heartbeat_interval,
         status_poll_interval=args.status_poll_interval,
