@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass
+from typing import Optional
 
 from .ssh_client import SSHClient
 
@@ -45,6 +46,19 @@ class SlurmState:
     exit_code: int | None = None
 
 
+def _parse_exit_code(value: str) -> Optional[int]:
+    text = value.strip()
+    if not text:
+        return None
+    code_text = text.split(":", 1)[0].strip()
+    if not code_text:
+        return None
+    try:
+        return int(code_text)
+    except ValueError:
+        return None
+
+
 def sbatch_submit(ssh: SSHClient, remote_script_path: str, remote_workdir: str) -> str:
     cmd = f"cd {shlex.quote(remote_workdir)} && sbatch --parsable {shlex.quote(remote_script_path)}"
     output = ssh.run(cmd, timeout=60)
@@ -67,27 +81,33 @@ def query_state(ssh: SSHClient, slurm_job_id: str) -> SlurmState:
             return SlurmState(state=state)
 
     # Terminal states from sacct after job leaves queue
+    # Prefer the root job row (`JobIDRaw == <job_id>`) and only fallback to
+    # job steps (e.g. .batch/.extern) when the root row is unavailable.
     sacct_out = ssh.run(
-        f"sacct -X -j {shlex.quote(slurm_job_id)} --format=State,ExitCode --parsable2 -n",
+        f"sacct -X -j {shlex.quote(slurm_job_id)} --format=JobIDRaw,State,ExitCode --parsable2 -n",
         timeout=30,
         check=False,
     )
+    fallback_state: SlurmState | None = None
     for line in sacct_out.splitlines():
         raw = line.strip()
         if not raw:
             continue
         parts = raw.split("|")
-        state = _normalize_state(parts[0]) if parts else ""
+        if len(parts) < 2:
+            continue
+        job_id_raw = parts[0].strip()
+        state = _normalize_state(parts[1])
         if not state:
             continue
-        exit_code = None
-        if len(parts) > 1:
-            # format usually "0:0"
-            code_text = parts[1].strip().split(":")[0]
-            try:
-                exit_code = int(code_text)
-            except ValueError:
-                exit_code = None
-        return SlurmState(state=state, exit_code=exit_code)
+        exit_code = _parse_exit_code(parts[2] if len(parts) > 2 else "")
+        candidate = SlurmState(state=state, exit_code=exit_code)
+        if job_id_raw == slurm_job_id:
+            return candidate
+        if fallback_state is None:
+            fallback_state = candidate
+
+    if fallback_state is not None:
+        return fallback_state
 
     return SlurmState(state="UNKNOWN", exit_code=None)

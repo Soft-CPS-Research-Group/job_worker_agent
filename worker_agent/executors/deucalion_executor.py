@@ -37,6 +37,7 @@ class DeucalionExecutor(BaseExecutor):
         self.poll_interval = float(self.env.get("DEUCALION_POLL_INTERVAL", "10"))
         self.sync_interval = float(self.env.get("DEUCALION_SYNC_INTERVAL", "15"))
         self.unreachable_grace_seconds = float(self.env.get("DEUCALION_UNREACHABLE_GRACE_SECONDS", "900"))
+        self.unknown_state_timeout_seconds = float(self.env.get("DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS", "300"))
 
         if ssh_client is None:
             ssh_client = SSHClient(
@@ -75,15 +76,101 @@ class DeucalionExecutor(BaseExecutor):
     def _check_remote_path(self, path: str, kind: str = "e") -> None:
         self.ssh.run(f"test -{kind} {shlex.quote(path)}", timeout=30)
 
-    def _sync_remote_logs(self, remote_job_dir: str, local_log_path: Path) -> None:
+    def _remote_exists(self, path: str, kind: str = "e") -> bool:
         output = self.ssh.run(
-            f"cat {shlex.quote(posixpath.join(remote_job_dir, 'slurm.out'))} "
-            f"{shlex.quote(posixpath.join(remote_job_dir, 'slurm.err'))} 2>/dev/null || true",
+            f"test -{kind} {shlex.quote(path)} && echo yes || true",
+            timeout=30,
+            check=False,
+        )
+        return output.strip() == "yes"
+
+    def _ensure_remote_dir(self, path: str) -> None:
+        self.ssh.run(f"mkdir -p {shlex.quote(path)}", timeout=30)
+
+    def _remote_file_size(self, remote_path: str) -> int:
+        output = self.ssh.run(
+            f"if [ -f {shlex.quote(remote_path)} ]; then wc -c < {shlex.quote(remote_path)}; else echo 0; fi",
+            timeout=30,
+            check=False,
+        ).strip()
+        try:
+            return int(output) if output else 0
+        except ValueError:
+            return 0
+
+    def _read_remote_file_from(self, remote_path: str, start: int) -> str:
+        return self.ssh.run(
+            f"if [ -f {shlex.quote(remote_path)} ]; then tail -c +{start} {shlex.quote(remote_path)}; fi",
             timeout=60,
             check=False,
         )
+
+    def _sync_remote_logs(self, remote_job_dir: str, local_log_path: Path, offsets: dict[str, int]) -> dict[str, int]:
         local_log_path.parent.mkdir(parents=True, exist_ok=True)
-        local_log_path.write_text(output, encoding="utf-8")
+        with open(local_log_path, "a", encoding="utf-8") as log_file:
+            for name in ("slurm.out", "slurm.err"):
+                remote_path = posixpath.join(remote_job_dir, name)
+                prev_size = offsets.get(name, 0)
+                current_size = self._remote_file_size(remote_path)
+                if current_size <= 0:
+                    offsets[name] = 0
+                    continue
+                # File rotated/truncated remotely; resync from beginning.
+                start = 1 if current_size < prev_size else prev_size + 1
+                if current_size == prev_size:
+                    continue
+                delta = self._read_remote_file_from(remote_path, start=start)
+                if delta:
+                    log_file.write(delta)
+                    log_file.flush()
+                offsets[name] = current_size
+        return offsets
+
+    def _sync_datasets(self, cfg: DeucalionJobConfig) -> tuple[list[str], list[str]]:
+        synced: list[str] = []
+        skipped: list[str] = []
+        for rel_path in cfg.datasets:
+            local_source = Path(self.runtime.shared_dir) / rel_path
+            remote_target = posixpath.join(cfg.remote_root, rel_path)
+            if not local_source.exists():
+                raise FileNotFoundError(f"Dataset path not found in shared dir: {local_source}")
+            if self._remote_exists(remote_target, kind="e"):
+                skipped.append(rel_path)
+                continue
+            self._ensure_remote_dir(posixpath.dirname(remote_target))
+            if local_source.is_dir():
+                self.ssh.copy_to(local_source, remote_target, timeout=180)
+            else:
+                self.ssh.copy_to(local_source, remote_target, timeout=120)
+            synced.append(rel_path)
+        return synced, skipped
+
+    def _ensure_datasets_symlink(self, remote_root: str, remote_job_dir: str) -> None:
+        datasets_root = posixpath.join(remote_root, "datasets")
+        link_path = posixpath.join(remote_job_dir, "data", "datasets")
+        self._ensure_remote_dir(datasets_root)
+        self._ensure_remote_dir(posixpath.dirname(link_path))
+        self.ssh.run(
+            f"ln -sfn {shlex.quote(datasets_root)} {shlex.quote(link_path)}",
+            timeout=30,
+        )
+
+    def _build_singularity_command(self, cfg: DeucalionJobConfig, remote_data_dir: str, command: str) -> str:
+        command_text = command.strip()
+        if not command_text:
+            raise ValueError("Empty job command")
+        if cfg.command_mode == "exec":
+            parts = shlex.split(command_text)
+            if not parts or parts[0].startswith("-"):
+                raise ValueError(
+                    "execution.deucalion.command_mode=exec requires an explicit executable in the command"
+                )
+        return (
+            f"singularity {cfg.command_mode} "
+            f"--bind {shlex.quote(remote_data_dir)}:/data "
+            f"{shlex.quote(cfg.sif_path)} "
+            f"{command_text}"
+        )
 
     def _sync_remote_artifacts(self, remote_job_dir: str, local_job_dir: Path) -> None:
         local_job_dir.mkdir(parents=True, exist_ok=True)
@@ -139,12 +226,7 @@ class DeucalionExecutor(BaseExecutor):
             if value is None:
                 continue
             lines.append(f"export {key}={shlex.quote(str(value))}")
-        lines.append(
-            "singularity exec "
-            f"--bind {shlex.quote(remote_data_dir)}:/data "
-            f"{shlex.quote(cfg.sif_path)} "
-            f"{command}"
-        )
+        lines.append(self._build_singularity_command(cfg=cfg, remote_data_dir=remote_data_dir, command=command))
         return "\n".join(lines) + "\n"
 
     def _map_terminal_status(self, stop_reason: str | None, state: SlurmState) -> tuple[str, int | None, str | None]:
@@ -171,14 +253,20 @@ class DeucalionExecutor(BaseExecutor):
 
         slurm_job_id: str | None = None
         degraded_since: float | None = None
+        unknown_since: float | None = None
         stop_reason: str | None = None
         last_status = "dispatched"
+        datasets_synced: list[str] = []
+        datasets_skipped: list[str] = []
+        command_mode = "run"
+        log_offsets = {"slurm.out": 0, "slurm.err": 0}
 
         try:
             self.runtime._mark_active_job(job_id)
             job_yaml = self._load_job_yaml(local_config_path)
             cfg = resolve_deucalion_job_config(job_yaml, env=self.env)
             remote_root = self._remote_root(cfg)
+            command_mode = cfg.command_mode
 
             remote_job_dir = posixpath.join(remote_root, "runs", job_id)
             remote_data_dir = posixpath.join(remote_job_dir, "data")
@@ -191,11 +279,14 @@ class DeucalionExecutor(BaseExecutor):
             for path in cfg.required_paths:
                 self._check_remote_path(path, kind="e")
 
+            datasets_synced, datasets_skipped = self._sync_datasets(cfg)
+
             self.ssh.run(
                 f"mkdir -p {shlex.quote(remote_job_dir)} "
                 f"{shlex.quote(posixpath.dirname(remote_cfg_path))}",
                 timeout=30,
             )
+            self._ensure_datasets_symlink(remote_root=remote_root, remote_job_dir=remote_job_dir)
             self.ssh.copy_to(local_config_path, remote_cfg_path, timeout=60)
 
             script = self._render_sbatch_script(
@@ -218,7 +309,14 @@ class DeucalionExecutor(BaseExecutor):
                     pass
 
             slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=remote_job_dir)
-            details = {"slurm_job_id": slurm_job_id, "slurm_state": "PENDING", "executor": "deucalion"}
+            details = {
+                "slurm_job_id": slurm_job_id,
+                "slurm_state": "PENDING",
+                "executor": "deucalion",
+                "command_mode": command_mode,
+                "datasets_synced": datasets_synced,
+                "datasets_skipped": datasets_skipped,
+            }
             self.runtime._post_status(job_id, "dispatched", details=details, container_name=job_name)
             last_status = "dispatched"
 
@@ -235,14 +333,41 @@ class DeucalionExecutor(BaseExecutor):
 
                     state = query_state(self.ssh, slurm_job_id)
                     degraded_since = None
+                    if state.state != "UNKNOWN":
+                        unknown_since = None
 
-                    details = {"slurm_job_id": slurm_job_id, "slurm_state": state.state, "executor": "deucalion"}
+                    details = {
+                        "slurm_job_id": slurm_job_id,
+                        "slurm_state": state.state,
+                        "executor": "deucalion",
+                        "command_mode": command_mode,
+                        "datasets_synced": datasets_synced,
+                        "datasets_skipped": datasets_skipped,
+                    }
 
                     if now >= next_sync:
-                        self._sync_remote_logs(remote_job_dir, local_log_path)
+                        log_offsets = self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
                         next_sync = now + self.sync_interval
 
-                    if state.state in ACTIVE_STATES or state.state == "UNKNOWN":
+                    if state.state == "UNKNOWN":
+                        if unknown_since is None:
+                            unknown_since = now
+                        details["unknown_since"] = unknown_since
+                        if (now - unknown_since) > self.unknown_state_timeout_seconds:
+                            self.runtime._post_status(
+                                job_id,
+                                "failed",
+                                error="slurm_unknown_timeout",
+                                details=details,
+                            )
+                            return
+                        report_status = "running" if last_status == "running" else "dispatched"
+                        self.runtime._post_status(job_id, report_status, details=details)
+                        last_status = report_status
+                        self.sleep_fn(self.poll_interval)
+                        continue
+
+                    if state.state in ACTIVE_STATES:
                         running_states = {"RUNNING", "COMPLETING", "STAGE_OUT"}
                         report_status = "running" if state.state in running_states else "dispatched"
                         self.runtime._post_status(job_id, report_status, details=details)
@@ -251,7 +376,7 @@ class DeucalionExecutor(BaseExecutor):
                         continue
 
                     final_status, exit_code, error = self._map_terminal_status(stop_reason, state)
-                    self._sync_remote_logs(remote_job_dir, local_log_path)
+                    self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
                     self._sync_remote_artifacts(remote_job_dir, local_job_dir)
                     self.runtime._post_status(job_id, final_status, exit_code=exit_code, error=error, details=details)
                     return
@@ -263,15 +388,27 @@ class DeucalionExecutor(BaseExecutor):
                         "slurm_job_id": slurm_job_id,
                         "connectivity": "degraded",
                         "executor": "deucalion",
+                        "command_mode": command_mode,
+                        "datasets_synced": datasets_synced,
+                        "datasets_skipped": datasets_skipped,
                         "error": exc.stderr or str(exc),
                     }
+                    if unknown_since is not None:
+                        details["unknown_since"] = unknown_since
                     self.runtime._post_status(job_id, last_status, details=details)
                     if elapsed > self.unreachable_grace_seconds:
                         self.runtime._post_status(
                             job_id,
                             "failed",
                             error="deucalion_unreachable_timeout",
-                            details={"slurm_job_id": slurm_job_id, "connectivity": "down", "executor": "deucalion"},
+                            details={
+                                "slurm_job_id": slurm_job_id,
+                                "connectivity": "down",
+                                "executor": "deucalion",
+                                "command_mode": command_mode,
+                                "datasets_synced": datasets_synced,
+                                "datasets_skipped": datasets_skipped,
+                            },
                         )
                         return
                     self.sleep_fn(self.poll_interval)
@@ -281,7 +418,13 @@ class DeucalionExecutor(BaseExecutor):
                         job_id,
                         "failed",
                         error=str(exc),
-                        details={"slurm_job_id": slurm_job_id, "executor": "deucalion"},
+                        details={
+                            "slurm_job_id": slurm_job_id,
+                            "executor": "deucalion",
+                            "command_mode": command_mode,
+                            "datasets_synced": datasets_synced,
+                            "datasets_skipped": datasets_skipped,
+                        },
                     )
                     return
         except Exception as exc:
@@ -290,7 +433,12 @@ class DeucalionExecutor(BaseExecutor):
                 job_id,
                 "failed",
                 error=str(exc),
-                details={"executor": "deucalion"},
+                details={
+                    "executor": "deucalion",
+                    "command_mode": command_mode,
+                    "datasets_synced": datasets_synced,
+                    "datasets_skipped": datasets_skipped,
+                },
             )
         finally:
             self.runtime._send_heartbeat(force=True)

@@ -19,10 +19,11 @@ worker service.
    - `docker` executor: launches the configured image with the shared directory
      mounted at `/data`.
    - `deucalion` executor: submits an Slurm job via SSH (`sbatch`) and runs the
-     payload command through Singularity (`.sif`) on Deucalion.
+     payload command through Singularity (`.sif`) on Deucalion (`run` by default,
+     optional `exec` override).
 4. **Stream/sync logs:** logs are persisted at
    `<shared_dir>/jobs/<job_id>/logs/<job_id>.log` (container stream in docker
-   mode, periodic remote sync in deucalion mode).
+   mode, incremental remote sync in deucalion mode).
 5. **Status updates:**
    - The worker posts `POST /api/agent/job-status` with
      `{"job_id": <id>, "worker_id": <id>, "status": <status>, ...}`.
@@ -83,10 +84,15 @@ updates.
   - optional `execution.deucalion.required_paths` exist
 - The worker writes config + sbatch script under:
   - `<remote_root>/runs/<job_id>/`
+- If `execution.deucalion.datasets` is provided, worker ensures each dataset
+  exists on Deucalion (`<remote_root>/<relative_path>`) using copy-if-missing.
+- Worker creates a per-job symlink:
+  - `<remote_root>/runs/<job_id>/data/datasets -> <remote_root>/datasets`
+  so configs using `/data/datasets/...` keep working.
 - Slurm lifecycle:
   - submit: `sbatch --parsable`
   - monitor active states: `squeue`
-  - resolve terminal state/exit code: `sacct`
+  - resolve terminal state/exit code: `sacct` (prefers root job row over steps)
   - cooperative stop/cancel: `scancel`
 - Status mapping to backend:
   - queued/running Slurm states -> `dispatched` / `running`
@@ -98,8 +104,14 @@ updates.
   - if SSH remains unavailable beyond
     `DEUCALION_UNREACHABLE_GRACE_SECONDS`, job is marked `failed` with
     `error=deucalion_unreachable_timeout`
+- UNKNOWN policy:
+  - transient `UNKNOWN` keeps monitoring
+  - continuous `UNKNOWN` longer than
+    `DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS` fails with
+    `error=slurm_unknown_timeout`
 - Job-specific overrides can be defined in YAML under `execution.deucalion.*`
-  (account/partition/time/cpus/mem/gpus/modules/sif_path/required_paths).
+  (account/partition/time/cpus/mem/gpus/modules/sif_path/required_paths/
+  command_mode/datasets).
 
 ## CLI & configuration inputs
 
@@ -123,7 +135,9 @@ Setting `--status-poll-interval 0` disables cooperative cancellation checks but
 all other reporting remains intact.
 
 Deucalion mode requires SSH settings and Slurm defaults via environment:
-`DEUCALION_SSH_*`, `DEUCALION_SIF_PATH`, and optional `DEUCALION_SLURM_*`.
+`DEUCALION_SSH_*`, `DEUCALION_SIF_PATH`, optional
+`DEUCALION_SIF_COMMAND_MODE`, `DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS`, and
+optional `DEUCALION_SLURM_*`.
 
 ## Backend expectations
 

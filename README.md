@@ -57,9 +57,12 @@ docker compose -f docker-compose.deucalion.yml up -d
 
 Notes:
 - Backend remains unchanged; this worker still uses `/api/agent/*`.
-- Datasets and `.sif` are expected to already exist in Deucalion storage.
+- `.sif` must exist in Deucalion storage.
+- Datasets can be synchronized automatically per job using
+  `execution.deucalion.datasets` (paths relative to the shared root, e.g.
+  `datasets/site_a/input.csv`).
 - The worker copies config + submits with `sbatch`, monitors with `squeue/sacct`,
-  syncs logs periodically, and reports final status back to backend.
+  syncs logs incrementally, and reports final status back to backend.
 - If SSH is unavailable longer than `DEUCALION_UNREACHABLE_GRACE_SECONDS`,
   the worker fails the job with `error=deucalion_unreachable_timeout`.
 
@@ -161,15 +164,24 @@ Deucalion-only variables:
 | `DEUCALION_SSH_KNOWN_HOSTS` | Path inside container to known_hosts file (recommended mount RO). |
 | `DEUCALION_REMOTE_ROOT` | Remote root directory (default `/projects/F202508843CPCAA0/tiagocalof`). |
 | `DEUCALION_SIF_PATH` | Remote path to Singularity image (`.sif`) used to execute jobs. |
+| `DEUCALION_SIF_COMMAND_MODE` | Singularity mode (`run` or `exec`). Default: `run`. |
 | `DEUCALION_POLL_INTERVAL` | Slurm state poll interval in seconds (default `10`). |
 | `DEUCALION_SYNC_INTERVAL` | Remote log sync interval in seconds (default `15`). |
 | `DEUCALION_UNREACHABLE_GRACE_SECONDS` | Grace window before failing unreachable jobs (default `900`). |
+| `DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS` | Max seconds to tolerate continuous `UNKNOWN` state before failing (`300`). |
 | `DEUCALION_SLURM_ACCOUNT_CPU/GPU` | Default Slurm accounts (`f202508843cpcaa0x` / `f202508843cpcaa0g`). |
 | `DEUCALION_SLURM_PARTITION_CPU/GPU` | Default partitions (`normal-x86` / `normal-a100-80`). |
 | `DEUCALION_SLURM_TIME` | Default time limit, e.g. `04:00:00`. |
 | `DEUCALION_SLURM_CPUS_PER_TASK` | Default CPU cores per task. |
 | `DEUCALION_SLURM_MEM_GB` | Default memory in GB. |
 | `DEUCALION_SLURM_GPUS` | Default GPU count (`0` means CPU job). |
+
+Per-job overrides in YAML (`execution.deucalion`) support:
+- `command_mode: run|exec` (default `run`)
+- `datasets: [datasets/...,...]` (relative to shared root; copied to
+  `<remote_root>/datasets/...` only when missing)
+- existing keys: `account`, `partition`, `time`, `cpus_per_task`, `mem_gb`,
+  `gpus`, `modules`, `sif_path`, `required_paths`
 
 Start additional containers if you need multiple jobs running in parallel.
 
