@@ -7,6 +7,7 @@ services:
     environment:
       OPEVA_SERVER: ${OPEVA_SERVER:-http://localhost:8000}
       WORKER_ID: ${WORKER_ID:-local}
+      WORKER_EXECUTOR: ${WORKER_EXECUTOR:-docker}
       OPEVA_SHARED_DIR: ${OPEVA_SHARED_DIR:-/mnt/opeva_shared}
       POLL_INTERVAL: ${POLL_INTERVAL:-5}
       WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-30}

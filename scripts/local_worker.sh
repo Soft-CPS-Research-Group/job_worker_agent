@@ -21,6 +21,7 @@ Environment overrides (export before running):
   OPEVA_SERVER           Backend URL (default: http://localhost:8000)
   WORKER_ID              Worker identifier (default: <hostname>-local)
   WORKER_IMAGE           Worker container image (default: calof/job_worker_agent:latest)
+  WORKER_EXECUTOR        Worker executor mode (default: docker)
   WORKER_CONTAINER_NAME  Container name (default: job-worker-<WORKER_ID>)
   LOG_LEVEL              Logging level (default: INFO)
   POLL_INTERVAL          Queue poll interval (default: 5)
@@ -44,6 +45,7 @@ NFS_MOUNT_OPTS="${NFS_MOUNT_OPTS:-vers=4.1,proto=tcp,port=2049}"
 
 WORKER_ID="${WORKER_ID:-$(hostname)-local}"
 WORKER_IMAGE="${WORKER_IMAGE:-calof/job_worker_agent:latest}"
+WORKER_EXECUTOR="${WORKER_EXECUTOR:-docker}"
 WORKER_CONTAINER_NAME="${WORKER_CONTAINER_NAME:-job-worker-${WORKER_ID}}"
 OPEVA_SERVER="${OPEVA_SERVER:-http://localhost:8000}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
@@ -108,6 +110,7 @@ container_running() {
 
 export_compose_env() {
 export WORKER_IMAGE
+export WORKER_EXECUTOR
 export WORKER_CONTAINER_NAME
 export OPEVA_SERVER
 export WORKER_ID

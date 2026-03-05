@@ -15,11 +15,14 @@ worker service.
    - `204 No Content` means no work is available.
    - Any other non-2xx code is treated as an error.
    - A successful response returns JSON describing the job (see below).
-3. **Run the job inside Docker:** the worker launches the configured image with
-   the shared directory mounted at `/data` and a command built from the job
-   payload.
-4. **Stream logs:** container stdout/stderr is appended to
-   `<shared_dir>/jobs/<job_id>/logs/<job_id>.log`.
+3. **Run the job via executor:**
+   - `docker` executor: launches the configured image with the shared directory
+     mounted at `/data`.
+   - `deucalion` executor: submits an Slurm job via SSH (`sbatch`) and runs the
+     payload command through Singularity (`.sif`) on Deucalion.
+4. **Stream/sync logs:** logs are persisted at
+   `<shared_dir>/jobs/<job_id>/logs/<job_id>.log` (container stream in docker
+   mode, periodic remote sync in deucalion mode).
 5. **Status updates:**
    - The worker posts `POST /api/agent/job-status` with
      `{"job_id": <id>, "worker_id": <id>, "status": <status>, ...}`.
@@ -59,7 +62,7 @@ Responses from `/api/agent/next-job` must include:
 Extra fields are ignored by the worker but are preserved when reporting status
 updates.
 
-## Container execution details
+## Docker execution details
 
 - **Image:** provided by payload or configured per worker via CLI flags
   (default `calof/opeva_simulator:latest`).
@@ -72,6 +75,32 @@ updates.
 - **Log file:** `<shared_dir>/jobs/<job_id>/logs/<job_id>.log` (directories are
   created automatically).
 
+## Deucalion execution details
+
+- The worker connects to Deucalion over SSH and validates remote prerequisites:
+  - remote root exists (default `/projects/F202508843CPCAA0/tiagocalof`)
+  - configured `.sif` exists
+  - optional `execution.deucalion.required_paths` exist
+- The worker writes config + sbatch script under:
+  - `<remote_root>/runs/<job_id>/`
+- Slurm lifecycle:
+  - submit: `sbatch --parsable`
+  - monitor active states: `squeue`
+  - resolve terminal state/exit code: `sacct`
+  - cooperative stop/cancel: `scancel`
+- Status mapping to backend:
+  - queued/running Slurm states -> `dispatched` / `running`
+  - completed exit 0 -> `finished`
+  - cancellation by backend -> `stopped` or `canceled`
+  - other terminal states -> `failed`
+- Connectivity policy:
+  - heartbeat continues independently from SSH availability
+  - if SSH remains unavailable beyond
+    `DEUCALION_UNREACHABLE_GRACE_SECONDS`, job is marked `failed` with
+    `error=deucalion_unreachable_timeout`
+- Job-specific overrides can be defined in YAML under `execution.deucalion.*`
+  (account/partition/time/cpus/mem/gpus/modules/sif_path/required_paths).
+
 ## CLI & configuration inputs
 
 The CLI front-end (`worker_agent.cli:main`) accepts the following arguments and
@@ -83,6 +112,7 @@ reads matching environment variables:
 | `--worker-id` | `WORKER_ID` | hostname at runtime |
 | `--shared-dir` | `OPEVA_SHARED_DIR` | `/opt/opeva_shared_data` |
 | `--image` | `WORKER_IMAGE` | `calof/opeva_simulator:latest` |
+| `--executor` | `WORKER_EXECUTOR` | `docker` |
 | `--poll-interval` | `POLL_INTERVAL` | `5` seconds |
 | `--heartbeat-interval` | `WORKER_HEARTBEAT_INTERVAL` | `30` seconds |
 | `--status-poll-interval` | `STATUS_POLL_INTERVAL` | `10` seconds |
@@ -91,6 +121,9 @@ reads matching environment variables:
 
 Setting `--status-poll-interval 0` disables cooperative cancellation checks but
 all other reporting remains intact.
+
+Deucalion mode requires SSH settings and Slurm defaults via environment:
+`DEUCALION_SSH_*`, `DEUCALION_SIF_PATH`, and optional `DEUCALION_SLURM_*`.
 
 ## Backend expectations
 

@@ -1,8 +1,8 @@
 # Job Worker Agent
 
 Worker implementation for the OPEVA backend. Each agent polls the API for
-queued jobs, runs the Docker workload with the shared NFS volume mounted, and
-streams status/log updates back to the server.
+queued jobs, executes workloads via the configured executor (`docker` or
+`deucalion`), and streams status/log updates back to the server.
 
 ## Features
 
@@ -10,6 +10,9 @@ streams status/log updates back to the server.
 - Writes logs to `jobs/<job_id>/logs/<job_id>.log` inside the shared directory.
 - Backend provides the full container payload (image, command, container name,
   volumes, env) and the worker runs it as-is.
+- Executor modes:
+  - `docker`: runs jobs in Docker as before.
+  - `deucalion`: submits jobs to Deucalion via SSH + Slurm + Singularity.
 - One job at a time per agent instance—run multiple containers for parallelism.
 - Heartbeat and cooperative stop support (agent stops the container when status
   becomes `stop_requested` or `canceled`).
@@ -31,6 +34,34 @@ sudo scripts/setup_worker.sh \
 
 By default the script uses the published image `calof/job_worker_agent:latest`
 and names the container `job-worker-<worker_id>`.
+
+## Deucalion mode (SSH + Slurm + Singularity)
+
+Use the dedicated compose file when running the worker that targets Deucalion:
+
+```bash
+export WORKER_ID=deucalion
+export OPEVA_SERVER=http://<backend>:8000
+export LOCAL_SHARED_DIR=/mnt/opeva_shared
+export OPEVA_SHARED_DIR=/mnt/opeva_shared
+
+export DEUCALION_SSH_HOST=<login-node>
+export DEUCALION_SSH_USER=<username>
+export DEUCALION_SSH_KEY_PATH_HOST=/etc/opeva/deucalion/id_ed25519
+export DEUCALION_SSH_KNOWN_HOSTS_HOST=/etc/opeva/deucalion/known_hosts
+export DEUCALION_SIF_PATH=/projects/F202508843CPCAA0/tiagocalof/images/simulator.sif
+export DEUCALION_REMOTE_ROOT=/projects/F202508843CPCAA0/tiagocalof
+
+docker compose -f docker-compose.deucalion.yml up -d
+```
+
+Notes:
+- Backend remains unchanged; this worker still uses `/api/agent/*`.
+- Datasets and `.sif` are expected to already exist in Deucalion storage.
+- The worker copies config + submits with `sbatch`, monitors with `squeue/sacct`,
+  syncs logs periodically, and reports final status back to backend.
+- If SSH is unavailable longer than `DEUCALION_UNREACHABLE_GRACE_SECONDS`,
+  the worker fails the job with `error=deucalion_unreachable_timeout`.
 
 ## Laptop helper (docker compose + NFS automation)
 
@@ -112,12 +143,33 @@ Environment variables:
 |----------|-------------|
 | `OPEVA_SERVER` | Backend base URL (default `http://localhost:8000`). |
 | `WORKER_ID` | Worker identifier; defaults to container hostname. |
+| `WORKER_EXECUTOR` | `docker` (default) or `deucalion`. |
 | `OPEVA_SHARED_DIR` | Local path to the mounted NFS share. |
 | `POLL_INTERVAL` | Seconds between queue polls when idle. |
 | `WORKER_HEARTBEAT_INTERVAL` | Heartbeat interval in seconds. |
 | `STATUS_POLL_INTERVAL` | How often to check job status while running (seconds). |
 | `LOG_LEVEL` | Python logging level (`INFO`, `DEBUG`, …). |
 | `WORKER_EXIT_AFTER_JOB` | Set to `1`/`true` to stop polling after the next job finishes. |
+
+Deucalion-only variables:
+
+| Variable | Description |
+|----------|-------------|
+| `DEUCALION_SSH_HOST` / `DEUCALION_SSH_USER` | SSH endpoint for Deucalion login node. |
+| `DEUCALION_SSH_PORT` | SSH port (default `22`). |
+| `DEUCALION_SSH_KEY_PATH` | Path inside container to private key (recommended mount RO). |
+| `DEUCALION_SSH_KNOWN_HOSTS` | Path inside container to known_hosts file (recommended mount RO). |
+| `DEUCALION_REMOTE_ROOT` | Remote root directory (default `/projects/F202508843CPCAA0/tiagocalof`). |
+| `DEUCALION_SIF_PATH` | Remote path to Singularity image (`.sif`) used to execute jobs. |
+| `DEUCALION_POLL_INTERVAL` | Slurm state poll interval in seconds (default `10`). |
+| `DEUCALION_SYNC_INTERVAL` | Remote log sync interval in seconds (default `15`). |
+| `DEUCALION_UNREACHABLE_GRACE_SECONDS` | Grace window before failing unreachable jobs (default `900`). |
+| `DEUCALION_SLURM_ACCOUNT_CPU/GPU` | Default Slurm accounts (`f202508843cpcaa0x` / `f202508843cpcaa0g`). |
+| `DEUCALION_SLURM_PARTITION_CPU/GPU` | Default partitions (`normal-x86` / `normal-a100-80`). |
+| `DEUCALION_SLURM_TIME` | Default time limit, e.g. `04:00:00`. |
+| `DEUCALION_SLURM_CPUS_PER_TASK` | Default CPU cores per task. |
+| `DEUCALION_SLURM_MEM_GB` | Default memory in GB. |
+| `DEUCALION_SLURM_GPUS` | Default GPU count (`0` means CPU job). |
 
 Start additional containers if you need multiple jobs running in parallel.
 
