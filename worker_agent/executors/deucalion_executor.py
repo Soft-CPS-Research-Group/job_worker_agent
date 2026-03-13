@@ -172,17 +172,32 @@ class DeucalionExecutor(BaseExecutor):
             f"{command_text}"
         )
 
-    def _sync_remote_artifacts(self, remote_job_dir: str, local_job_dir: Path) -> None:
+    def _sync_remote_artifacts(
+        self,
+        remote_job_dir: str,
+        remote_data_dir: str,
+        job_id: str,
+        local_job_dir: Path,
+    ) -> None:
         local_job_dir.mkdir(parents=True, exist_ok=True)
         for folder in ("results", "progress"):
-            remote_path = posixpath.join(remote_job_dir, folder)
-            exists = self.ssh.run(f"test -d {shlex.quote(remote_path)} && echo yes || true", check=False)
-            if exists.strip() != "yes":
-                continue
-            try:
-                self.ssh.copy_from(remote_path, local_job_dir, recursive=True)
-            except SSHCommandError as exc:
-                _LOGGER.warning("Failed to sync remote '%s': %s", folder, exc)
+            candidate_paths = (
+                posixpath.join(remote_data_dir, "jobs", job_id, folder),
+                posixpath.join(remote_job_dir, folder),
+            )
+            synced = False
+            for remote_path in candidate_paths:
+                exists = self.ssh.run(f"test -d {shlex.quote(remote_path)} && echo yes || true", check=False)
+                if exists.strip() != "yes":
+                    continue
+                try:
+                    self.ssh.copy_from(remote_path, local_job_dir, recursive=True)
+                    synced = True
+                    break
+                except SSHCommandError as exc:
+                    _LOGGER.warning("Failed to sync remote '%s' from %s: %s", folder, remote_path, exc)
+            if not synced:
+                _LOGGER.debug("No remote '%s' artifacts found for job %s", folder, job_id)
 
     def _render_sbatch_script(
         self,
@@ -377,7 +392,12 @@ class DeucalionExecutor(BaseExecutor):
 
                     final_status, exit_code, error = self._map_terminal_status(stop_reason, state)
                     self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
-                    self._sync_remote_artifacts(remote_job_dir, local_job_dir)
+                    self._sync_remote_artifacts(
+                        remote_job_dir=remote_job_dir,
+                        remote_data_dir=remote_data_dir,
+                        job_id=job_id,
+                        local_job_dir=local_job_dir,
+                    )
                     self.runtime._post_status(job_id, final_status, exit_code=exit_code, error=error, details=details)
                     return
                 except SSHCommandError as exc:

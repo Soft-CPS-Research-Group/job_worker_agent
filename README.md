@@ -63,6 +63,9 @@ Notes:
   `datasets/site_a/input.csv`).
 - The worker copies config + submits with `sbatch`, monitors with `squeue/sacct`,
   syncs logs incrementally, and reports final status back to backend.
+- Artifact sync prioritizes the current simulator layout under
+  `<remote_root>/runs/<job_id>/data/jobs/<job_id>/(results|progress)` and falls
+  back to legacy `<remote_root>/runs/<job_id>/(results|progress)` if needed.
 - If SSH is unavailable longer than `DEUCALION_UNREACHABLE_GRACE_SECONDS`,
   the worker fails the job with `error=deucalion_unreachable_timeout`.
 

@@ -150,8 +150,15 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
 
     job_id = "job-1"
     remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
     fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "line-from-slurm\n"
     fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "err-line\n"
+    fake_ssh.existing_paths.update(
+        {
+            f"{remote_data_job_dir}/results",
+            f"{remote_data_job_dir}/progress",
+        }
+    )
 
     _write_config(
         shared_dir,
@@ -191,6 +198,60 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     log_text = log_path.read_text(encoding="utf-8")
     assert log_text.count("line-from-slurm") == 1
     assert log_text.count("err-line") == 1
+    copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
+    assert f"{remote_data_job_dir}/results" in copied_from
+    assert f"{remote_data_job_dir}/progress" in copied_from
+
+
+def test_deucalion_executor_sync_fallback_to_legacy_artifact_paths(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+
+    job_id = "job-legacy"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "legacy-out\n"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "legacy-err\n"
+    fake_ssh.existing_paths.update(
+        {
+            f"{remote_job_dir}/results",
+            f"{remote_job_dir}/progress",
+        }
+    )
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "54321")
+    states = iter(
+        [
+            SlurmState(state="PENDING"),
+            SlurmState(state="RUNNING"),
+            SlurmState(state="COMPLETED", exit_code=0),
+        ]
+    )
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Legacy"})
+
+    copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
+    assert f"{remote_job_dir}/results" in copied_from
+    assert f"{remote_job_dir}/progress" in copied_from
 
 
 def test_deucalion_executor_exec_mode_requires_executable(tmp_path, monkeypatch):
