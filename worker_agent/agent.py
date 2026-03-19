@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import logging
 import os
 import threading
@@ -21,6 +22,12 @@ from .executors.docker_executor import DockerExecutor
 
 
 _LOGGER = logging.getLogger(__name__)
+
+_IMMEDIATE_POST_RETRIES = 3
+_RETRY_INITIAL_BACKOFF_SECONDS = 0.5
+_RETRY_MAX_BACKOFF_SECONDS = 5.0
+_TERMINAL_QUEUE_MAX_BACKOFF_SECONDS = 30.0
+_TERMINAL_JOB_STATUSES = {"finished", "failed", "stopped", "canceled"}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -65,6 +72,8 @@ class WorkerAgent:
         self._active_job_id: Optional[str] = None
         self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", DeviceRequest is not None)
         self._last_request_failure: Optional[str] = None
+        self._pending_terminal_statuses: deque[dict[str, Any]] = deque()
+        self._pending_terminal_statuses_lock = threading.Lock()
         self._env = dict(env or os.environ)
 
         self.executor = (executor or self._env.get("WORKER_EXECUTOR", "docker")).strip().lower()
@@ -109,12 +118,15 @@ class WorkerAgent:
             self._executor.close()
 
     def poll_once(self) -> bool:
+        self._flush_pending_terminal_statuses()
         self._send_heartbeat()
+        self._flush_pending_terminal_statuses()
         job = self._request_next_job()
         if not job:
             return False
         _LOGGER.info("Received job %s", job["job_id"])
         self._run_job(job)
+        self._flush_pending_terminal_statuses(force=True)
         if self._exit_after_job:
             _LOGGER.info("Exit-after-job flag set; stopping worker once current job completes")
             self.stop()
@@ -125,6 +137,134 @@ class WorkerAgent:
 
     # ------------------------------------------------------------------
     # HTTP interactions
+    def _is_retryable_http_status(self, status_code: int) -> bool:
+        return status_code in {408, 429} or 500 <= status_code < 600
+
+    def _is_retryable_exception(self, exc: requests.RequestException) -> bool:
+        if isinstance(exc, requests.HTTPError):
+            response = exc.response
+            if response is None:
+                return False
+            return self._is_retryable_http_status(response.status_code)
+        return True
+
+    def _post_json_with_retries(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        *,
+        context: str,
+        timeout: float = 10,
+        warning: bool = False,
+    ) -> Dict[str, bool]:
+        backoff = _RETRY_INITIAL_BACKOFF_SECONDS
+        last_retryable_exc: Optional[requests.RequestException] = None
+        for attempt in range(1, _IMMEDIATE_POST_RETRIES + 1):
+            try:
+                response = self._session.post(
+                    f"{self.server_url}{endpoint}",
+                    json=payload,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                self._last_request_failure = None
+                return {"ok": True, "retryable": False}
+            except requests.RequestException as exc:
+                retryable = self._is_retryable_exception(exc)
+                if not retryable:
+                    is_repeat = self._last_request_failure == context
+                    log_func = _LOGGER.warning if warning and not is_repeat else (
+                        _LOGGER.debug if is_repeat else _LOGGER.error
+                    )
+                    status_code = getattr(getattr(exc, "response", None), "status_code", "n/a")
+                    log_func(
+                        "Request to %s failed with non-retryable response (status=%s): %s",
+                        context,
+                        status_code,
+                        exc,
+                    )
+                    self._last_request_failure = context
+                    return {"ok": False, "retryable": False}
+
+                last_retryable_exc = exc
+                self._handle_request_exception(context, exc, warning=warning)
+                if attempt >= _IMMEDIATE_POST_RETRIES:
+                    break
+                sleep_for = min(backoff, _RETRY_MAX_BACKOFF_SECONDS)
+                _LOGGER.warning(
+                    "Retrying %s in %.1fs (attempt %d/%d)",
+                    context,
+                    sleep_for,
+                    attempt + 1,
+                    _IMMEDIATE_POST_RETRIES,
+                )
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2, _RETRY_MAX_BACKOFF_SECONDS)
+        if last_retryable_exc is not None:
+            _LOGGER.warning("Exhausted retries for %s: %s", context, last_retryable_exc)
+        return {"ok": False, "retryable": True}
+
+    def _enqueue_pending_terminal_status(self, payload: Dict[str, Any]) -> None:
+        job_id = payload.get("job_id")
+        status = payload.get("status")
+        with self._pending_terminal_statuses_lock:
+            for pending in self._pending_terminal_statuses:
+                existing = pending.get("payload", {})
+                if existing.get("job_id") == job_id and existing.get("status") == status:
+                    return
+            self._pending_terminal_statuses.append(
+                {
+                    "payload": dict(payload),
+                    "next_retry_at": time.monotonic(),
+                    "backoff_seconds": _RETRY_INITIAL_BACKOFF_SECONDS,
+                }
+            )
+        _LOGGER.warning(
+            "Queued terminal status for retry (job=%s status=%s)",
+            job_id,
+            status,
+        )
+
+    def _flush_pending_terminal_statuses(self, force: bool = False) -> None:
+        while True:
+            with self._pending_terminal_statuses_lock:
+                if not self._pending_terminal_statuses:
+                    return
+                entry = self._pending_terminal_statuses[0]
+                if not force and entry["next_retry_at"] > time.monotonic():
+                    return
+                entry = self._pending_terminal_statuses.popleft()
+
+            payload = entry["payload"]
+            job_id = payload.get("job_id", "unknown")
+            result = self._post_json_with_retries(
+                "/api/agent/job-status",
+                payload,
+                context=f"job-status({job_id})",
+                timeout=10,
+                warning=True,
+            )
+            if result["ok"]:
+                continue
+
+            if result["retryable"]:
+                backoff = min(
+                    max(float(entry.get("backoff_seconds", _RETRY_INITIAL_BACKOFF_SECONDS)) * 2, _RETRY_INITIAL_BACKOFF_SECONDS),
+                    _TERMINAL_QUEUE_MAX_BACKOFF_SECONDS,
+                )
+                entry["backoff_seconds"] = backoff
+                entry["next_retry_at"] = time.monotonic() + backoff
+                with self._pending_terminal_statuses_lock:
+                    self._pending_terminal_statuses.appendleft(entry)
+                _LOGGER.warning(
+                    "Will retry pending terminal status for job %s in %.1fs",
+                    job_id,
+                    backoff,
+                )
+                return
+
+            _LOGGER.error("Dropping pending terminal status for job %s after non-retryable response", job_id)
+
     def _send_heartbeat(self, force: bool = False) -> None:
         now = time.time()
         if not force:
@@ -132,16 +272,15 @@ class WorkerAgent:
                 return
         payload = {"worker_id": self.worker_id}
         _LOGGER.info("POST /api/agent/heartbeat payload=%s", payload)
-        try:
-            self._session.post(
-                f"{self.server_url}/api/agent/heartbeat",
-                json=payload,
-                timeout=10,
-            )
+        result = self._post_json_with_retries(
+            "/api/agent/heartbeat",
+            payload,
+            context="heartbeat",
+            timeout=10,
+            warning=True,
+        )
+        if result["ok"]:
             self._last_heartbeat = now
-            self._last_request_failure = None
-        except requests.RequestException as exc:  # pragma: no cover - network issues
-            self._handle_request_exception("heartbeat", exc, warning=True)
 
     def _request_next_job(self) -> Optional[Dict[str, Any]]:
         _LOGGER.info("POST /api/agent/next-job payload=%s", {"worker_id": self.worker_id})
@@ -166,15 +305,15 @@ class WorkerAgent:
         payload = {"job_id": job_id, "status": status, "worker_id": self.worker_id}
         payload.update({k: v for k, v in extra.items() if v is not None})
         _LOGGER.info("POST /api/agent/job-status payload=%s", payload)
-        try:
-            self._session.post(
-                f"{self.server_url}/api/agent/job-status",
-                json=payload,
-                timeout=10,
-            )
-            self._last_request_failure = None
-        except requests.RequestException as exc:  # pragma: no cover
-            self._handle_request_exception(f"job-status({job_id})", exc, warning=True)
+        result = self._post_json_with_retries(
+            "/api/agent/job-status",
+            payload,
+            context=f"job-status({job_id})",
+            timeout=10,
+            warning=True,
+        )
+        if not result["ok"] and result["retryable"] and status in _TERMINAL_JOB_STATUSES:
+            self._enqueue_pending_terminal_status(payload)
 
     def _fetch_status(self, job_id: str) -> Optional[str]:
         _LOGGER.info("GET /status/%s", job_id)

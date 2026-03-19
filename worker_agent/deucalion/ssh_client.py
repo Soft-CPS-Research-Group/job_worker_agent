@@ -72,13 +72,23 @@ class SSHClient:
             )
         return completed.stdout.strip()
 
-    def copy_to(self, local_path: str | Path, remote_path: str, timeout: int = 60) -> None:
-        cmd = [
-            "scp",
-            *self._ssh_base(),
-            str(local_path),
-            f"{self._remote()}:{remote_path}",
-        ]
+    def copy_to(
+        self,
+        local_path: str | Path,
+        remote_path: str,
+        timeout: int = 60,
+        recursive: bool = False,
+    ) -> None:
+        cmd = ["scp"]
+        if recursive:
+            cmd.append("-r")
+        cmd.extend(
+            [
+                *self._ssh_base(),
+                str(local_path),
+                f"{self._remote()}:{remote_path}",
+            ]
+        )
         completed = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
         if completed.returncode != 0:
             raise SSHCommandError(

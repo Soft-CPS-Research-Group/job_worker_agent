@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 import pytest
+import requests
 
 from worker_agent.agent import WorkerAgent
 
@@ -19,7 +20,7 @@ class DummyResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
 
 class DummySession:
@@ -27,12 +28,18 @@ class DummySession:
         self.calls = []
         self.next_job_responses = []
         self.status_responses = []
+        self.heartbeat_responses = []
+        self.job_status_post_responses = []
 
     def post(self, url, json=None, timeout=None):  # noqa: A003 json parameter name is intentional
         self.calls.append({"url": url, "json": json})
         if url.endswith("/heartbeat"):
+            if self.heartbeat_responses:
+                return self.heartbeat_responses.pop(0)
             return DummyResponse(200, {})
         if url.endswith("/job-status"):
+            if self.job_status_post_responses:
+                return self.job_status_post_responses.pop(0)
             return DummyResponse(200, {})
         if url.endswith("/next-job"):
             if self.next_job_responses:
@@ -305,3 +312,84 @@ def test_run_job_stop_requested(tmp_path):
     assert container.stop_called is True
     status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["json"]["status"] == "stopped"
+
+
+def test_heartbeat_retries_and_updates_timestamp_only_on_success(monkeypatch):
+    session = DummySession()
+    session.heartbeat_responses = [
+        DummyResponse(500, {}),
+        DummyResponse(503, {}),
+        DummyResponse(200, {}),
+    ]
+    monkeypatch.setattr("worker_agent.agent.time.sleep", lambda _seconds: None)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+    assert agent._last_heartbeat == 0.0
+
+    agent._send_heartbeat(force=True)
+
+    heartbeat_calls = [call for call in session.calls if call["url"].endswith("/heartbeat")]
+    assert len(heartbeat_calls) == 3
+    assert agent._last_heartbeat > 0
+
+
+def test_terminal_status_is_buffered_and_flushed_after_retryable_failures(monkeypatch):
+    session = DummySession()
+    session.job_status_post_responses = [
+        DummyResponse(500, {}),
+        DummyResponse(503, {}),
+        DummyResponse(502, {}),
+        DummyResponse(200, {}),
+    ]
+    monkeypatch.setattr("worker_agent.agent.time.sleep", lambda _seconds: None)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    agent._post_status("job-buffer", "finished", exit_code=0)
+    assert len(agent._pending_terminal_statuses) == 1
+
+    agent._flush_pending_terminal_statuses(force=True)
+    assert len(agent._pending_terminal_statuses) == 0
+
+    status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
+    assert len(status_calls) == 4
+
+
+def test_terminal_status_non_retryable_4xx_is_not_buffered():
+    session = DummySession()
+    session.job_status_post_responses = [DummyResponse(400, {})]
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    agent._post_status("job-4xx", "finished", exit_code=0)
+    assert len(agent._pending_terminal_statuses) == 0
+
+    status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
+    assert len(status_calls) == 1

@@ -42,12 +42,13 @@ class DummySession:
 
 
 class FakeSSHClient:
-    def __init__(self, existing_paths=None):
+    def __init__(self, existing_paths=None, copy_from_failures=None):
         self.commands = []
         self.copy_to_calls = []
         self.copy_from_calls = []
         self.remote_files = {}
         self.existing_paths = set(existing_paths or [])
+        self.copy_from_failures = dict(copy_from_failures or {})
 
     def _exists(self, path: str) -> bool:
         if path in self.existing_paths or path in self.remote_files:
@@ -100,15 +101,23 @@ class FakeSSHClient:
 
         return ""
 
-    def copy_to(self, local_path, remote_path, timeout=60):
-        self.copy_to_calls.append((str(local_path), remote_path))
+    def copy_to(self, local_path, remote_path, timeout=60, recursive=False):
+        self.copy_to_calls.append((str(local_path), remote_path, recursive))
         self.existing_paths.add(remote_path)
         lp = Path(local_path)
         if lp.exists() and lp.is_file():
             self.remote_files[remote_path] = lp.read_text(encoding="utf-8")
 
     def copy_from(self, remote_path, local_path, timeout=60, recursive=False):
+        remaining_failures = self.copy_from_failures.get(remote_path, 0)
+        if remaining_failures > 0:
+            self.copy_from_failures[remote_path] = remaining_failures - 1
+            raise SSHCommandError(f"copy failed for {remote_path}")
         self.copy_from_calls.append((remote_path, str(local_path), recursive))
+        if not recursive and remote_path in self.remote_files:
+            lp = Path(local_path)
+            lp.parent.mkdir(parents=True, exist_ok=True)
+            lp.write_text(self.remote_files[remote_path], encoding="utf-8")
 
 
 def _write_config(shared_dir: Path, content: dict):
@@ -201,6 +210,53 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
     assert f"{remote_data_job_dir}/results" in copied_from
     assert f"{remote_data_job_dir}/progress" in copied_from
+
+
+def test_deucalion_executor_syncs_progress_snapshot_during_execution(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+
+    job_id = "job-progress"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_progress_file = f"{remote_job_dir}/data/jobs/{job_id}/progress/progress.json"
+    fake_ssh.remote_files[remote_progress_file] = '{"step": 12}'
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "out\n"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "err\n"
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "12346")
+    states = iter(
+        [
+            SlurmState(state="PENDING"),
+            SlurmState(state="RUNNING"),
+            SlurmState(state="COMPLETED", exit_code=0),
+        ]
+    )
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    agent = _build_agent(shared_dir, session, fake_ssh, env={"DEUCALION_SYNC_INTERVAL": "0"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Progress"})
+
+    local_progress = shared_dir / "jobs" / job_id / "progress" / "progress.json"
+    assert local_progress.exists()
+    assert local_progress.read_text(encoding="utf-8") == '{"step": 12}'
 
 
 def test_deucalion_executor_sync_fallback_to_legacy_artifact_paths(tmp_path, monkeypatch):
@@ -334,7 +390,7 @@ def test_deucalion_executor_dataset_sync_copy_missing_skip_existing(tmp_path, mo
     agent = _build_agent(shared_dir, session, fake_ssh)
     agent._run_job({"job_id": "job-data", "config_path": "configs/demo.yaml", "job_name": "Data"})
 
-    copied_remote_paths = [remote for _local, remote in fake_ssh.copy_to_calls]
+    copied_remote_paths = [remote for _local, remote, _recursive in fake_ssh.copy_to_calls]
     assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in copied_remote_paths
     assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" not in copied_remote_paths
     assert any("ln -sfn /projects/F202508843CPCAA0/tiagocalof/datasets" in cmd for cmd in fake_ssh.commands)
@@ -343,6 +399,52 @@ def test_deucalion_executor_dataset_sync_copy_missing_skip_existing(tmp_path, mo
     final_details = status_calls[-1]["details"]
     assert final_details["datasets_synced"] == ["datasets/site_b/b.csv"]
     assert final_details["datasets_skipped"] == ["datasets/site_a/a.csv"]
+
+
+def test_deucalion_executor_dataset_directory_uses_recursive_copy(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    (shared_dir / "datasets" / "site_dir").mkdir(parents=True, exist_ok=True)
+    (shared_dir / "datasets" / "site_dir" / "nested.csv").write_text("x", encoding="utf-8")
+
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+                    "datasets": ["datasets/site_dir"],
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "888")
+    monkeypatch.setattr(
+        deucalion_executor_module,
+        "query_state",
+        lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0),
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": "job-dir", "config_path": "configs/demo.yaml", "job_name": "Dir"})
+
+    dataset_copy_calls = [
+        (_local, remote, recursive)
+        for _local, remote, recursive in fake_ssh.copy_to_calls
+        if remote.endswith("/datasets/site_dir")
+    ]
+    assert dataset_copy_calls, "expected dataset directory copy_to call"
+    assert dataset_copy_calls[0][2] is True
 
 
 def test_deucalion_executor_stop_requested(tmp_path, monkeypatch):
@@ -459,3 +561,92 @@ def test_deucalion_executor_unreachable_timeout(tmp_path, monkeypatch):
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
     assert status_calls[-1]["error"] == "deucalion_unreachable_timeout"
+
+
+def test_deucalion_executor_completed_but_artifact_sync_failure_marks_failed(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    job_id = "job-artifact-fail"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    results_path = f"{remote_data_job_dir}/results"
+
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+            results_path,
+            f"{remote_data_job_dir}/progress",
+        },
+        copy_from_failures={results_path: 3},
+    )
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "out\n"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "err\n"
+
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "901")
+    monkeypatch.setattr(
+        deucalion_executor_module,
+        "query_state",
+        lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0),
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsFail"})
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls[-1]["status"] == "failed"
+    assert status_calls[-1]["error"] == "artifact_sync_failed"
+    artifact_sync = status_calls[-1]["details"]["artifact_sync"]
+    assert artifact_sync["had_failure"] is True
+    assert artifact_sync["folders"]["results"]["status"] == "failed"
+
+
+def test_deucalion_executor_artifact_sync_transient_failure_keeps_finished(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    job_id = "job-artifact-retry"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    results_path = f"{remote_data_job_dir}/results"
+
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+            results_path,
+            f"{remote_data_job_dir}/progress",
+        },
+        copy_from_failures={results_path: 1},
+    )
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "out\n"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "err\n"
+
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "902")
+    monkeypatch.setattr(
+        deucalion_executor_module,
+        "query_state",
+        lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0),
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsRetry"})
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls[-1]["status"] == "finished"
+    artifact_sync = status_calls[-1]["details"]["artifact_sync"]
+    assert artifact_sync["had_failure"] is False
+    assert artifact_sync["folders"]["results"]["status"] == "synced"

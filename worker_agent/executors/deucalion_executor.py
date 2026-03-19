@@ -18,6 +18,7 @@ from worker_agent.deucalion.ssh_client import SSHClient, SSHCommandError, SSHSet
 from .base import BaseExecutor, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
+_ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS = 5.0
 
 
 class DeucalionExecutor(BaseExecutor):
@@ -38,6 +39,11 @@ class DeucalionExecutor(BaseExecutor):
         self.sync_interval = float(self.env.get("DEUCALION_SYNC_INTERVAL", "15"))
         self.unreachable_grace_seconds = float(self.env.get("DEUCALION_UNREACHABLE_GRACE_SECONDS", "900"))
         self.unknown_state_timeout_seconds = float(self.env.get("DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS", "300"))
+        self.artifact_copy_retries = max(1, int(self.env.get("DEUCALION_ARTIFACT_COPY_RETRIES", "3")))
+        self.artifact_copy_retry_backoff = max(
+            0.0,
+            float(self.env.get("DEUCALION_ARTIFACT_COPY_RETRY_BACKOFF", "0.5")),
+        )
 
         if ssh_client is None:
             ssh_client = SSHClient(
@@ -126,6 +132,39 @@ class DeucalionExecutor(BaseExecutor):
                 offsets[name] = current_size
         return offsets
 
+    def _sync_remote_progress_snapshot(
+        self,
+        remote_job_dir: str,
+        remote_data_dir: str,
+        job_id: str,
+        local_job_dir: Path,
+    ) -> None:
+        local_progress_dir = local_job_dir / "progress"
+        local_progress_dir.mkdir(parents=True, exist_ok=True)
+        local_progress_path = local_progress_dir / "progress.json"
+
+        candidate_paths = (
+            posixpath.join(remote_data_dir, "jobs", job_id, "progress", "progress.json"),
+            posixpath.join(remote_job_dir, "progress", "progress.json"),
+        )
+        for remote_path in candidate_paths:
+            exists = self.ssh.run(f"test -f {shlex.quote(remote_path)} && echo yes || true", check=False)
+            if exists.strip() != "yes":
+                continue
+            tmp_path = local_progress_path.with_name("progress.json.tmp")
+            try:
+                self.ssh.copy_from(remote_path, tmp_path, timeout=60, recursive=False)
+                os.replace(tmp_path, local_progress_path)
+                return
+            except SSHCommandError as exc:
+                _LOGGER.warning("Failed to sync remote progress snapshot from %s: %s", remote_path, exc)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+                return
+
     def _sync_datasets(self, cfg: DeucalionJobConfig) -> tuple[list[str], list[str]]:
         synced: list[str] = []
         skipped: list[str] = []
@@ -139,7 +178,7 @@ class DeucalionExecutor(BaseExecutor):
                 continue
             self._ensure_remote_dir(posixpath.dirname(remote_target))
             if local_source.is_dir():
-                self.ssh.copy_to(local_source, remote_target, timeout=180)
+                self.ssh.copy_to(local_source, remote_target, timeout=180, recursive=True)
             else:
                 self.ssh.copy_to(local_source, remote_target, timeout=120)
             synced.append(rel_path)
@@ -178,26 +217,68 @@ class DeucalionExecutor(BaseExecutor):
         remote_data_dir: str,
         job_id: str,
         local_job_dir: Path,
-    ) -> None:
+    ) -> dict[str, Any]:
         local_job_dir.mkdir(parents=True, exist_ok=True)
+        summary: dict[str, Any] = {
+            "had_failure": False,
+            "folders": {},
+        }
         for folder in ("results", "progress"):
+            folder_summary = {
+                "status": "missing",
+                "source": None,
+                "attempts": 0,
+                "errors": [],
+            }
             candidate_paths = (
                 posixpath.join(remote_data_dir, "jobs", job_id, folder),
                 posixpath.join(remote_job_dir, folder),
             )
-            synced = False
+            found_existing = False
             for remote_path in candidate_paths:
                 exists = self.ssh.run(f"test -d {shlex.quote(remote_path)} && echo yes || true", check=False)
                 if exists.strip() != "yes":
                     continue
-                try:
-                    self.ssh.copy_from(remote_path, local_job_dir, recursive=True)
-                    synced = True
+                found_existing = True
+                for attempt in range(1, self.artifact_copy_retries + 1):
+                    try:
+                        self.ssh.copy_from(remote_path, local_job_dir, recursive=True)
+                        folder_summary["status"] = "synced"
+                        folder_summary["source"] = remote_path
+                        folder_summary["attempts"] = attempt
+                        break
+                    except SSHCommandError as exc:
+                        folder_summary["source"] = remote_path
+                        folder_summary["attempts"] = attempt
+                        folder_summary["errors"].append(exc.stderr or str(exc))
+                        if attempt < self.artifact_copy_retries:
+                            backoff = min(
+                                self.artifact_copy_retry_backoff * (2 ** (attempt - 1)),
+                                _ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS,
+                            )
+                            if backoff > 0:
+                                self.sleep_fn(backoff)
+                        _LOGGER.warning(
+                            "Failed to sync remote '%s' from %s (attempt %d/%d): %s",
+                            folder,
+                            remote_path,
+                            attempt,
+                            self.artifact_copy_retries,
+                            exc,
+                        )
+                if folder_summary["status"] == "synced":
                     break
-                except SSHCommandError as exc:
-                    _LOGGER.warning("Failed to sync remote '%s' from %s: %s", folder, remote_path, exc)
-            if not synced:
-                _LOGGER.debug("No remote '%s' artifacts found for job %s", folder, job_id)
+
+            if folder_summary["status"] != "synced":
+                if found_existing:
+                    folder_summary["status"] = "failed"
+                    summary["had_failure"] = True
+                    _LOGGER.error("Failed to sync remote '%s' artifacts for job %s", folder, job_id)
+                else:
+                    folder_summary["status"] = "missing"
+                    _LOGGER.debug("No remote '%s' artifacts found for job %s", folder, job_id)
+            summary["folders"][folder] = folder_summary
+        return summary
 
     def _render_sbatch_script(
         self,
@@ -362,6 +443,12 @@ class DeucalionExecutor(BaseExecutor):
 
                     if now >= next_sync:
                         log_offsets = self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
+                        self._sync_remote_progress_snapshot(
+                            remote_job_dir=remote_job_dir,
+                            remote_data_dir=remote_data_dir,
+                            job_id=job_id,
+                            local_job_dir=local_job_dir,
+                        )
                         next_sync = now + self.sync_interval
 
                     if state.state == "UNKNOWN":
@@ -392,12 +479,22 @@ class DeucalionExecutor(BaseExecutor):
 
                     final_status, exit_code, error = self._map_terminal_status(stop_reason, state)
                     self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
-                    self._sync_remote_artifacts(
+                    self._sync_remote_progress_snapshot(
                         remote_job_dir=remote_job_dir,
                         remote_data_dir=remote_data_dir,
                         job_id=job_id,
                         local_job_dir=local_job_dir,
                     )
+                    artifact_sync = self._sync_remote_artifacts(
+                        remote_job_dir=remote_job_dir,
+                        remote_data_dir=remote_data_dir,
+                        job_id=job_id,
+                        local_job_dir=local_job_dir,
+                    )
+                    details["artifact_sync"] = artifact_sync
+                    if final_status == "finished" and artifact_sync.get("had_failure"):
+                        final_status = "failed"
+                        error = "artifact_sync_failed"
                     self.runtime._post_status(job_id, final_status, exit_code=exit_code, error=error, details=details)
                     return
                 except SSHCommandError as exc:
