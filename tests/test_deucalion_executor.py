@@ -296,8 +296,12 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
     agent = _build_agent(shared_dir, session, fake_ssh)
     agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Demo"})
 
-    # Worker should rebuild with the requested version tag.
-    assert any("docker://calof/opeva_simulator:v0.2.5" in cmd for cmd in fake_ssh.commands)
+    # Worker should rebuild with the requested version tag via SIF build sbatch script.
+    assert any(
+        "docker://calof/opeva_simulator:v0.2.5" in content
+        for content in fake_ssh.remote_files.values()
+        if isinstance(content, str)
+    )
     assert fake_ssh.remote_files[marker_path].strip() == "v0.2.5"
 
 

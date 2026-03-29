@@ -174,6 +174,14 @@ Deucalion-only variables:
 | `DEUCALION_SIF_PATH` | Remote path to Singularity image (`.sif`) used to execute jobs. |
 | `DEUCALION_SIF_IMAGE` | Docker image reference used to rebuild SIF when missing/version-changed. |
 | `DEUCALION_SIF_VERSION` | Desired SIF version marker for change detection (optional). |
+| `DEUCALION_SIF_BUILD_MODE` | `slurm` (default) or `login`. `slurm` builds SIF via batch job on compute node. |
+| `DEUCALION_SIF_BUILD_TIMEOUT_SECONDS` | Max wait for SIF build job completion (default `5400`). |
+| `DEUCALION_SIF_BUILD_POLL_INTERVAL` | Poll interval for SIF build Slurm state (default `5`). |
+| `DEUCALION_SIF_BUILD_ACCOUNT` | Optional Slurm account override for SIF build job. |
+| `DEUCALION_SIF_BUILD_PARTITION` | Optional Slurm partition override for SIF build job. |
+| `DEUCALION_SIF_BUILD_TIME` | Optional Slurm time limit override for SIF build job. |
+| `DEUCALION_SIF_BUILD_CPUS` | CPU cores for SIF build job (default `2`). |
+| `DEUCALION_SIF_BUILD_MEM_GB` | Memory for SIF build job in GB (default `8`). |
 | `DEUCALION_SIF_COMMAND_MODE` | Singularity mode (`run` or `exec`). Default: `run`. |
 | `DEUCALION_POLL_INTERVAL` | Slurm state poll interval in seconds (default `10`). |
 | `DEUCALION_SYNC_INTERVAL` | Remote log sync interval in seconds (default `15`). |

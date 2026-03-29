@@ -6,6 +6,7 @@ import posixpath
 import shlex
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
@@ -44,6 +45,22 @@ class DeucalionExecutor(BaseExecutor):
             0.0,
             float(self.env.get("DEUCALION_ARTIFACT_COPY_RETRY_BACKOFF", "0.5")),
         )
+        self.sif_pull_procs = max(1, int(self.env.get("DEUCALION_SIF_PULL_PROCS", "1")))
+        self.sif_mksquashfs_args = self.env.get("DEUCALION_SIF_MKSQUASHFS_ARGS", "").strip()
+        self.sif_build_mode = self.env.get("DEUCALION_SIF_BUILD_MODE", "slurm").strip().lower() or "slurm"
+        self.sif_build_timeout_seconds = max(
+            60.0,
+            float(self.env.get("DEUCALION_SIF_BUILD_TIMEOUT_SECONDS", "5400")),
+        )
+        self.sif_build_poll_interval = max(
+            1.0,
+            float(self.env.get("DEUCALION_SIF_BUILD_POLL_INTERVAL", "5")),
+        )
+        self.sif_build_time_limit = self.env.get("DEUCALION_SIF_BUILD_TIME", "").strip()
+        self.sif_build_partition = self.env.get("DEUCALION_SIF_BUILD_PARTITION", "").strip()
+        self.sif_build_account = self.env.get("DEUCALION_SIF_BUILD_ACCOUNT", "").strip()
+        self.sif_build_cpus = max(1, int(self.env.get("DEUCALION_SIF_BUILD_CPUS", "2")))
+        self.sif_build_mem_gb = max(1, int(self.env.get("DEUCALION_SIF_BUILD_MEM_GB", "8")))
         self.budget_refresh_interval = max(
             60.0,
             float(self.env.get("DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS", "3600")),
@@ -200,6 +217,147 @@ class DeucalionExecutor(BaseExecutor):
             return f"{base}:{cfg.sif_version}"
         return f"{image}:{cfg.sif_version}"
 
+    def _render_sif_build_script(
+        self,
+        cfg: DeucalionJobConfig,
+        image_ref: str,
+        cache_dir: str,
+        tmp_dir: str,
+        account: str,
+        partition: str,
+        time_limit: str,
+        cpus: int,
+        mem_gb: int,
+        out_path: str,
+        err_path: str,
+    ) -> str:
+        mksquashfs_line = ""
+        if self.sif_mksquashfs_args:
+            mksquashfs_line = f"APPTAINER_MKSQUASHFS_ARGS={shlex.quote(self.sif_mksquashfs_args)} "
+        lines = [
+            "#!/bin/bash",
+            f"#SBATCH -J opeva_sif_{uuid.uuid4().hex[:8]}",
+            f"#SBATCH -A {account}",
+            f"#SBATCH -p {partition}",
+            f"#SBATCH -t {time_limit}",
+            f"#SBATCH --cpus-per-task={cpus}",
+            f"#SBATCH --mem={mem_gb}G",
+            f"#SBATCH -o {out_path}",
+            f"#SBATCH -e {err_path}",
+            "",
+            "set -euo pipefail",
+            "module purge >/dev/null 2>&1 || true",
+            "module load singularity >/dev/null 2>&1 || true",
+            f"mkdir -p {shlex.quote(posixpath.dirname(cfg.sif_path))}",
+            f"mkdir -p {shlex.quote(cache_dir)}",
+            f"mkdir -p {shlex.quote(tmp_dir)}",
+            f"export APPTAINER_CACHEDIR={shlex.quote(cache_dir)}",
+            f"export APPTAINER_TMPDIR={shlex.quote(tmp_dir)}",
+            f"export APPTAINER_MKSQUASHFS_PROCS={self.sif_pull_procs}",
+            f"export SINGULARITY_CACHEDIR={shlex.quote(cache_dir)}",
+            f"export SINGULARITY_TMPDIR={shlex.quote(tmp_dir)}",
+            f"export SINGULARITY_MKSQUASHFS_PROCS={self.sif_pull_procs}",
+            (
+                "if command -v apptainer >/dev/null 2>&1; then "
+                f"{mksquashfs_line}apptainer build --force {shlex.quote(cfg.sif_path)} "
+                f"docker://{shlex.quote(image_ref)}; "
+                "elif command -v singularity >/dev/null 2>&1; then "
+                f"singularity build --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}; "
+                "else "
+                "echo 'Neither apptainer nor singularity found on PATH' >&2; exit 127; "
+                "fi"
+            ),
+            f"test -f {shlex.quote(cfg.sif_path)}",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _read_remote_tail(self, remote_path: str, lines: int = 80) -> str:
+        return self.ssh.run(
+            (
+                f"if [ -f {shlex.quote(remote_path)} ]; then "
+                f"tail -n {max(1, lines)} {shlex.quote(remote_path)}; "
+                "fi"
+            ),
+            timeout=60,
+            check=False,
+        ).strip()
+
+    def _ensure_remote_sif_via_slurm(
+        self,
+        cfg: DeucalionJobConfig,
+        image_ref: str,
+        marker_path: str,
+        cache_dir: str,
+        tmp_dir: str,
+    ) -> None:
+        remote_root = self._remote_root(cfg)
+        build_root = posixpath.join(remote_root, ".opeva", "sif_builds")
+        build_id = uuid.uuid4().hex[:10]
+        build_dir = posixpath.join(build_root, build_id)
+        self._ensure_remote_dir(build_dir)
+        remote_script_path = posixpath.join(build_dir, "build_sif.sbatch")
+
+        account = self.sif_build_account or cfg.profile.account
+        partition = self.sif_build_partition or cfg.profile.partition
+        time_limit = self.sif_build_time_limit or cfg.profile.time_limit
+        cpus = self.sif_build_cpus
+        mem_gb = self.sif_build_mem_gb
+        out_path = posixpath.join(build_dir, "sif-build.out")
+        err_path = posixpath.join(build_dir, "sif-build.err")
+        script_text = self._render_sif_build_script(
+            cfg=cfg,
+            image_ref=image_ref,
+            cache_dir=cache_dir,
+            tmp_dir=tmp_dir,
+            account=account,
+            partition=partition,
+            time_limit=time_limit,
+            cpus=cpus,
+            mem_gb=mem_gb,
+            out_path=out_path,
+            err_path=err_path,
+        )
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            tmp.write(script_text)
+            tmp_path = Path(tmp.name)
+        try:
+            self.ssh.copy_to(tmp_path, remote_script_path, timeout=60, recursive=False)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=build_dir)
+        deadline = self.now_fn() + self.sif_build_timeout_seconds
+        while True:
+            state = query_state(self.ssh, slurm_job_id)
+            if state.state in ACTIVE_STATES or state.state == "UNKNOWN":
+                if self.now_fn() > deadline:
+                    scancel_job(self.ssh, slurm_job_id)
+                    raise TimeoutError(
+                        f"SIF build timed out (job={slurm_job_id}, state={state.state}) for docker://{image_ref}"
+                    )
+                self.sleep_fn(self.sif_build_poll_interval)
+                continue
+            if state.state == "COMPLETED" and self._sif_exists(cfg.sif_path):
+                break
+            out_tail = self._read_remote_tail(out_path)
+            err_tail = self._read_remote_tail(err_path)
+            details = "; ".join(
+                part
+                for part in [
+                    f"state={state.state}",
+                    f"exit_code={state.exit_code}",
+                    f"stdout_tail={out_tail}" if out_tail else "",
+                    f"stderr_tail={err_tail}" if err_tail else "",
+                ]
+                if part
+            )
+            raise FileNotFoundError(
+                f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref} via Slurm job {slurm_job_id}. {details}"
+            )
+
+        if cfg.sif_version:
+            self._write_remote_file_text(marker_path, cfg.sif_version)
+
     def _ensure_remote_sif(self, cfg: DeucalionJobConfig) -> None:
         sif_exists = self._sif_exists(cfg.sif_path)
         marker_path = self._sif_version_marker_path(cfg)
@@ -217,26 +375,110 @@ class DeucalionExecutor(BaseExecutor):
                 f"Cannot refresh SIF ({reason}) at {cfg.sif_path}: no sif_image provided."
             )
 
+        remote_root = self._remote_root(cfg)
         sif_dir = posixpath.dirname(cfg.sif_path)
+        cache_dir = self.env.get(
+            "DEUCALION_SIF_CACHE_DIR",
+            posixpath.join(remote_root, ".opeva", "sif_cache"),
+        )
+        tmp_dir = self.env.get(
+            "DEUCALION_SIF_TMP_DIR",
+            posixpath.join(remote_root, ".opeva", "sif_tmp"),
+        )
         self._ensure_remote_dir(sif_dir)
+        self._ensure_remote_dir(cache_dir)
+        self._ensure_remote_dir(tmp_dir)
+
+        if self.sif_build_mode == "slurm":
+            self._ensure_remote_sif_via_slurm(
+                cfg=cfg,
+                image_ref=image_ref,
+                marker_path=marker_path,
+                cache_dir=cache_dir,
+                tmp_dir=tmp_dir,
+            )
+            return
+
+        pull_env = (
+            f"APPTAINER_CACHEDIR={shlex.quote(cache_dir)} "
+            f"APPTAINER_TMPDIR={shlex.quote(tmp_dir)} "
+            f"APPTAINER_MKSQUASHFS_PROCS={self.sif_pull_procs} "
+            f"SINGULARITY_CACHEDIR={shlex.quote(cache_dir)} "
+            f"SINGULARITY_TMPDIR={shlex.quote(tmp_dir)} "
+            f"SINGULARITY_MKSQUASHFS_PROCS={self.sif_pull_procs}"
+        )
 
         build_ok = False
-        for candidate in ("apptainer", "singularity"):
-            build_cmd = (
-                f"command -v {candidate} >/dev/null 2>&1 && {candidate} pull --force "
-                f"{shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}"
-            )
+        attempt_errors: list[str] = []
+        mksquashfs_flag = (
+            f"--mksquashfs-args {shlex.quote(self.sif_mksquashfs_args)} " if self.sif_mksquashfs_args else ""
+        )
+
+        build_attempts = [
+            (
+                "apptainer+mksquashfs-args",
+                f"{pull_env} command -v apptainer >/dev/null 2>&1 && "
+                f"apptainer build --force {mksquashfs_flag}{shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+            (
+                "singularity+keep-layers",
+                f"{pull_env} command -v singularity >/dev/null 2>&1 && "
+                f"singularity build --force --keep-layers {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+            (
+                "singularity+build",
+                f"{pull_env} command -v singularity >/dev/null 2>&1 && "
+                f"singularity build --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+            (
+                "apptainer",
+                f"{pull_env} command -v apptainer >/dev/null 2>&1 && "
+                f"apptainer pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+            (
+                "singularity",
+                f"{pull_env} command -v singularity >/dev/null 2>&1 && "
+                f"singularity pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+            (
+                "module+apptainer",
+                f"source /etc/profile >/dev/null 2>&1 || true; "
+                f"source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
+                f"module load apptainer >/dev/null 2>&1 || true; "
+                f"{pull_env} "
+                f"command -v apptainer >/dev/null 2>&1 && "
+                f"apptainer pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+            (
+                "module+singularity",
+                f"source /etc/profile >/dev/null 2>&1 || true; "
+                f"source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
+                f"module load singularity >/dev/null 2>&1 || true; "
+                f"{pull_env} "
+                f"command -v singularity >/dev/null 2>&1 && "
+                f"singularity pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
+            ),
+        ]
+
+        for attempt_name, build_cmd in build_attempts:
             try:
                 self.ssh.run(build_cmd, timeout=1800, check=True)
-            except SSHCommandError:
+            except SSHCommandError as exc:
+                stderr = (exc.stderr or exc.stdout or str(exc)).strip().replace("\n", " | ")
+                if stderr:
+                    attempt_errors.append(f"{attempt_name}: {stderr}")
+                else:
+                    attempt_errors.append(f"{attempt_name}: command failed (rc={exc.returncode})")
                 continue
             if self._sif_exists(cfg.sif_path):
                 build_ok = True
                 break
+            attempt_errors.append(f"{attempt_name}: command completed but SIF path still missing")
 
         if not build_ok:
+            details = "; ".join(attempt_errors) if attempt_errors else "no pull attempt details available"
             raise FileNotFoundError(
-                f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref}"
+                f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref}. Attempts: {details}"
             )
 
         if cfg.sif_version:

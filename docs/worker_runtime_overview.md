@@ -136,8 +136,8 @@ all other reporting remains intact.
 
 Deucalion mode requires SSH settings and Slurm defaults via environment:
 `DEUCALION_SSH_*`, `DEUCALION_SIF_PATH`, optional
-`DEUCALION_SIF_COMMAND_MODE`, `DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS`, and
-optional `DEUCALION_SLURM_*`.
+`DEUCALION_SIF_BUILD_MODE` (default `slurm`), `DEUCALION_SIF_COMMAND_MODE`,
+`DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS`, and optional `DEUCALION_SLURM_*`.
 
 ## Backend expectations
 
