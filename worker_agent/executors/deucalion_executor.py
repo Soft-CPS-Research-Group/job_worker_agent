@@ -54,6 +54,7 @@ class DeucalionExecutor(BaseExecutor):
             60,
             int(self.env.get("DEUCALION_DATASET_COPY_TIMEOUT_SECONDS", "1800")),
         )
+        self.container_workdir = self.env.get("DEUCALION_CONTAINER_WORKDIR", "/app").strip()
         self.sif_pull_procs = max(1, int(self.env.get("DEUCALION_SIF_PULL_PROCS", "1")))
         self.sif_mksquashfs_args = self.env.get("DEUCALION_SIF_MKSQUASHFS_ARGS", "").strip()
         self.sif_build_mode = self.env.get("DEUCALION_SIF_BUILD_MODE", "slurm").strip().lower() or "slurm"
@@ -643,8 +644,10 @@ class DeucalionExecutor(BaseExecutor):
                 raise ValueError(
                     "execution.deucalion.command_mode=exec requires an explicit executable in the command"
                 )
+        pwd_opt = f"--pwd {shlex.quote(self.container_workdir)} " if self.container_workdir else ""
         return (
             f"singularity {cfg.command_mode} "
+            f"{pwd_opt}"
             f"--bind {shlex.quote(remote_data_dir)}:/data "
             f"{shlex.quote(cfg.sif_path)} "
             f"{command_text}"

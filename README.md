@@ -183,6 +183,7 @@ Deucalion-only variables:
 | `DEUCALION_SIF_BUILD_CPUS` | CPU cores for SIF build job (default `2`). |
 | `DEUCALION_SIF_BUILD_MEM_GB` | Memory for SIF build job in GB (default `8`). |
 | `DEUCALION_SIF_COMMAND_MODE` | Singularity mode (`run` or `exec`). Default: `run`. |
+| `DEUCALION_CONTAINER_WORKDIR` | Working directory inside container for Singularity actions (default `/app`). |
 | `DEUCALION_DATASET_COPY_RETRIES` | Retries for dataset SCP sync (default `3`). |
 | `DEUCALION_DATASET_COPY_RETRY_BACKOFF` | Base backoff seconds for dataset copy retries (default `2.0`). |
 | `DEUCALION_DATASET_COPY_TIMEOUT_SECONDS` | Timeout for directory dataset copy (default `1800`). |
