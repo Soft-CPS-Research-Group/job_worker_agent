@@ -86,6 +86,14 @@ class FakeSSHClient:
             self.remote_files[link] = f"symlink->{target}"
             return ""
 
+        m = re.match(r"printf %s (\S+) > (\S+)$", command)
+        if m:
+            content = m.group(1).strip("'\"")
+            remote_path = m.group(2).strip("'\"")
+            self.existing_paths.add(remote_path)
+            self.remote_files[remote_path] = content
+            return ""
+
         m = re.match(r"if \[ -f (\S+) \]; then wc -c < (\S+); else echo 0; fi$", command)
         if m:
             path = m.group(1).strip("'\"")
@@ -249,7 +257,10 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
     shared_dir.mkdir()
     session = DummySession()
     sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
-    marker_path = f"{sif_path}.version"
+    marker_path = (
+        "/projects/F202508843CPCAA0/tiagocalof/.opeva/sif_versions/"
+        "projects__F202508843CPCAA0__tiagocalof__images__sim.sif.version"
+    )
     fake_ssh = FakeSSHClient(
         existing_paths={
             "/projects/F202508843CPCAA0/tiagocalof",

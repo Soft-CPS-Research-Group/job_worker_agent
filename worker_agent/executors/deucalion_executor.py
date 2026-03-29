@@ -164,8 +164,10 @@ class DeucalionExecutor(BaseExecutor):
     def _sif_exists(self, sif_path: str) -> bool:
         return self._remote_exists(sif_path, kind="f")
 
-    def _sif_version_marker_path(self, sif_path: str) -> str:
-        return f"{sif_path}.version"
+    def _sif_version_marker_path(self, cfg: DeucalionJobConfig) -> str:
+        marker_dir = posixpath.join(self._remote_root(cfg), ".opeva", "sif_versions")
+        marker_name = f"{cfg.sif_path.strip('/').replace('/', '__')}.version"
+        return posixpath.join(marker_dir, marker_name)
 
     def _read_remote_file_text(self, remote_path: str) -> str | None:
         output = self.ssh.run(
@@ -176,16 +178,12 @@ class DeucalionExecutor(BaseExecutor):
         return output or None
 
     def _write_remote_file_text(self, remote_path: str, content: str) -> None:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        try:
-            self.ssh.copy_to(tmp_path, remote_path, timeout=30)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        remote_dir = posixpath.dirname(remote_path)
+        self._ensure_remote_dir(remote_dir)
+        self.ssh.run(
+            f"printf %s {shlex.quote(content)} > {shlex.quote(remote_path)}",
+            timeout=30,
+        )
 
     def _image_ref_for_version(self, cfg: DeucalionJobConfig) -> str | None:
         if not cfg.sif_image:
@@ -204,7 +202,8 @@ class DeucalionExecutor(BaseExecutor):
 
     def _ensure_remote_sif(self, cfg: DeucalionJobConfig) -> None:
         sif_exists = self._sif_exists(cfg.sif_path)
-        remote_version = self._read_remote_file_text(self._sif_version_marker_path(cfg.sif_path))
+        marker_path = self._sif_version_marker_path(cfg)
+        remote_version = self._read_remote_file_text(marker_path)
         version_changed = bool(cfg.sif_version) and cfg.sif_version != remote_version
         needs_refresh = (not sif_exists) or version_changed
 
@@ -227,7 +226,10 @@ class DeucalionExecutor(BaseExecutor):
                 f"command -v {candidate} >/dev/null 2>&1 && {candidate} pull --force "
                 f"{shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}"
             )
-            self.ssh.run(build_cmd, timeout=1800, check=False)
+            try:
+                self.ssh.run(build_cmd, timeout=1800, check=True)
+            except SSHCommandError:
+                continue
             if self._sif_exists(cfg.sif_path):
                 build_ok = True
                 break
@@ -239,8 +241,8 @@ class DeucalionExecutor(BaseExecutor):
 
         if cfg.sif_version:
             self._write_remote_file_text(
-                self._sif_version_marker_path(cfg.sif_path),
-                f"{cfg.sif_version}\n",
+                marker_path,
+                cfg.sif_version,
             )
 
     def _remote_exists(self, path: str, kind: str = "e") -> bool:
