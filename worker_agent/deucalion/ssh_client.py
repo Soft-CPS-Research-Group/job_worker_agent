@@ -89,7 +89,15 @@ class SSHClient:
                 f"{self._remote()}:{remote_path}",
             ]
         )
-        completed = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        try:
+            completed = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise SSHCommandError(
+                f"SCP to remote timed out after {timeout}s",
+                returncode=None,
+                stdout=(exc.stdout or ""),
+                stderr=(exc.stderr or ""),
+            ) from exc
         if completed.returncode != 0:
             raise SSHCommandError(
                 f"SCP to remote failed ({completed.returncode})",
@@ -109,7 +117,15 @@ class SSHClient:
                 str(local_path),
             ]
         )
-        completed = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        try:
+            completed = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise SSHCommandError(
+                f"SCP from remote timed out after {timeout}s",
+                returncode=None,
+                stdout=(exc.stdout or ""),
+                stderr=(exc.stderr or ""),
+            ) from exc
         if completed.returncode != 0:
             raise SSHCommandError(
                 f"SCP from remote failed ({completed.returncode})",

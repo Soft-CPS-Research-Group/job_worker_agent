@@ -45,6 +45,15 @@ class DeucalionExecutor(BaseExecutor):
             0.0,
             float(self.env.get("DEUCALION_ARTIFACT_COPY_RETRY_BACKOFF", "0.5")),
         )
+        self.dataset_copy_retries = max(1, int(self.env.get("DEUCALION_DATASET_COPY_RETRIES", "3")))
+        self.dataset_copy_retry_backoff = max(
+            0.0,
+            float(self.env.get("DEUCALION_DATASET_COPY_RETRY_BACKOFF", "2.0")),
+        )
+        self.dataset_copy_timeout_seconds = max(
+            60,
+            int(self.env.get("DEUCALION_DATASET_COPY_TIMEOUT_SECONDS", "1800")),
+        )
         self.sif_pull_procs = max(1, int(self.env.get("DEUCALION_SIF_PULL_PROCS", "1")))
         self.sif_mksquashfs_args = self.env.get("DEUCALION_SIF_MKSQUASHFS_ARGS", "").strip()
         self.sif_build_mode = self.env.get("DEUCALION_SIF_BUILD_MODE", "slurm").strip().lower() or "slurm"
@@ -582,10 +591,35 @@ class DeucalionExecutor(BaseExecutor):
                 skipped.append(rel_path)
                 continue
             self._ensure_remote_dir(posixpath.dirname(remote_target))
-            if local_source.is_dir():
-                self.ssh.copy_to(local_source, remote_target, timeout=180, recursive=True)
-            else:
-                self.ssh.copy_to(local_source, remote_target, timeout=120)
+            is_dir = local_source.is_dir()
+            timeout = self.dataset_copy_timeout_seconds if is_dir else 300
+            last_exc: SSHCommandError | None = None
+            for attempt in range(1, self.dataset_copy_retries + 1):
+                try:
+                    self.ssh.copy_to(local_source, remote_target, timeout=timeout, recursive=is_dir)
+                    last_exc = None
+                    break
+                except SSHCommandError as exc:
+                    last_exc = exc
+                    _LOGGER.warning(
+                        "Dataset sync failed for %s -> %s (attempt %d/%d): %s",
+                        local_source,
+                        remote_target,
+                        attempt,
+                        self.dataset_copy_retries,
+                        exc,
+                    )
+                    if attempt < self.dataset_copy_retries and self.dataset_copy_retry_backoff > 0:
+                        backoff = min(
+                            self.dataset_copy_retry_backoff * (2 ** (attempt - 1)),
+                            _ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS * 6,
+                        )
+                        self.sleep_fn(backoff)
+            if last_exc is not None:
+                detail = (last_exc.stderr or last_exc.stdout or str(last_exc)).strip().replace("\n", " | ")
+                raise RuntimeError(
+                    f"Failed to sync dataset '{rel_path}' to '{remote_target}': {detail or 'unknown SCP error'}"
+                ) from last_exc
             synced.append(rel_path)
         return synced, skipped
 
