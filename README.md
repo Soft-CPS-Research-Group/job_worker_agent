@@ -112,8 +112,9 @@ Need to abort immediately? `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh 
 removes the worker and any job containers without waiting for the current job to finish,
 and posts a `failed` status with `error="force-stop"` for each running job.
 The worker always passes the job id as `--job_id <value>` to match the simulator
-entrypoint and automatically requests GPUs when available, falling back to CPU
-if Docker cannot satisfy the request.
+entrypoint. GPU requests are controlled explicitly via `WORKER_ENABLE_GPU=true`
+(recommended only on GPU-capable hosts). If enabled, the worker falls back to CPU
+when Docker cannot satisfy GPU allocation.
 
 ## Manual setup
 
@@ -156,6 +157,10 @@ Environment variables:
 | `STATUS_POLL_INTERVAL` | How often to check job status while running (seconds). |
 | `LOG_LEVEL` | Python logging level (`INFO`, `DEBUG`, …). |
 | `WORKER_EXIT_AFTER_JOB` | Set to `1`/`true` to stop polling after the next job finishes. |
+
+Cadence alignment with backend:
+- Typical setup: `WORKER_HEARTBEAT_INTERVAL=30` with backend `HOST_HEARTBEAT_TTL=60`.
+- More responsive host status in UI: `WORKER_HEARTBEAT_INTERVAL=15` and backend `HOST_HEARTBEAT_TTL=45`.
 
 Deucalion-only variables:
 

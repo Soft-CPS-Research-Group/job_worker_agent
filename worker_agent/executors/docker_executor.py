@@ -34,6 +34,31 @@ class DockerExecutor(BaseExecutor):
             self._docker_client_instance = self._docker_client_factory()
         return self._docker_client_instance
 
+    def _is_name_conflict_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "conflict" in message and "already in use" in message
+
+    def _remove_stale_container(self, client: "docker.DockerClient", container_name: str) -> bool:
+        try:
+            stale = client.containers.get(container_name)
+        except Exception:
+            return False
+        try:
+            stale.remove(force=True)
+            _LOGGER.warning("Removed stale container '%s' before retry", container_name)
+            return True
+        except Exception as remove_exc:
+            _LOGGER.warning("Failed to remove stale container '%s': %s", container_name, remove_exc)
+            return False
+
+    def _append_startup_error_log(self, job_id: str, exc: Exception) -> None:
+        try:
+            log_path = self.runtime._prepare_log_file(job_id)
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"[worker] startup failure: {exc}\n")
+        except Exception:  # pragma: no cover - defensive logging
+            pass
+
     def run_job(self, job: Dict[str, Any]) -> None:
         job_id = job["job_id"]
         config_path = job["config_path"]
@@ -76,7 +101,22 @@ class DockerExecutor(BaseExecutor):
             except Exception as exc:
                 if device_requests:
                     _LOGGER.info("GPU request failed (%s); retrying without GPU", exc)
+                    self._remove_stale_container(client, container_name)
                     run_kwargs.pop("device_requests", None)
+                    try:
+                        container = client.containers.run(**run_kwargs)
+                    except Exception as retry_exc:
+                        if self._is_name_conflict_error(retry_exc):
+                            self._remove_stale_container(client, container_name)
+                            container = client.containers.run(**run_kwargs)
+                        else:
+                            raise
+                elif self._is_name_conflict_error(exc):
+                    _LOGGER.warning(
+                        "Container name conflict for '%s'; removing stale container and retrying once",
+                        container_name,
+                    )
+                    self._remove_stale_container(client, container_name)
                     container = client.containers.run(**run_kwargs)
                 else:
                     raise
@@ -141,6 +181,7 @@ class DockerExecutor(BaseExecutor):
                 _LOGGER.info("Job %s exited with status '%s' (exit code %s)", job_id, status, exit_code)
         except Exception as exc:
             _LOGGER.exception("Job %s failed: %s", job_id, exc)
+            self._append_startup_error_log(job_id, exc)
             self.runtime._post_status(job_id, "failed", error=str(exc))
         finally:
             monitor_stop.set()

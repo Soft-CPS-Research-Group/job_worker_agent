@@ -74,7 +74,7 @@ class WorkerAgent:
         self._active_job_status: Optional[str] = None
         self._last_job_id: Optional[str] = None
         self._last_terminal_status: Optional[str] = None
-        self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", DeviceRequest is not None)
+        self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", False)
         self._last_request_failure: Optional[str] = None
         self._pending_terminal_statuses: deque[dict[str, Any]] = deque()
         self._pending_terminal_statuses_lock = threading.Lock()
@@ -110,6 +110,7 @@ class WorkerAgent:
         info: Dict[str, Any] = {
             "executor": self.executor,
             "worker_version": self._worker_version,
+            "gpu_enabled": self._gpu_request_enabled,
             "active_job_id": self._active_job_id,
             "active_job_count": 1 if self._active_job_id else 0,
             "last_job_id": self._last_job_id,
