@@ -43,6 +43,23 @@ class SSHClient:
             "StrictHostKeyChecking=yes",
         ]
 
+    def _scp_base(self) -> list[str]:
+        # scp uses -P (uppercase) for port; -p means preserve timestamps.
+        return [
+            "-P",
+            str(self.settings.port),
+            "-i",
+            self.settings.key_path,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={self.settings.connect_timeout}",
+            "-o",
+            f"UserKnownHostsFile={self.settings.known_hosts_path}",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ]
+
     def _remote(self) -> str:
         return f"{self.settings.user}@{self.settings.host}"
 
@@ -84,7 +101,7 @@ class SSHClient:
             cmd.append("-r")
         cmd.extend(
             [
-                *self._ssh_base(),
+                *self._scp_base(),
                 str(local_path),
                 f"{self._remote()}:{remote_path}",
             ]
@@ -112,7 +129,7 @@ class SSHClient:
             cmd.append("-r")
         cmd.extend(
             [
-                *self._ssh_base(),
+                *self._scp_base(),
                 f"{self._remote()}:{remote_path}",
                 str(local_path),
             ]
