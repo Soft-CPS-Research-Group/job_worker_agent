@@ -13,6 +13,7 @@ def test_resolve_config_cpu_defaults():
     assert cfg.profile.partition == "normal-x86"
     assert cfg.command_mode == "run"
     assert cfg.datasets == []
+    assert cfg.sif_version is None
 
 
 def test_resolve_config_gpu_and_yaml_override():
@@ -49,6 +50,20 @@ def test_resolve_config_command_mode_env_default():
         env={"DEUCALION_SIF_COMMAND_MODE": "exec"},
     )
     assert cfg.command_mode == "exec"
+
+
+def test_resolve_config_sif_version_from_yaml_and_env():
+    cfg = resolve_deucalion_job_config(
+        config={"execution": {"deucalion": {"sif_path": "/remote/sim.sif", "sif_version": "v0.2.5"}}},
+        env={"DEUCALION_SIF_VERSION": "v0.2.4"},
+    )
+    assert cfg.sif_version == "v0.2.5"
+
+    cfg_env = resolve_deucalion_job_config(
+        config={"execution": {"deucalion": {"sif_path": "/remote/sim.sif"}}},
+        env={"DEUCALION_SIF_VERSION": "v0.2.4"},
+    )
+    assert cfg_env.sif_version == "v0.2.4"
 
 
 @pytest.mark.parametrize(

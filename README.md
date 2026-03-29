@@ -172,6 +172,8 @@ Deucalion-only variables:
 | `DEUCALION_SSH_KNOWN_HOSTS` | Path inside container to known_hosts file (recommended mount RO). |
 | `DEUCALION_REMOTE_ROOT` | Remote root directory (default `/projects/F202508843CPCAA0/tiagocalof`). |
 | `DEUCALION_SIF_PATH` | Remote path to Singularity image (`.sif`) used to execute jobs. |
+| `DEUCALION_SIF_IMAGE` | Docker image reference used to rebuild SIF when missing/version-changed. |
+| `DEUCALION_SIF_VERSION` | Desired SIF version marker for change detection (optional). |
 | `DEUCALION_SIF_COMMAND_MODE` | Singularity mode (`run` or `exec`). Default: `run`. |
 | `DEUCALION_POLL_INTERVAL` | Slurm state poll interval in seconds (default `10`). |
 | `DEUCALION_SYNC_INTERVAL` | Remote log sync interval in seconds (default `15`). |
@@ -186,6 +188,7 @@ Deucalion-only variables:
 
 Per-job overrides in YAML (`execution.deucalion`) support:
 - `command_mode: run|exec` (default `run`)
+- `sif_image: <repo/image>` and `sif_version: <tag>` (optional refresh-by-version)
 - `datasets: [datasets/...,...]` (relative to shared root; copied to
   `<remote_root>/datasets/...` only when missing)
 - existing keys: `account`, `partition`, `time`, `cpus_per_task`, `mem_gb`,

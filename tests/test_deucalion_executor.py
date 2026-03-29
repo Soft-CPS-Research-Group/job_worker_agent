@@ -99,6 +99,19 @@ class FakeSSHClient:
             idx = max(0, start - 1)
             return content[idx:]
 
+        m = re.match(r"if \[ -f (\S+) \]; then cat (\S+); fi$", command)
+        if m:
+            path = m.group(1).strip("'\"")
+            return self.remote_files.get(path, "")
+
+        if " pull --force " in command and " docker://" in command:
+            m = re.search(r"pull --force (\S+) docker://", command)
+            if m:
+                sif_path = m.group(1).strip("'\"")
+                self.existing_paths.add(sif_path)
+                self.remote_files[sif_path] = "sif-binary"
+            return ""
+
         return ""
 
     def copy_to(self, local_path, remote_path, timeout=60, recursive=False):
@@ -229,6 +242,52 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
     assert f"{remote_data_job_dir}/results" in copied_from
     assert f"{remote_data_job_dir}/progress" in copied_from
+
+
+def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
+    marker_path = f"{sif_path}.version"
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            sif_path,
+            marker_path,
+        }
+    )
+    fake_ssh.remote_files[marker_path] = "v0.2.4\n"
+
+    job_id = "job-version-refresh"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "line-from-slurm\n"
+    fake_ssh.existing_paths.update({f"{remote_data_job_dir}/results", f"{remote_data_job_dir}/progress"})
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": sif_path,
+                    "sif_image": "calof/opeva_simulator",
+                    "sif_version": "v0.2.5",
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "12345")
+    states = iter([SlurmState(state="PENDING"), SlurmState(state="COMPLETED", exit_code=0)])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Demo"})
+
+    # Worker should rebuild with the requested version tag.
+    assert any("docker://calof/opeva_simulator:v0.2.5" in cmd for cmd in fake_ssh.commands)
+    assert fake_ssh.remote_files[marker_path].strip() == "v0.2.5"
 
 
 def test_deucalion_heartbeat_includes_budget_snapshot_and_uses_cache(tmp_path):

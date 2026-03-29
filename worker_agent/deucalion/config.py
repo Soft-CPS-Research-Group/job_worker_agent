@@ -23,6 +23,8 @@ class SlurmProfile:
 class DeucalionJobConfig:
     remote_root: str
     sif_path: str
+    sif_image: str | None
+    sif_version: str | None
     command_mode: str
     datasets: list[str]
     required_paths: list[str]
@@ -128,6 +130,20 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
     if not sif_path:
         raise ValueError("Missing Deucalion SIF path. Set DEUCALION_SIF_PATH or execution.deucalion.sif_path")
 
+    sif_image = _as_str(
+        _pick(deucalion, "sif_image"),
+        env.get("DEUCALION_SIF_IMAGE", ""),
+    )
+    if not sif_image:
+        sif_image = None
+
+    sif_version = _as_str(
+        _pick(deucalion, "sif_version"),
+        env.get("DEUCALION_SIF_VERSION", ""),
+    )
+    if not sif_version:
+        sif_version = None
+
     remote_root = _as_str(
         env.get("DEUCALION_REMOTE_ROOT"),
         DEFAULT_DEUCALION_REMOTE_ROOT,
@@ -143,6 +159,8 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
     return DeucalionJobConfig(
         remote_root=remote_root,
         sif_path=sif_path,
+        sif_image=sif_image,
+        sif_version=sif_version,
         command_mode=command_mode,
         datasets=datasets,
         required_paths=required_paths,

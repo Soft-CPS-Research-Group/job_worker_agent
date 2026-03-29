@@ -80,7 +80,7 @@ updates.
 
 - The worker connects to Deucalion over SSH and validates remote prerequisites:
   - remote root exists (default `/projects/F202508843CPCAA0/tiagocalof`)
-  - configured `.sif` exists
+  - configured `.sif` exists (or is rebuilt from `sif_image` when allowed)
   - optional `execution.deucalion.required_paths` exist
 - The worker writes config + sbatch script under:
   - `<remote_root>/runs/<job_id>/`
@@ -111,7 +111,7 @@ updates.
     `error=slurm_unknown_timeout`
 - Job-specific overrides can be defined in YAML under `execution.deucalion.*`
   (account/partition/time/cpus/mem/gpus/modules/sif_path/required_paths/
-  command_mode/datasets).
+  command_mode/datasets/sif_image/sif_version).
 
 ## CLI & configuration inputs
 

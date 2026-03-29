@@ -161,6 +161,88 @@ class DeucalionExecutor(BaseExecutor):
     def _check_remote_path(self, path: str, kind: str = "e") -> None:
         self.ssh.run(f"test -{kind} {shlex.quote(path)}", timeout=30)
 
+    def _sif_exists(self, sif_path: str) -> bool:
+        return self._remote_exists(sif_path, kind="f")
+
+    def _sif_version_marker_path(self, sif_path: str) -> str:
+        return f"{sif_path}.version"
+
+    def _read_remote_file_text(self, remote_path: str) -> str | None:
+        output = self.ssh.run(
+            f"if [ -f {shlex.quote(remote_path)} ]; then cat {shlex.quote(remote_path)}; fi",
+            timeout=30,
+            check=False,
+        ).strip()
+        return output or None
+
+    def _write_remote_file_text(self, remote_path: str, content: str) -> None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            self.ssh.copy_to(tmp_path, remote_path, timeout=30)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _image_ref_for_version(self, cfg: DeucalionJobConfig) -> str | None:
+        if not cfg.sif_image:
+            return None
+        if not cfg.sif_version:
+            return cfg.sif_image
+        if "@" in cfg.sif_image:
+            return cfg.sif_image
+
+        image = cfg.sif_image
+        last_segment = image.rsplit("/", 1)[-1]
+        if ":" in last_segment:
+            base, _tag = image.rsplit(":", 1)
+            return f"{base}:{cfg.sif_version}"
+        return f"{image}:{cfg.sif_version}"
+
+    def _ensure_remote_sif(self, cfg: DeucalionJobConfig) -> None:
+        sif_exists = self._sif_exists(cfg.sif_path)
+        remote_version = self._read_remote_file_text(self._sif_version_marker_path(cfg.sif_path))
+        version_changed = bool(cfg.sif_version) and cfg.sif_version != remote_version
+        needs_refresh = (not sif_exists) or version_changed
+
+        if not needs_refresh:
+            return
+
+        image_ref = self._image_ref_for_version(cfg)
+        if not image_ref:
+            reason = "version mismatch" if version_changed else "missing SIF"
+            raise FileNotFoundError(
+                f"Cannot refresh SIF ({reason}) at {cfg.sif_path}: no sif_image provided."
+            )
+
+        sif_dir = posixpath.dirname(cfg.sif_path)
+        self._ensure_remote_dir(sif_dir)
+
+        build_ok = False
+        for candidate in ("apptainer", "singularity"):
+            build_cmd = (
+                f"command -v {candidate} >/dev/null 2>&1 && {candidate} pull --force "
+                f"{shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}"
+            )
+            self.ssh.run(build_cmd, timeout=1800, check=False)
+            if self._sif_exists(cfg.sif_path):
+                build_ok = True
+                break
+
+        if not build_ok:
+            raise FileNotFoundError(
+                f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref}"
+            )
+
+        if cfg.sif_version:
+            self._write_remote_file_text(
+                self._sif_version_marker_path(cfg.sif_path),
+                f"{cfg.sif_version}\n",
+            )
+
     def _remote_exists(self, path: str, kind: str = "e") -> bool:
         output = self.ssh.run(
             f"test -{kind} {shlex.quote(path)} && echo yes || true",
@@ -450,7 +532,7 @@ class DeucalionExecutor(BaseExecutor):
 
             # Preflight
             self._check_remote_path(remote_root, kind="d")
-            self._check_remote_path(cfg.sif_path, kind="f")
+            self._ensure_remote_sif(cfg)
             for path in cfg.required_paths:
                 self._check_remote_path(path, kind="e")
 
