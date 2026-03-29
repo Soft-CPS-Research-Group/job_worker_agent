@@ -120,6 +120,25 @@ class FakeSSHClient:
             lp.write_text(self.remote_files[remote_path], encoding="utf-8")
 
 
+class BudgetSSHClient(FakeSSHClient):
+    def __init__(self):
+        super().__init__()
+        self.billing_calls = 0
+
+    def run(self, command, timeout=60, check=True):
+        if command == "billing":
+            self.billing_calls += 1
+            return (
+                "┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━┓\n"
+                "┃ Account           ┃ Used (h) ┃ Limit (h) ┃ Used (%) ┃\n"
+                "┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━┩\n"
+                "│ f202508843cpcaa0g │        0 │       700 │     0.00 │\n"
+                "│ f202508843cpcaa0x │    10752 │     48000 │    22.40 │\n"
+                "└───────────────────┴──────────┴───────────┴──────────┘\n"
+            )
+        return super().run(command, timeout=timeout, check=check)
+
+
 def _write_config(shared_dir: Path, content: dict):
     config_path = shared_dir / "configs" / "demo.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +229,32 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
     assert f"{remote_data_job_dir}/results" in copied_from
     assert f"{remote_data_job_dir}/progress" in copied_from
+
+
+def test_deucalion_heartbeat_includes_budget_snapshot_and_uses_cache(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = BudgetSSHClient()
+
+    agent = _build_agent(
+        shared_dir,
+        session,
+        fake_ssh,
+        env={"DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS": "3600"},
+    )
+    agent._send_heartbeat(force=True)
+    agent._send_heartbeat(force=True)
+
+    heartbeat_calls = [call for call in session.calls if call["url"].endswith("/heartbeat")]
+    assert heartbeat_calls
+    info = heartbeat_calls[-1]["json"]["info"]
+    assert info["executor"] == "deucalion"
+    assert "budget" in info
+    assert info["budget"]["accounts"][0]["account"] == "f202508843cpcaa0g"
+    assert info["budget"]["accounts"][1]["used_percent"] == 22.4
+    assert "budget_refreshed_at" in info
+    assert fake_ssh.billing_calls == 1
 
 
 def test_deucalion_executor_syncs_progress_snapshot_during_execution(tmp_path, monkeypatch):

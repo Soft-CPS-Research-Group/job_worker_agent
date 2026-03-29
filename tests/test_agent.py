@@ -393,3 +393,35 @@ def test_terminal_status_non_retryable_4xx_is_not_buffered():
 
     status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
     assert len(status_calls) == 1
+
+
+def test_heartbeat_payload_contains_runtime_metadata():
+    session = DummySession()
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+    agent._mark_active_job("job-meta")
+    agent._post_status("job-meta", "running")
+    agent._post_status("job-meta", "finished", exit_code=0)
+    agent._mark_active_job(None)
+    agent._send_heartbeat(force=True)
+
+    heartbeat_calls = [call for call in session.calls if call["url"].endswith("/heartbeat")]
+    assert heartbeat_calls
+    payload = heartbeat_calls[-1]["json"]
+    info = payload["info"]
+    assert payload["worker_id"] == "worker-a"
+    assert info["executor"] == "docker"
+    assert isinstance(info["worker_version"], str)
+    assert info["active_job_id"] is None
+    assert info["active_job_count"] == 0
+    assert info["last_job_id"] == "job-meta"
+    assert info["last_terminal_status"] == "finished"

@@ -8,8 +8,8 @@ worker service.
 ## High-level flow
 
 1. **Heartbeat:** the worker periodically calls `POST /api/agent/heartbeat` with
-   `{"worker_id": <id>}`. A heartbeat is always sent immediately after a job
-   finishes, even if the configured interval is `0`.
+   `{"worker_id": <id>, "info": {...}}`. A heartbeat is always sent immediately
+   after a job finishes, even if the configured interval is `0`.
 2. **Poll for work:** the worker calls `POST /api/agent/next-job` with
    `{"worker_id": <id>}`.
    - `204 No Content` means no work is available.
@@ -148,6 +148,25 @@ optional `DEUCALION_SLURM_*`.
   JSON object with at least a `status` field when known.
 - Backend should ensure that the referenced config files exist on the shared
   filesystem prior to assigning a job.
+
+### Heartbeat `info` payload (current contract)
+
+Every heartbeat includes:
+
+- `executor` – `docker` or `deucalion`
+- `worker_version` – package/app version string
+- `active_job_id` – currently active job id (or `null`)
+- `active_job_count` – number of active jobs on this worker (currently `0` or `1`)
+- `last_job_id` – latest job seen by this worker
+- `last_terminal_status` – last terminal status emitted by this worker
+
+Deucalion workers additionally include:
+
+- `budget` – parsed snapshot from `billing` output (`accounts`, used/limit/percent)
+- `budget_refreshed_at` – UNIX timestamp for last successful budget refresh
+
+Budget refresh is cached and executed at most once per
+`DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS` (default `3600`).
 
 Keeping this contract stable allows the worker agent and backend to evolve
 independently while preserving compatibility.

@@ -43,5 +43,8 @@ class BaseExecutor:
     def run_job(self, job: Dict[str, Any]) -> None:
         raise NotImplementedError
 
+    def heartbeat_info(self) -> Dict[str, Any]:
+        return {}
+
     def close(self) -> None:
         return None

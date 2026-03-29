@@ -151,8 +151,8 @@ class DockerExecutor(BaseExecutor):
                     container.remove(force=True)
                 except Exception:  # pragma: no cover
                     pass
-            self.runtime._send_heartbeat(force=True)
             self.runtime._mark_active_job(None)
+            self.runtime._send_heartbeat(force=True)
 
     def close(self) -> None:
         client = self._docker_client_instance

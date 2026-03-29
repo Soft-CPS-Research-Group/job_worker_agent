@@ -44,6 +44,13 @@ class DeucalionExecutor(BaseExecutor):
             0.0,
             float(self.env.get("DEUCALION_ARTIFACT_COPY_RETRY_BACKOFF", "0.5")),
         )
+        self.budget_refresh_interval = max(
+            60.0,
+            float(self.env.get("DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS", "3600")),
+        )
+        self._budget_snapshot: dict[str, Any] | None = None
+        self._budget_refreshed_at: float | None = None
+        self._budget_last_attempt_at = 0.0
 
         if ssh_client is None:
             ssh_client = SSHClient(
@@ -62,6 +69,78 @@ class DeucalionExecutor(BaseExecutor):
         if not value:
             raise RuntimeError(f"Missing required environment variable: {key}")
         return value
+
+    @staticmethod
+    def _parse_numeric(value: str) -> float | None:
+        stripped = value.strip().replace(",", "")
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _parse_billing_output(cls, output: str) -> dict[str, Any] | None:
+        rows: list[dict[str, Any]] = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            delimiter = "│" if "│" in line else "|" if "|" in line else None
+            if delimiter is None:
+                continue
+            parts = [part.strip() for part in line.strip(delimiter).split(delimiter)]
+            if len(parts) != 4:
+                continue
+            if parts[0].lower() == "account":
+                continue
+            used = cls._parse_numeric(parts[1])
+            limit = cls._parse_numeric(parts[2])
+            pct = cls._parse_numeric(parts[3])
+            if used is None or limit is None or pct is None:
+                continue
+            rows.append(
+                {
+                    "account": parts[0],
+                    "used_hours": used,
+                    "limit_hours": limit,
+                    "used_percent": pct,
+                }
+            )
+        if not rows:
+            return None
+        return {"accounts": rows}
+
+    def _refresh_budget_snapshot(self) -> None:
+        now = time.time()
+        self._budget_last_attempt_at = now
+        try:
+            output = self.ssh.run("billing", timeout=60, check=False)
+        except SSHCommandError as exc:
+            _LOGGER.warning("Failed to refresh Deucalion budget snapshot: %s", exc)
+            return
+        parsed = self._parse_billing_output(output)
+        if parsed is None:
+            _LOGGER.warning("Unable to parse billing output for Deucalion budget")
+            return
+        self._budget_snapshot = parsed
+        self._budget_refreshed_at = now
+
+    def heartbeat_info(self) -> Dict[str, Any]:
+        now = time.time()
+        should_refresh = (
+            self._budget_snapshot is None
+            or (now - self._budget_last_attempt_at) >= self.budget_refresh_interval
+        )
+        if should_refresh:
+            self._refresh_budget_snapshot()
+        if self._budget_snapshot is None:
+            return {}
+        return {
+            "budget": self._budget_snapshot,
+            "budget_refreshed_at": self._budget_refreshed_at,
+        }
 
     def _remote_root(self, cfg: DeucalionJobConfig) -> str:
         return cfg.remote_root.rstrip("/")
@@ -558,5 +637,5 @@ class DeucalionExecutor(BaseExecutor):
                 },
             )
         finally:
-            self.runtime._send_heartbeat(force=True)
             self.runtime._mark_active_job(None)
+            self.runtime._send_heartbeat(force=True)

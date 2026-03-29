@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from importlib.metadata import PackageNotFoundError, version
 import logging
 import os
 import threading
@@ -70,6 +71,9 @@ class WorkerAgent:
         self._external_session = session is not None
         self._session = session or requests.Session()
         self._active_job_id: Optional[str] = None
+        self._active_job_status: Optional[str] = None
+        self._last_job_id: Optional[str] = None
+        self._last_terminal_status: Optional[str] = None
         self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", DeviceRequest is not None)
         self._last_request_failure: Optional[str] = None
         self._pending_terminal_statuses: deque[dict[str, Any]] = deque()
@@ -86,11 +90,40 @@ class WorkerAgent:
                 self._executor = DeucalionExecutor(self, env=self._env)
         else:
             raise ValueError(f"Unknown executor '{self.executor}'. Allowed: docker, deucalion")
+        self._worker_version = self._resolve_worker_version()
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
     def _mark_active_job(self, job_id: str | None) -> None:
         self._active_job_id = job_id
+        self._active_job_status = None
+
+    def _resolve_worker_version(self) -> str:
+        if self._env.get("WORKER_VERSION"):
+            return str(self._env["WORKER_VERSION"])
+        try:
+            return version("job-worker-agent")
+        except PackageNotFoundError:
+            return "dev"
+
+    def _build_heartbeat_info(self) -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "executor": self.executor,
+            "worker_version": self._worker_version,
+            "active_job_id": self._active_job_id,
+            "active_job_count": 1 if self._active_job_id else 0,
+            "last_job_id": self._last_job_id,
+            "last_terminal_status": self._last_terminal_status,
+        }
+        if self._active_job_id and self._active_job_status:
+            info["active_job_status"] = self._active_job_status
+        try:
+            executor_info = self._executor.heartbeat_info()
+            if isinstance(executor_info, dict):
+                info.update(executor_info)
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOGGER.warning("Failed to collect executor heartbeat info: %s", exc)
+        return info
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -270,7 +303,10 @@ class WorkerAgent:
         if not force:
             if self.heartbeat_interval > 0 and (now - self._last_heartbeat) < self.heartbeat_interval:
                 return
-        payload = {"worker_id": self.worker_id}
+        payload = {
+            "worker_id": self.worker_id,
+            "info": self._build_heartbeat_info(),
+        }
         _LOGGER.info("POST /api/agent/heartbeat payload=%s", payload)
         result = self._post_json_with_retries(
             "/api/agent/heartbeat",
@@ -302,6 +338,11 @@ class WorkerAgent:
         return response.json()
 
     def _post_status(self, job_id: str, status: str, **extra: object) -> None:
+        self._last_job_id = job_id
+        if self._active_job_id == job_id:
+            self._active_job_status = status
+        if status in _TERMINAL_JOB_STATUSES:
+            self._last_terminal_status = status
         payload = {"job_id": job_id, "status": status, "worker_id": self.worker_id}
         payload.update({k: v for k, v in extra.items() if v is not None})
         _LOGGER.info("POST /api/agent/job-status payload=%s", payload)
