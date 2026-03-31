@@ -20,6 +20,8 @@ from .base import BaseExecutor, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS = 5.0
+_BACKEND_STOP_STATES = {"stop_requested", "canceled", "queued", "failed", "finished", "stopped"}
+_BACKEND_OVERRIDE_NO_POST = {"queued", "failed", "finished", "stopped"}
 
 
 class DeucalionExecutor(BaseExecutor):
@@ -634,6 +636,30 @@ class DeucalionExecutor(BaseExecutor):
             timeout=30,
         )
 
+    @staticmethod
+    def _derive_image_version(image_ref: str) -> str | None:
+        ref = image_ref.strip()
+        if not ref:
+            return None
+        if "@" in ref:
+            digest = ref.split("@", 1)[1].strip()
+            return digest or None
+        last_segment = ref.rsplit("/", 1)[-1]
+        if ":" in last_segment:
+            return ref.rsplit(":", 1)[1].strip() or None
+        return None
+
+    def _apply_job_image(self, cfg: DeucalionJobConfig, job: Dict[str, Any]) -> DeucalionJobConfig:
+        image_ref = str(job.get("image") or "").strip()
+        if not image_ref:
+            raise ValueError("Missing job image in payload for deucalion executor")
+
+        cfg.sif_image = image_ref
+        derived_version = self._derive_image_version(image_ref)
+        # The job payload image is authoritative; never fall back to YAML versioning.
+        cfg.sif_version = derived_version
+        return cfg
+
     def _build_singularity_command(self, cfg: DeucalionJobConfig, remote_data_dir: str, command: str) -> str:
         command_text = command.strip()
         if not command_text:
@@ -803,6 +829,7 @@ class DeucalionExecutor(BaseExecutor):
             self.runtime._mark_active_job(job_id)
             job_yaml = self._load_job_yaml(local_config_path)
             cfg = resolve_deucalion_job_config(job_yaml, env=self.env)
+            cfg = self._apply_job_image(cfg, job)
             remote_root = self._remote_root(cfg)
             command_mode = cfg.command_mode
 
@@ -854,6 +881,7 @@ class DeucalionExecutor(BaseExecutor):
                 "command_mode": command_mode,
                 "datasets_synced": datasets_synced,
                 "datasets_skipped": datasets_skipped,
+                "image": cfg.sif_image,
             }
             self.runtime._post_status(job_id, "dispatched", details=details, container_name=job_name)
             last_status = "dispatched"
@@ -864,7 +892,7 @@ class DeucalionExecutor(BaseExecutor):
                 try:
                     if self.runtime.status_poll_interval > 0:
                         backend_status = self.runtime._fetch_status(job_id)
-                        if backend_status in {"stop_requested", "canceled"}:
+                        if backend_status in _BACKEND_STOP_STATES and stop_reason is None:
                             stop_reason = backend_status
                             if slurm_job_id:
                                 scancel_job(self.ssh, slurm_job_id)
@@ -881,7 +909,10 @@ class DeucalionExecutor(BaseExecutor):
                         "command_mode": command_mode,
                         "datasets_synced": datasets_synced,
                         "datasets_skipped": datasets_skipped,
+                        "image": cfg.sif_image,
                     }
+                    if stop_reason:
+                        details["backend_stop_reason"] = stop_reason
 
                     if now >= next_sync:
                         log_offsets = self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
@@ -897,6 +928,9 @@ class DeucalionExecutor(BaseExecutor):
                         if unknown_since is None:
                             unknown_since = now
                         details["unknown_since"] = unknown_since
+                        if stop_reason in _BACKEND_OVERRIDE_NO_POST:
+                            self.sleep_fn(self.poll_interval)
+                            continue
                         if (now - unknown_since) > self.unknown_state_timeout_seconds:
                             self.runtime._post_status(
                                 job_id,
@@ -912,6 +946,9 @@ class DeucalionExecutor(BaseExecutor):
                         continue
 
                     if state.state in ACTIVE_STATES:
+                        if stop_reason in _BACKEND_OVERRIDE_NO_POST:
+                            self.sleep_fn(self.poll_interval)
+                            continue
                         running_states = {"RUNNING", "COMPLETING", "STAGE_OUT"}
                         report_status = "running" if state.state in running_states else "dispatched"
                         self.runtime._post_status(job_id, report_status, details=details)
@@ -934,6 +971,13 @@ class DeucalionExecutor(BaseExecutor):
                         local_job_dir=local_job_dir,
                     )
                     details["artifact_sync"] = artifact_sync
+                    if stop_reason in _BACKEND_OVERRIDE_NO_POST:
+                        _LOGGER.info(
+                            "Skipping terminal status post for job %s; backend already moved to '%s'",
+                            job_id,
+                            stop_reason,
+                        )
+                        return
                     if final_status == "finished" and artifact_sync.get("had_failure"):
                         final_status = "failed"
                         error = "artifact_sync_failed"
@@ -954,21 +998,23 @@ class DeucalionExecutor(BaseExecutor):
                     }
                     if unknown_since is not None:
                         details["unknown_since"] = unknown_since
-                    self.runtime._post_status(job_id, last_status, details=details)
+                    if stop_reason not in _BACKEND_OVERRIDE_NO_POST:
+                        self.runtime._post_status(job_id, last_status, details=details)
                     if elapsed > self.unreachable_grace_seconds:
-                        self.runtime._post_status(
-                            job_id,
-                            "failed",
-                            error="deucalion_unreachable_timeout",
-                            details={
-                                "slurm_job_id": slurm_job_id,
-                                "connectivity": "down",
-                                "executor": "deucalion",
-                                "command_mode": command_mode,
-                                "datasets_synced": datasets_synced,
-                                "datasets_skipped": datasets_skipped,
-                            },
-                        )
+                        if stop_reason not in _BACKEND_OVERRIDE_NO_POST:
+                            self.runtime._post_status(
+                                job_id,
+                                "failed",
+                                error="deucalion_unreachable_timeout",
+                                details={
+                                    "slurm_job_id": slurm_job_id,
+                                    "connectivity": "down",
+                                    "executor": "deucalion",
+                                    "command_mode": command_mode,
+                                    "datasets_synced": datasets_synced,
+                                    "datasets_skipped": datasets_skipped,
+                                },
+                            )
                         return
                     self.sleep_fn(self.poll_interval)
                 except Exception as exc:

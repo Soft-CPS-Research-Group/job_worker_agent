@@ -92,6 +92,20 @@ class DummyDockerClient:
         pass
 
 
+class PullTrackingImages:
+    def __init__(self):
+        self.pulled = []
+
+    def pull(self, image):
+        self.pulled.append(image)
+
+
+class PullTrackingDockerClient(DummyDockerClient):
+    def __init__(self, container):
+        super().__init__(container)
+        self.images = PullTrackingImages()
+
+
 def test_run_job_success(tmp_path):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
@@ -126,6 +140,32 @@ def test_run_job_success(tmp_path):
     assert "--config /data/configs/demo.yaml" in docker_client.last_kwargs["command"]
     assert docker_client.last_kwargs["labels"]["opeva.job_id"] == "job1"
     assert docker_client.last_kwargs["labels"]["opeva.worker_id"] == "worker-a"
+
+
+def test_run_job_pulls_image_before_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKER_DOCKER_PULL_POLICY", "always")
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    container = DummyContainer(exit_code=0, logs=[b"hello\n"])
+    docker_client = PullTrackingDockerClient(container)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        poll_interval=0.1,
+        heartbeat_interval=0.1,
+        status_poll_interval=0.0,
+    )
+
+    job = {"job_id": "job-pull", "config_path": "configs/demo.yaml", "job_name": "Demo", "image": "calof/algorithms:v1"}
+    agent._run_job(job)
+
+    assert docker_client.images.pulled == ["calof/algorithms:v1"]
 
 
 def test_run_job_failure(tmp_path):
@@ -312,6 +352,84 @@ def test_run_job_stop_requested(tmp_path):
     assert container.stop_called is True
     status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["json"]["status"] == "stopped"
+
+
+def test_run_job_stops_when_backend_requeued(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses = ["running", "queued"]
+
+    class RequeueContainer(DummyContainer):
+        def __init__(self):
+            super().__init__(exit_code=137, logs=[b"start\n"])
+
+        def wait(self):
+            for _ in range(20):
+                if self.stop_called:
+                    return {"StatusCode": 137}
+                time.sleep(0.01)
+            return {"StatusCode": 0}
+
+    container = RequeueContainer()
+    docker_client = DummyDockerClient(container)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.05,
+        heartbeat_interval=0.0,
+    )
+
+    agent._run_job({"job_id": "job-requeue", "config_path": "cfg.yaml", "job_name": "Demo"})
+
+    assert container.stop_called is True
+    status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    assert all(status == "running" for status in status_calls)
+
+
+def test_run_job_stops_when_backend_failed(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses = ["running", "failed"]
+
+    class FailedContainer(DummyContainer):
+        def __init__(self):
+            super().__init__(exit_code=137, logs=[b"start\n"])
+
+        def wait(self):
+            for _ in range(20):
+                if self.stop_called:
+                    return {"StatusCode": 137}
+                time.sleep(0.01)
+            return {"StatusCode": 0}
+
+    container = FailedContainer()
+    docker_client = DummyDockerClient(container)
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.05,
+        heartbeat_interval=0.0,
+    )
+
+    agent._run_job({"job_id": "job-fail-override", "config_path": "cfg.yaml", "job_name": "Demo"})
+
+    assert container.stop_called is True
+    status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    assert all(status == "running" for status in status_calls)
 
 
 def test_heartbeat_retries_and_updates_timestamp_only_on_success(monkeypatch):

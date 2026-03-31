@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -22,6 +23,9 @@ class DockerExecutor(BaseExecutor):
         docker_client_factory: Optional[Callable[[], "docker.DockerClient"]] = None,
     ) -> None:
         self.runtime = runtime
+        self.pull_policy = os.environ.get("WORKER_DOCKER_PULL_POLICY", "always").strip().lower()
+        if self.pull_policy not in {"always", "if-not-present", "never"}:
+            self.pull_policy = "always"
         if docker_client_factory is None:
             if docker is None:
                 raise RuntimeError("docker package is not available")
@@ -59,6 +63,26 @@ class DockerExecutor(BaseExecutor):
         except Exception:  # pragma: no cover - defensive logging
             pass
 
+    def _pull_image(self, client: "docker.DockerClient", image_ref: str) -> None:
+        if self.pull_policy == "never":
+            return
+        images_api = getattr(client, "images", None)
+        if images_api is None or not hasattr(images_api, "pull"):
+            return
+
+        if self.pull_policy == "if-not-present" and hasattr(images_api, "get"):
+            try:
+                images_api.get(image_ref)
+                return
+            except Exception:
+                pass
+
+        try:
+            images_api.pull(image_ref)
+            _LOGGER.info("Pulled image %s before run (policy=%s)", image_ref, self.pull_policy)
+        except Exception as exc:  # pragma: no cover - depends on daemon/network
+            _LOGGER.warning("Failed to pull image %s (policy=%s): %s", image_ref, self.pull_policy, exc)
+
     def run_job(self, job: Dict[str, Any]) -> None:
         job_id = job["job_id"]
         config_path = job["config_path"]
@@ -94,6 +118,7 @@ class DockerExecutor(BaseExecutor):
                 "labels": labels,
                 "detach": True,
             }
+            self._pull_image(client, run_kwargs["image"])
             if device_requests:
                 run_kwargs["device_requests"] = device_requests
             try:
@@ -130,11 +155,19 @@ class DockerExecutor(BaseExecutor):
             )
 
             if self.runtime.status_poll_interval > 0:
+                backend_stop_states = {
+                    "stop_requested",
+                    "canceled",
+                    "queued",
+                    "failed",
+                    "finished",
+                    "stopped",
+                }
 
                 def _monitor() -> None:
                     while not monitor_stop.wait(self.runtime.status_poll_interval):
                         status = self.runtime._fetch_status(job_id)
-                        if status in {"stop_requested", "canceled"}:
+                        if status in backend_stop_states:
                             monitor_state["status"] = status
                             try:
                                 if hasattr(container, "stop"):
@@ -173,6 +206,13 @@ class DockerExecutor(BaseExecutor):
                     "Job %s completed with backend status '%s' (exit code %s)",
                     job_id,
                     reported_status,
+                    exit_code,
+                )
+            elif final_status in {"queued", "failed", "finished", "stopped"}:
+                _LOGGER.info(
+                    "Job %s stopped locally because backend moved it to '%s' (exit code %s)",
+                    job_id,
+                    final_status,
                     exit_code,
                 )
             else:

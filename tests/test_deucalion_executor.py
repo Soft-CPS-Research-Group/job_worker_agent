@@ -232,7 +232,14 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Demo"})
+    agent._run_job(
+        {
+            "job_id": job_id,
+            "config_path": "configs/demo.yaml",
+            "job_name": "Demo",
+            "image": "calof/algorithms",
+        }
+    )
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "finished"
@@ -294,15 +301,165 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Demo"})
+    agent._run_job(
+        {
+            "job_id": job_id,
+            "config_path": "configs/demo.yaml",
+            "job_name": "Demo",
+            "image": "calof/algorithms:v0.2.5",
+        }
+    )
 
     # Worker should rebuild with the requested version tag via SIF build sbatch script.
     assert any(
-        "docker://calof/opeva_simulator:v0.2.5" in content
+        "docker://calof/algorithms:v0.2.5" in content
         for content in fake_ssh.remote_files.values()
         if isinstance(content, str)
     )
     assert fake_ssh.remote_files[marker_path].strip() == "v0.2.5"
+
+
+def test_deucalion_executor_untagged_image_does_not_reuse_yaml_sif_version(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+        }
+    )
+
+    job_id = "job-untagged"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "line-from-slurm\n"
+    fake_ssh.existing_paths.update({f"{remote_data_job_dir}/results", f"{remote_data_job_dir}/progress"})
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": sif_path,
+                    "sif_image": "calof/legacy-image",
+                    "sif_version": "v0.2.5",
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "22346")
+    states = iter([SlurmState(state="PENDING"), SlurmState(state="COMPLETED", exit_code=0)])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job(
+        {
+            "job_id": job_id,
+            "config_path": "configs/demo.yaml",
+            "job_name": "Demo",
+            "image": "calof/algorithms",
+        }
+    )
+
+    built_scripts = [content for content in fake_ssh.remote_files.values() if isinstance(content, str)]
+    assert any("docker://calof/algorithms" in content for content in built_scripts)
+    assert all("docker://calof/algorithms:v0.2.5" not in content for content in built_scripts)
+
+
+def test_deucalion_executor_uses_job_image_override(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
+    marker_path = (
+        "/projects/F202508843CPCAA0/tiagocalof/.opeva/sif_versions/"
+        "projects__F202508843CPCAA0__tiagocalof__images__sim.sif.version"
+    )
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            sif_path,
+            marker_path,
+        }
+    )
+    fake_ssh.remote_files[marker_path] = "v0.2.4\n"
+
+    job_id = "job-image-override"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "line-from-slurm\n"
+    fake_ssh.existing_paths.update({f"{remote_data_job_dir}/results", f"{remote_data_job_dir}/progress"})
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": sif_path,
+                    "sif_image": "calof/old-image",
+                    "sif_version": "v0.2.4",
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "22345")
+    states = iter([SlurmState(state="PENDING"), SlurmState(state="COMPLETED", exit_code=0)])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job(
+        {
+            "job_id": job_id,
+            "config_path": "configs/demo.yaml",
+            "job_name": "Demo",
+            "image": "calof/algorithms:v9.1.0",
+        }
+    )
+
+    assert any(
+        "docker://calof/algorithms:v9.1.0" in content
+        for content in fake_ssh.remote_files.values()
+        if isinstance(content, str)
+    )
+    assert fake_ssh.remote_files[marker_path].strip() == "v9.1.0"
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls[0]["details"]["image"] == "calof/algorithms:v9.1.0"
+
+
+def test_deucalion_executor_requires_payload_image(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+                    "sif_image": "calof/legacy-image",
+                    "sif_version": "v0.1.0",
+                }
+            }
+        },
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": "job-missing-image", "config_path": "configs/demo.yaml", "job_name": "Demo"})
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    assert status_calls[-1]["status"] == "failed"
+    assert "Missing job image in payload for deucalion executor" in status_calls[-1]["error"]
 
 
 def test_deucalion_heartbeat_includes_budget_snapshot_and_uses_cache(tmp_path):
@@ -371,7 +528,7 @@ def test_deucalion_executor_syncs_progress_snapshot_during_execution(tmp_path, m
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
 
     agent = _build_agent(shared_dir, session, fake_ssh, env={"DEUCALION_SYNC_INTERVAL": "0"})
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Progress"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Progress", "image": "calof/algorithms"})
 
     local_progress = shared_dir / "jobs" / job_id / "progress" / "progress.json"
     assert local_progress.exists()
@@ -422,7 +579,7 @@ def test_deucalion_executor_sync_fallback_to_legacy_artifact_paths(tmp_path, mon
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Legacy"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Legacy", "image": "calof/algorithms"})
 
     copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
     assert f"{remote_job_dir}/results" in copied_from
@@ -463,7 +620,7 @@ def test_deucalion_executor_exec_mode_requires_executable(tmp_path, monkeypatch)
 
     agent = _build_agent(shared_dir, session, fake_ssh)
     # default command is only "--config ... --job_id ...", invalid for exec mode
-    agent._run_job({"job_id": "job-exec", "config_path": "configs/demo.yaml", "job_name": "Exec"})
+    agent._run_job({"job_id": "job-exec", "config_path": "configs/demo.yaml", "job_name": "Exec", "image": "calof/algorithms"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -507,7 +664,7 @@ def test_deucalion_executor_dataset_sync_copy_missing_skip_existing(tmp_path, mo
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0))
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-data", "config_path": "configs/demo.yaml", "job_name": "Data"})
+    agent._run_job({"job_id": "job-data", "config_path": "configs/demo.yaml", "job_name": "Data", "image": "calof/algorithms"})
 
     copied_remote_paths = [remote for _local, remote, _recursive in fake_ssh.copy_to_calls]
     assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in copied_remote_paths
@@ -555,7 +712,7 @@ def test_deucalion_executor_dataset_directory_uses_recursive_copy(tmp_path, monk
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-dir", "config_path": "configs/demo.yaml", "job_name": "Dir"})
+    agent._run_job({"job_id": "job-dir", "config_path": "configs/demo.yaml", "job_name": "Dir", "image": "calof/algorithms"})
 
     dataset_copy_calls = [
         (_local, remote, recursive)
@@ -594,11 +751,81 @@ def test_deucalion_executor_stop_requested(tmp_path, monkeypatch):
     monkeypatch.setattr(deucalion_executor_module, "scancel_job", _fake_cancel)
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-stop", "config_path": "configs/demo.yaml", "job_name": "Stop"})
+    agent._run_job({"job_id": "job-stop", "config_path": "configs/demo.yaml", "job_name": "Stop", "image": "calof/algorithms"})
 
     assert cancel_called["value"] is True
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "stopped"
+
+
+def test_deucalion_executor_stops_when_backend_requeues(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses = ["queued"]
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+    cancel_called = {"value": False}
+
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "556")
+    states = iter([SlurmState(state="RUNNING"), SlurmState(state="CANCELLED", exit_code=137)])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    def _fake_cancel(*args, **kwargs):
+        cancel_called["value"] = True
+
+    monkeypatch.setattr(deucalion_executor_module, "scancel_job", _fake_cancel)
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": "job-requeue", "config_path": "configs/demo.yaml", "job_name": "Requeue", "image": "calof/algorithms"})
+
+    assert cancel_called["value"] is True
+    status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls == ["dispatched"]
+
+
+def test_deucalion_executor_stops_when_backend_marks_failed(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses = ["failed"]
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+    cancel_called = {"value": False}
+
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "557")
+    states = iter([SlurmState(state="RUNNING"), SlurmState(state="CANCELLED", exit_code=137)])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    def _fake_cancel(*args, **kwargs):
+        cancel_called["value"] = True
+
+    monkeypatch.setattr(deucalion_executor_module, "scancel_job", _fake_cancel)
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": "job-failed", "config_path": "configs/demo.yaml", "job_name": "Failed", "image": "calof/algorithms"})
+
+    assert cancel_called["value"] is True
+    status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls == ["dispatched"]
 
 
 def test_deucalion_executor_unknown_timeout(tmp_path, monkeypatch):
@@ -632,7 +859,7 @@ def test_deucalion_executor_unknown_timeout(tmp_path, monkeypatch):
         now_fn=lambda: next(now_values),
     )
 
-    agent._run_job({"job_id": "job-unknown", "config_path": "configs/demo.yaml", "job_name": "Unknown"})
+    agent._run_job({"job_id": "job-unknown", "config_path": "configs/demo.yaml", "job_name": "Unknown", "image": "calof/algorithms"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -675,7 +902,7 @@ def test_deucalion_executor_unreachable_timeout(tmp_path, monkeypatch):
         now_fn=lambda: next(now_values),
     )
 
-    agent._run_job({"job_id": "job-timeout", "config_path": "configs/demo.yaml", "job_name": "Timeout"})
+    agent._run_job({"job_id": "job-timeout", "config_path": "configs/demo.yaml", "job_name": "Timeout", "image": "calof/algorithms"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -717,7 +944,7 @@ def test_deucalion_executor_completed_but_artifact_sync_failure_marks_failed(tmp
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsFail"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsFail", "image": "calof/algorithms"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -762,7 +989,7 @@ def test_deucalion_executor_artifact_sync_transient_failure_keeps_finished(tmp_p
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsRetry"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsRetry", "image": "calof/algorithms"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "finished"
