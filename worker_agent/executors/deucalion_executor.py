@@ -350,6 +350,7 @@ class DeucalionExecutor(BaseExecutor):
         tmp_dir: str,
         job_id: str | None = None,
         preflight_stage: str = "sif_build",
+        local_log_path: Path | None = None,
     ) -> None:
         remote_root = self._remote_root(cfg)
         build_root = posixpath.join(remote_root, ".opeva", "sif_builds")
@@ -387,19 +388,64 @@ class DeucalionExecutor(BaseExecutor):
             tmp_path.unlink(missing_ok=True)
 
         slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=build_dir)
+        if local_log_path is not None:
+            self._append_local_log(
+                local_log_path,
+                f"SIF build submitted via Slurm: job={slurm_job_id}, image=docker://{image_ref}",
+            )
         deadline = self.now_fn() + self.sif_build_timeout_seconds
         last_probe_at = self.now_fn()
+        last_progress_log_at = 0.0
+        last_progress_signature: tuple[str | None, str | None, int | None, int | None] | None = None
         while True:
             now = self.now_fn()
             if job_id and (now - last_probe_at) >= self.preflight_status_update_interval:
                 last_probe_at = now
                 backend_status = self._poll_backend_stop_status(job_id)
                 if backend_status in _BACKEND_STOP_STATES:
+                    if local_log_path is not None:
+                        self._append_local_log(
+                            local_log_path,
+                            f"SIF build canceled due to backend status '{backend_status}' (slurm_job={slurm_job_id})",
+                        )
                     scancel_job(self.ssh, slurm_job_id)
                     raise PreflightInterrupted(status=backend_status, stage=preflight_stage)
             state = query_state(self.ssh, slurm_job_id)
+            if local_log_path is not None:
+                progress_signature = (
+                    state.state,
+                    state.reason,
+                    state.queue_position,
+                    state.jobs_ahead,
+                )
+                should_log_progress = (
+                    progress_signature != last_progress_signature
+                    or (now - last_progress_log_at) >= self.preflight_status_update_interval
+                )
+                if should_log_progress:
+                    extra_parts: list[str] = []
+                    if state.partition:
+                        extra_parts.append(f"partition={state.partition}")
+                    if state.reason:
+                        extra_parts.append(f"reason={state.reason}")
+                    if state.queue_position is not None:
+                        extra_parts.append(f"queue_pos={state.queue_position}")
+                    if state.jobs_ahead is not None:
+                        extra_parts.append(f"ahead={state.jobs_ahead}")
+                    extra_suffix = f" ({', '.join(extra_parts)})" if extra_parts else ""
+                    self._append_local_log(
+                        local_log_path,
+                        f"SIF build Slurm state: {state.state}{extra_suffix}",
+                    )
+                    last_progress_signature = progress_signature
+                    last_progress_log_at = now
             if state.state in ACTIVE_STATES or state.state == "UNKNOWN":
                 if now > deadline:
+                    if local_log_path is not None:
+                        self._append_local_log(
+                            local_log_path,
+                            f"SIF build timeout reached; canceling Slurm job {slurm_job_id}",
+                        )
                     scancel_job(self.ssh, slurm_job_id)
                     raise TimeoutError(
                         f"SIF build timed out (job={slurm_job_id}, state={state.state}) for docker://{image_ref}"
@@ -407,6 +453,11 @@ class DeucalionExecutor(BaseExecutor):
                 self.sleep_fn(self.sif_build_poll_interval)
                 continue
             if state.state == "COMPLETED" and self._sif_exists(cfg.sif_path):
+                if local_log_path is not None:
+                    self._append_local_log(
+                        local_log_path,
+                        f"SIF build completed successfully (slurm_job={slurm_job_id})",
+                    )
                 break
             out_tail = self._read_remote_tail(out_path)
             err_tail = self._read_remote_tail(err_path)
@@ -420,6 +471,11 @@ class DeucalionExecutor(BaseExecutor):
                 ]
                 if part
             )
+            if local_log_path is not None:
+                self._append_local_log(
+                    local_log_path,
+                    f"SIF build failed (slurm_job={slurm_job_id}): {details}",
+                )
             raise FileNotFoundError(
                 f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref} via Slurm job {slurm_job_id}. {details}"
             )
@@ -427,7 +483,12 @@ class DeucalionExecutor(BaseExecutor):
         if cfg.sif_version:
             self._write_remote_file_text(marker_path, cfg.sif_version)
 
-    def _ensure_remote_sif(self, cfg: DeucalionJobConfig, job_id: str | None = None) -> None:
+    def _ensure_remote_sif(
+        self,
+        cfg: DeucalionJobConfig,
+        job_id: str | None = None,
+        local_log_path: Path | None = None,
+    ) -> None:
         sif_exists = self._sif_exists(cfg.sif_path)
         marker_path = self._sif_version_marker_path(cfg)
         remote_version = self._read_remote_file_text(marker_path)
@@ -470,6 +531,7 @@ class DeucalionExecutor(BaseExecutor):
                         tmp_dir=tmp_dir,
                         job_id=job_id,
                         preflight_stage="preflight:sif_build",
+                        local_log_path=local_log_path,
                     )
                     return
                 except FileNotFoundError as exc:
@@ -1025,7 +1087,7 @@ class DeucalionExecutor(BaseExecutor):
                 stage=preflight_stage,
                 last_probe_at=preflight_last_probe,
             )
-            self._ensure_remote_sif(cfg, job_id=job_id)
+            self._ensure_remote_sif(cfg, job_id=job_id, local_log_path=local_log_path)
             for path in cfg.required_paths:
                 preflight_stage = "preflight:required_paths"
                 preflight_last_probe = self._maybe_interrupt_preflight(

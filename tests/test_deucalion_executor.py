@@ -495,6 +495,61 @@ def test_deucalion_executor_preflight_failure_writes_local_log_and_stage(tmp_pat
     assert "preflight:remote_root_check" in log_text
 
 
+def test_deucalion_executor_logs_sif_build_progress(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
+    marker_path = (
+        "/projects/F202508843CPCAA0/tiagocalof/.opeva/sif_versions/"
+        "projects__F202508843CPCAA0__tiagocalof__images__sim.sif.version"
+    )
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            sif_path,
+            marker_path,
+        }
+    )
+    fake_ssh.remote_files[marker_path] = "v0.2.4\n"
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": sif_path,
+                    "sif_image": "calof/opeva_simulator",
+                    "sif_version": "v0.2.5",
+                }
+            }
+        },
+    )
+
+    submitted_ids = iter(["build-123", "job-123"])
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: next(submitted_ids))
+    states = iter(
+        [
+            SlurmState(state="PENDING", partition="normal", reason="Priority", queue_position=4, jobs_ahead=3),
+            SlurmState(state="COMPLETED", exit_code=0),
+            SlurmState(state="PENDING"),
+            SlurmState(state="RUNNING"),
+            SlurmState(state="COMPLETED", exit_code=0),
+        ]
+    )
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    job_id = "job-sif-log"
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "SIF log", "image": "calof/algorithms:v0.2.5"})
+
+    log_path = shared_dir / "jobs" / job_id / "logs" / f"{job_id}.log"
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "SIF build submitted via Slurm: job=build-123" in log_text
+    assert "SIF build Slurm state: PENDING" in log_text
+    assert "SIF build completed successfully (slurm_job=build-123)" in log_text
+
+
 def test_deucalion_heartbeat_includes_budget_snapshot_and_uses_cache(tmp_path):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
