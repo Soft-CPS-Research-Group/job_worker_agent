@@ -6,6 +6,7 @@ import posixpath
 import shlex
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -22,6 +23,13 @@ _LOGGER = logging.getLogger(__name__)
 _ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS = 5.0
 _BACKEND_STOP_STATES = {"stop_requested", "canceled", "queued", "failed", "finished", "stopped"}
 _BACKEND_OVERRIDE_NO_POST = {"queued", "failed", "finished", "stopped"}
+
+
+class PreflightInterrupted(RuntimeError):
+    def __init__(self, *, status: str, stage: str):
+        self.status = status
+        self.stage = stage
+        super().__init__(f"Preflight interrupted by backend status '{status}' during stage '{stage}'")
 
 
 class DeucalionExecutor(BaseExecutor):
@@ -72,6 +80,10 @@ class DeucalionExecutor(BaseExecutor):
         self.sif_build_poll_interval = max(
             1.0,
             float(self.env.get("DEUCALION_SIF_BUILD_POLL_INTERVAL", "5")),
+        )
+        self.preflight_status_update_interval = max(
+            5.0,
+            float(self.env.get("DEUCALION_PREFLIGHT_STATUS_UPDATE_INTERVAL", "20")),
         )
         self.sif_build_time_limit = self.env.get("DEUCALION_SIF_BUILD_TIME", "").strip()
         self.sif_build_partition = self.env.get("DEUCALION_SIF_BUILD_PARTITION", "").strip()
@@ -299,6 +311,36 @@ class DeucalionExecutor(BaseExecutor):
             check=False,
         ).strip()
 
+    def _append_local_log(self, local_log_path: Path, message: str) -> None:
+        local_log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open(local_log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message.rstrip()}\n")
+
+    def _poll_backend_stop_status(self, job_id: str) -> str | None:
+        if self.runtime.status_poll_interval <= 0:
+            return None
+        backend_status = self.runtime._fetch_status(job_id)
+        if backend_status in _BACKEND_STOP_STATES:
+            return backend_status
+        return None
+
+    def _resolve_interrupted_preflight_status(self, status: str) -> str | None:
+        if status == "stop_requested":
+            return "stopped"
+        if status == "canceled":
+            return "canceled"
+        return None
+
+    def _maybe_interrupt_preflight(self, *, job_id: str, stage: str, last_probe_at: float) -> float:
+        now = self.now_fn()
+        if (now - last_probe_at) < self.preflight_status_update_interval:
+            return last_probe_at
+        status = self._poll_backend_stop_status(job_id)
+        if status in _BACKEND_STOP_STATES:
+            raise PreflightInterrupted(status=status, stage=stage)
+        return now
+
     def _ensure_remote_sif_via_slurm(
         self,
         cfg: DeucalionJobConfig,
@@ -306,6 +348,8 @@ class DeucalionExecutor(BaseExecutor):
         marker_path: str,
         cache_dir: str,
         tmp_dir: str,
+        job_id: str | None = None,
+        preflight_stage: str = "sif_build",
     ) -> None:
         remote_root = self._remote_root(cfg)
         build_root = posixpath.join(remote_root, ".opeva", "sif_builds")
@@ -344,10 +388,18 @@ class DeucalionExecutor(BaseExecutor):
 
         slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=build_dir)
         deadline = self.now_fn() + self.sif_build_timeout_seconds
+        last_probe_at = self.now_fn()
         while True:
+            now = self.now_fn()
+            if job_id and (now - last_probe_at) >= self.preflight_status_update_interval:
+                last_probe_at = now
+                backend_status = self._poll_backend_stop_status(job_id)
+                if backend_status in _BACKEND_STOP_STATES:
+                    scancel_job(self.ssh, slurm_job_id)
+                    raise PreflightInterrupted(status=backend_status, stage=preflight_stage)
             state = query_state(self.ssh, slurm_job_id)
             if state.state in ACTIVE_STATES or state.state == "UNKNOWN":
-                if self.now_fn() > deadline:
+                if now > deadline:
                     scancel_job(self.ssh, slurm_job_id)
                     raise TimeoutError(
                         f"SIF build timed out (job={slurm_job_id}, state={state.state}) for docker://{image_ref}"
@@ -375,7 +427,7 @@ class DeucalionExecutor(BaseExecutor):
         if cfg.sif_version:
             self._write_remote_file_text(marker_path, cfg.sif_version)
 
-    def _ensure_remote_sif(self, cfg: DeucalionJobConfig) -> None:
+    def _ensure_remote_sif(self, cfg: DeucalionJobConfig, job_id: str | None = None) -> None:
         sif_exists = self._sif_exists(cfg.sif_path)
         marker_path = self._sif_version_marker_path(cfg)
         remote_version = self._read_remote_file_text(marker_path)
@@ -416,6 +468,8 @@ class DeucalionExecutor(BaseExecutor):
                         marker_path=marker_path,
                         cache_dir=cache_dir,
                         tmp_dir=tmp_dir,
+                        job_id=job_id,
+                        preflight_stage="preflight:sif_build",
                     )
                     return
                 except FileNotFoundError as exc:
@@ -886,6 +940,7 @@ class DeucalionExecutor(BaseExecutor):
         unknown_since: float | None = None,
         stop_reason: str | None = None,
         error: str | None = None,
+        executor_stage: str | None = None,
     ) -> dict[str, Any]:
         details: dict[str, Any] = {
             "executor": "deucalion",
@@ -910,6 +965,8 @@ class DeucalionExecutor(BaseExecutor):
             details["backend_stop_reason"] = stop_reason
         if error:
             details["error"] = error
+        if executor_stage:
+            details["executor_stage"] = executor_stage
         return details
 
     def run_job(self, job: Dict[str, Any]) -> None:
@@ -932,10 +989,15 @@ class DeucalionExecutor(BaseExecutor):
         datasets_skipped: list[str] = []
         command_mode = "run"
         log_offsets = {"slurm.out": 0, "slurm.err": 0}
+        preflight_stage = "preflight:init"
+        preflight_last_update = self.now_fn()
+        preflight_last_probe = preflight_last_update
 
         try:
             self.runtime._mark_active_job(job_id)
+            self._append_local_log(local_log_path, f"Job accepted by deucalion worker: {job_id}")
             job_yaml = self._load_job_yaml(local_config_path)
+            self._append_local_log(local_log_path, f"Loaded config: {config_path}")
             cfg = resolve_deucalion_job_config(job_yaml, env=self.env)
             cfg = self._apply_job_image(cfg, job)
             image_name = cfg.sif_image
@@ -948,13 +1010,50 @@ class DeucalionExecutor(BaseExecutor):
             remote_script_path = posixpath.join(remote_job_dir, "run.sbatch")
 
             # Preflight
+            preflight_stage = "preflight:remote_root_check"
+            self._append_local_log(local_log_path, f"Preflight stage {preflight_stage} (remote_root={remote_root})")
+            preflight_last_probe = self._maybe_interrupt_preflight(
+                job_id=job_id,
+                stage=preflight_stage,
+                last_probe_at=preflight_last_probe,
+            )
             self._check_remote_path(remote_root, kind="d")
-            self._ensure_remote_sif(cfg)
+            preflight_stage = "preflight:sif"
+            self._append_local_log(local_log_path, "Preflight stage preflight:sif (ensure SIF image)")
+            preflight_last_probe = self._maybe_interrupt_preflight(
+                job_id=job_id,
+                stage=preflight_stage,
+                last_probe_at=preflight_last_probe,
+            )
+            self._ensure_remote_sif(cfg, job_id=job_id)
             for path in cfg.required_paths:
+                preflight_stage = "preflight:required_paths"
+                preflight_last_probe = self._maybe_interrupt_preflight(
+                    job_id=job_id,
+                    stage=preflight_stage,
+                    last_probe_at=preflight_last_probe,
+                )
                 self._check_remote_path(path, kind="e")
 
+            preflight_stage = "preflight:datasets"
+            self._append_local_log(local_log_path, "Preflight stage preflight:datasets (sync datasets)")
+            preflight_last_probe = self._maybe_interrupt_preflight(
+                job_id=job_id,
+                stage=preflight_stage,
+                last_probe_at=preflight_last_probe,
+            )
             datasets_synced, datasets_skipped = self._sync_datasets(cfg)
+            self._append_local_log(
+                local_log_path,
+                f"Dataset sync complete (copied={len(datasets_synced)}, reused={len(datasets_skipped)})",
+            )
 
+            preflight_stage = "preflight:submit_setup"
+            preflight_last_probe = self._maybe_interrupt_preflight(
+                job_id=job_id,
+                stage=preflight_stage,
+                last_probe_at=preflight_last_probe,
+            )
             self.ssh.run(
                 f"mkdir -p {shlex.quote(remote_job_dir)} "
                 f"{shlex.quote(posixpath.dirname(remote_cfg_path))}",
@@ -982,7 +1081,26 @@ class DeucalionExecutor(BaseExecutor):
                 except OSError:
                     pass
 
+            now = self.now_fn()
+            if (now - preflight_last_update) >= self.preflight_status_update_interval:
+                self.runtime._post_status(
+                    job_id,
+                    "dispatched",
+                    details=self._build_status_details(
+                        slurm_job_id=None,
+                        command_mode=command_mode,
+                        datasets_synced=datasets_synced,
+                        datasets_skipped=datasets_skipped,
+                        image=image_name,
+                        slurm_state="PREPARING",
+                        executor_stage=preflight_stage,
+                    ),
+                    container_name=job_name,
+                )
+                preflight_last_update = now
+
             slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=remote_job_dir)
+            self._append_local_log(local_log_path, f"Submitted Slurm job: {slurm_job_id}")
             initial_state = SlurmState(state="PENDING")
             try:
                 initial_state = query_state(self.ssh, slurm_job_id)
@@ -995,6 +1113,7 @@ class DeucalionExecutor(BaseExecutor):
                 datasets_skipped=datasets_skipped,
                 image=image_name,
                 state=initial_state,
+                executor_stage="execution:dispatched",
             )
             self.runtime._post_status(job_id, "dispatched", details=details, container_name=job_name)
             last_status = "dispatched"
@@ -1023,6 +1142,7 @@ class DeucalionExecutor(BaseExecutor):
                         image=image_name,
                         state=state,
                         stop_reason=stop_reason,
+                        executor_stage="execution:poll",
                     )
 
                     if now >= next_sync:
@@ -1053,6 +1173,10 @@ class DeucalionExecutor(BaseExecutor):
                         report_status = "running" if last_status == "running" else "dispatched"
                         self.runtime._post_status(job_id, report_status, details=details)
                         last_status = report_status
+                        self._append_local_log(
+                            local_log_path,
+                            f"Slurm state unknown; keeping status '{report_status}' (unknown_since={unknown_since})",
+                        )
                         self.sleep_fn(self.poll_interval)
                         continue
 
@@ -1064,6 +1188,10 @@ class DeucalionExecutor(BaseExecutor):
                         report_status = "running" if state.state in running_states else "dispatched"
                         self.runtime._post_status(job_id, report_status, details=details)
                         last_status = report_status
+                        self._append_local_log(
+                            local_log_path,
+                            f"Slurm state={state.state}; reported status='{report_status}'",
+                        )
                         self.sleep_fn(self.poll_interval)
                         continue
 
@@ -1092,6 +1220,10 @@ class DeucalionExecutor(BaseExecutor):
                     if final_status == "finished" and artifact_sync.get("had_failure"):
                         final_status = "failed"
                         error = "artifact_sync_failed"
+                    self._append_local_log(
+                        local_log_path,
+                        f"Terminal Slurm state={state.state}; reporting job status='{final_status}'",
+                    )
                     self.runtime._post_status(job_id, final_status, exit_code=exit_code, error=error, details=details)
                     return
                 except SSHCommandError as exc:
@@ -1109,9 +1241,11 @@ class DeucalionExecutor(BaseExecutor):
                         unknown_since=unknown_since,
                         stop_reason=stop_reason,
                         error=exc.stderr or str(exc),
+                        executor_stage="execution:connectivity_degraded",
                     )
                     if stop_reason not in _BACKEND_OVERRIDE_NO_POST:
                         self.runtime._post_status(job_id, last_status, details=details)
+                    self._append_local_log(local_log_path, f"Connectivity degraded while polling Slurm: {exc}")
                     if elapsed > self.unreachable_grace_seconds:
                         if stop_reason not in _BACKEND_OVERRIDE_NO_POST:
                             self.runtime._post_status(
@@ -1128,12 +1262,38 @@ class DeucalionExecutor(BaseExecutor):
                                     connectivity="down",
                                     unknown_since=unknown_since,
                                     stop_reason=stop_reason,
+                                    executor_stage="execution:connectivity_down",
                                 ),
                             )
+                        self._append_local_log(
+                            local_log_path,
+                            "Connectivity timeout reached; marking job failed (deucalion_unreachable_timeout)",
+                        )
                         return
                     self.sleep_fn(self.poll_interval)
+                except PreflightInterrupted as exc:
+                    stop_reason = exc.status
+                    details = self._build_status_details(
+                        slurm_job_id=slurm_job_id,
+                        command_mode=command_mode,
+                        datasets_synced=datasets_synced,
+                        datasets_skipped=datasets_skipped,
+                        image=image_name,
+                        slurm_state="PREPARING",
+                        stop_reason=stop_reason,
+                        error=str(exc),
+                        executor_stage=exc.stage,
+                    )
+                    resolved_status = self._resolve_interrupted_preflight_status(stop_reason)
+                    self._append_local_log(local_log_path, str(exc))
+                    if resolved_status:
+                        self.runtime._post_status(job_id, resolved_status, details=details)
+                    elif stop_reason not in _BACKEND_OVERRIDE_NO_POST:
+                        self.runtime._post_status(job_id, "failed", error=str(exc), details=details)
+                    return
                 except Exception as exc:
                     _LOGGER.exception("Unexpected Deucalion execution failure for job %s", job_id)
+                    self._append_local_log(local_log_path, f"Unexpected execution failure: {exc}")
                     self.runtime._post_status(
                         job_id,
                         "failed",
@@ -1144,11 +1304,34 @@ class DeucalionExecutor(BaseExecutor):
                             datasets_synced=datasets_synced,
                             datasets_skipped=datasets_skipped,
                             image=image_name,
+                            executor_stage="execution:unexpected_error",
                         ),
                     )
                     return
+        except PreflightInterrupted as exc:
+            stop_reason = exc.status
+            details = self._build_status_details(
+                slurm_job_id=slurm_job_id,
+                command_mode=command_mode,
+                datasets_synced=datasets_synced,
+                datasets_skipped=datasets_skipped,
+                image=image_name,
+                slurm_state="PREPARING",
+                stop_reason=stop_reason,
+                error=str(exc),
+                executor_stage=exc.stage,
+            )
+            resolved_status = self._resolve_interrupted_preflight_status(stop_reason)
+            self._append_local_log(local_log_path, str(exc))
+            if resolved_status:
+                self.runtime._post_status(job_id, resolved_status, details=details)
+            elif stop_reason not in _BACKEND_OVERRIDE_NO_POST:
+                self.runtime._post_status(job_id, "failed", error=str(exc), details=details)
         except Exception as exc:
             _LOGGER.exception("Failed to submit Deucalion job %s", job_id)
+            traceback_text = traceback.format_exc()
+            self._append_local_log(local_log_path, f"Submission/preflight failure during {preflight_stage}: {exc}")
+            self._append_local_log(local_log_path, traceback_text)
             self.runtime._post_status(
                 job_id,
                 "failed",
@@ -1159,6 +1342,8 @@ class DeucalionExecutor(BaseExecutor):
                     datasets_synced=datasets_synced,
                     datasets_skipped=datasets_skipped,
                     image=image_name,
+                    slurm_state="PREPARING",
+                    executor_stage=preflight_stage,
                 ),
             )
         finally:

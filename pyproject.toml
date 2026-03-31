@@ -1,6 +1,6 @@
 [project]
 name = "job-worker-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Worker agent for the OPEVA job queue"
 authors = [
     {name = "OPEVA Team"}

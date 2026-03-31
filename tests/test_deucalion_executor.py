@@ -462,6 +462,39 @@ def test_deucalion_executor_requires_payload_image(tmp_path):
     assert "Missing job image in payload for deucalion executor" in status_calls[-1]["error"]
 
 
+def test_deucalion_executor_preflight_failure_writes_local_log_and_stage(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = FakeSSHClient(existing_paths=set())
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+                }
+            }
+        },
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    job_id = "job-preflight-fail"
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Broken", "image": "calof/algorithms"})
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    assert status_calls[-1]["status"] == "failed"
+    assert status_calls[-1]["details"]["executor_stage"] == "preflight:remote_root_check"
+
+    log_path = shared_dir / "jobs" / job_id / "logs" / f"{job_id}.log"
+    assert log_path.exists()
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "Job accepted by deucalion worker" in log_text
+    assert "preflight:remote_root_check" in log_text
+
+
 def test_deucalion_heartbeat_includes_budget_snapshot_and_uses_cache(tmp_path):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
@@ -847,7 +880,7 @@ def test_deucalion_executor_unknown_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "unknown-1")
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: SlurmState(state="UNKNOWN"))
 
-    now_values = iter([0.0, 0.2, 0.8, 1.3, 1.6])
+    now_values = iter([0.0, 0.2, 0.8, 1.3, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6])
     agent = _build_agent(
         shared_dir,
         session,
@@ -890,7 +923,7 @@ def test_deucalion_executor_unreachable_timeout(tmp_path, monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(SSHCommandError("network down")),
     )
 
-    now_values = iter([0.0, 0.6, 1.2, 1.8, 2.4])
+    now_values = iter([0.0, 0.6, 1.2, 1.8, 2.4, 3.0, 3.6, 4.2, 4.8, 5.4])
     agent = _build_agent(
         shared_dir,
         session,
