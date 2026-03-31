@@ -64,6 +64,11 @@ class DeucalionExecutor(BaseExecutor):
             60.0,
             float(self.env.get("DEUCALION_SIF_BUILD_TIMEOUT_SECONDS", "5400")),
         )
+        self.sif_build_retries = max(1, int(self.env.get("DEUCALION_SIF_BUILD_RETRIES", "3")))
+        self.sif_build_retry_backoff = max(
+            0.0,
+            float(self.env.get("DEUCALION_SIF_BUILD_RETRY_BACKOFF", "10.0")),
+        )
         self.sif_build_poll_interval = max(
             1.0,
             float(self.env.get("DEUCALION_SIF_BUILD_POLL_INTERVAL", "5")),
@@ -402,13 +407,37 @@ class DeucalionExecutor(BaseExecutor):
         self._ensure_remote_dir(tmp_dir)
 
         if self.sif_build_mode == "slurm":
-            self._ensure_remote_sif_via_slurm(
-                cfg=cfg,
-                image_ref=image_ref,
-                marker_path=marker_path,
-                cache_dir=cache_dir,
-                tmp_dir=tmp_dir,
-            )
+            last_error: Exception | None = None
+            for attempt in range(1, self.sif_build_retries + 1):
+                try:
+                    self._ensure_remote_sif_via_slurm(
+                        cfg=cfg,
+                        image_ref=image_ref,
+                        marker_path=marker_path,
+                        cache_dir=cache_dir,
+                        tmp_dir=tmp_dir,
+                    )
+                    return
+                except FileNotFoundError as exc:
+                    last_error = exc
+                    if attempt >= self.sif_build_retries:
+                        raise
+                    error_message = str(exc)
+                    if not self._is_transient_sif_build_error(error_message):
+                        raise
+                    backoff = min(120.0, self.sif_build_retry_backoff * (2 ** (attempt - 1)))
+                    _LOGGER.warning(
+                        "Transient SIF build failure for docker://%s (attempt %d/%d): %s. Retrying in %.1fs",
+                        image_ref,
+                        attempt,
+                        self.sif_build_retries,
+                        error_message,
+                        backoff,
+                    )
+                    if backoff > 0:
+                        self.sleep_fn(backoff)
+            if last_error is not None:
+                raise last_error
             return
 
         pull_env = (
@@ -498,6 +527,22 @@ class DeucalionExecutor(BaseExecutor):
                 marker_path,
                 cfg.sif_version,
             )
+
+    @staticmethod
+    def _is_transient_sif_build_error(error_message: str) -> bool:
+        message = (error_message or "").lower()
+        transient_tokens = (
+            "i/o timeout",
+            "dial tcp",
+            "connection timed out",
+            "connection reset by peer",
+            "temporary failure in name resolution",
+            "tls handshake timeout",
+            "context deadline exceeded",
+            "no route to host",
+            "network is unreachable",
+        )
+        return any(token in message for token in transient_tokens)
 
     def _remote_exists(self, path: str, kind: str = "e") -> bool:
         output = self.ssh.run(
@@ -805,11 +850,74 @@ class DeucalionExecutor(BaseExecutor):
             return "failed", state.exit_code, "slurm_cancelled"
         return "failed", state.exit_code, f"slurm_{state.state.lower()}"
 
+    @staticmethod
+    def _inject_slurm_queue_details(details: dict[str, Any], state: SlurmState) -> None:
+        mapping = {
+            "slurm_partition": state.partition,
+            "slurm_reason": state.reason,
+            "slurm_submit_time": state.submit_time,
+            "slurm_start_time": state.start_time,
+            "slurm_elapsed": state.elapsed,
+            "slurm_time_left": state.time_left,
+            "slurm_priority": state.priority,
+            "slurm_user": state.user,
+            "slurm_nodes": state.nodes,
+            "slurm_cpus": state.cpus,
+            "slurm_queue_position": state.queue_position,
+            "slurm_jobs_ahead": state.jobs_ahead,
+            "slurm_pending_jobs_in_partition": state.pending_jobs_in_partition,
+        }
+        for key, value in mapping.items():
+            if value is None:
+                continue
+            details[key] = value
+
+    def _build_status_details(
+        self,
+        *,
+        slurm_job_id: str | None,
+        command_mode: str,
+        datasets_synced: list[str],
+        datasets_skipped: list[str],
+        image: str | None,
+        state: SlurmState | None = None,
+        slurm_state: str | None = None,
+        connectivity: str | None = None,
+        unknown_since: float | None = None,
+        stop_reason: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        details: dict[str, Any] = {
+            "executor": "deucalion",
+            "command_mode": command_mode,
+            "datasets_synced": datasets_synced,
+            "datasets_skipped": datasets_skipped,
+        }
+        if slurm_job_id:
+            details["slurm_job_id"] = slurm_job_id
+        if image:
+            details["image"] = image
+        if state is not None:
+            details["slurm_state"] = state.state
+            self._inject_slurm_queue_details(details, state)
+        elif slurm_state:
+            details["slurm_state"] = slurm_state
+        if connectivity:
+            details["connectivity"] = connectivity
+        if unknown_since is not None:
+            details["unknown_since"] = unknown_since
+        if stop_reason:
+            details["backend_stop_reason"] = stop_reason
+        if error:
+            details["error"] = error
+        return details
+
     def run_job(self, job: Dict[str, Any]) -> None:
         job_id = job["job_id"]
         config_path = str(job["config_path"]).lstrip("/")
         job_name = str(job.get("job_name", job_id))
         command = str(job.get("command") or self.runtime._build_command(job_id, config_path))
+        image_name = str(job.get("image") or "")
 
         local_config_path = self._local_config_path(config_path)
         local_log_path = self.runtime._prepare_log_file(job_id)
@@ -830,6 +938,7 @@ class DeucalionExecutor(BaseExecutor):
             job_yaml = self._load_job_yaml(local_config_path)
             cfg = resolve_deucalion_job_config(job_yaml, env=self.env)
             cfg = self._apply_job_image(cfg, job)
+            image_name = cfg.sif_image
             remote_root = self._remote_root(cfg)
             command_mode = cfg.command_mode
 
@@ -874,15 +983,19 @@ class DeucalionExecutor(BaseExecutor):
                     pass
 
             slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=remote_job_dir)
-            details = {
-                "slurm_job_id": slurm_job_id,
-                "slurm_state": "PENDING",
-                "executor": "deucalion",
-                "command_mode": command_mode,
-                "datasets_synced": datasets_synced,
-                "datasets_skipped": datasets_skipped,
-                "image": cfg.sif_image,
-            }
+            initial_state = SlurmState(state="PENDING")
+            try:
+                initial_state = query_state(self.ssh, slurm_job_id)
+            except SSHCommandError as exc:
+                _LOGGER.warning("Unable to fetch initial Slurm queue details for job %s: %s", job_id, exc)
+            details = self._build_status_details(
+                slurm_job_id=slurm_job_id,
+                command_mode=command_mode,
+                datasets_synced=datasets_synced,
+                datasets_skipped=datasets_skipped,
+                image=image_name,
+                state=initial_state,
+            )
             self.runtime._post_status(job_id, "dispatched", details=details, container_name=job_name)
             last_status = "dispatched"
 
@@ -902,17 +1015,15 @@ class DeucalionExecutor(BaseExecutor):
                     if state.state != "UNKNOWN":
                         unknown_since = None
 
-                    details = {
-                        "slurm_job_id": slurm_job_id,
-                        "slurm_state": state.state,
-                        "executor": "deucalion",
-                        "command_mode": command_mode,
-                        "datasets_synced": datasets_synced,
-                        "datasets_skipped": datasets_skipped,
-                        "image": cfg.sif_image,
-                    }
-                    if stop_reason:
-                        details["backend_stop_reason"] = stop_reason
+                    details = self._build_status_details(
+                        slurm_job_id=slurm_job_id,
+                        command_mode=command_mode,
+                        datasets_synced=datasets_synced,
+                        datasets_skipped=datasets_skipped,
+                        image=image_name,
+                        state=state,
+                        stop_reason=stop_reason,
+                    )
 
                     if now >= next_sync:
                         log_offsets = self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
@@ -987,17 +1098,18 @@ class DeucalionExecutor(BaseExecutor):
                     if degraded_since is None:
                         degraded_since = now
                     elapsed = now - degraded_since
-                    details = {
-                        "slurm_job_id": slurm_job_id,
-                        "connectivity": "degraded",
-                        "executor": "deucalion",
-                        "command_mode": command_mode,
-                        "datasets_synced": datasets_synced,
-                        "datasets_skipped": datasets_skipped,
-                        "error": exc.stderr or str(exc),
-                    }
-                    if unknown_since is not None:
-                        details["unknown_since"] = unknown_since
+                    details = self._build_status_details(
+                        slurm_job_id=slurm_job_id,
+                        command_mode=command_mode,
+                        datasets_synced=datasets_synced,
+                        datasets_skipped=datasets_skipped,
+                        image=image_name,
+                        slurm_state="UNKNOWN",
+                        connectivity="degraded",
+                        unknown_since=unknown_since,
+                        stop_reason=stop_reason,
+                        error=exc.stderr or str(exc),
+                    )
                     if stop_reason not in _BACKEND_OVERRIDE_NO_POST:
                         self.runtime._post_status(job_id, last_status, details=details)
                     if elapsed > self.unreachable_grace_seconds:
@@ -1006,14 +1118,17 @@ class DeucalionExecutor(BaseExecutor):
                                 job_id,
                                 "failed",
                                 error="deucalion_unreachable_timeout",
-                                details={
-                                    "slurm_job_id": slurm_job_id,
-                                    "connectivity": "down",
-                                    "executor": "deucalion",
-                                    "command_mode": command_mode,
-                                    "datasets_synced": datasets_synced,
-                                    "datasets_skipped": datasets_skipped,
-                                },
+                                details=self._build_status_details(
+                                    slurm_job_id=slurm_job_id,
+                                    command_mode=command_mode,
+                                    datasets_synced=datasets_synced,
+                                    datasets_skipped=datasets_skipped,
+                                    image=image_name,
+                                    slurm_state="UNKNOWN",
+                                    connectivity="down",
+                                    unknown_since=unknown_since,
+                                    stop_reason=stop_reason,
+                                ),
                             )
                         return
                     self.sleep_fn(self.poll_interval)
@@ -1023,13 +1138,13 @@ class DeucalionExecutor(BaseExecutor):
                         job_id,
                         "failed",
                         error=str(exc),
-                        details={
-                            "slurm_job_id": slurm_job_id,
-                            "executor": "deucalion",
-                            "command_mode": command_mode,
-                            "datasets_synced": datasets_synced,
-                            "datasets_skipped": datasets_skipped,
-                        },
+                        details=self._build_status_details(
+                            slurm_job_id=slurm_job_id,
+                            command_mode=command_mode,
+                            datasets_synced=datasets_synced,
+                            datasets_skipped=datasets_skipped,
+                            image=image_name,
+                        ),
                     )
                     return
         except Exception as exc:
@@ -1038,12 +1153,13 @@ class DeucalionExecutor(BaseExecutor):
                 job_id,
                 "failed",
                 error=str(exc),
-                details={
-                    "executor": "deucalion",
-                    "command_mode": command_mode,
-                    "datasets_synced": datasets_synced,
-                    "datasets_skipped": datasets_skipped,
-                },
+                details=self._build_status_details(
+                    slurm_job_id=slurm_job_id,
+                    command_mode=command_mode,
+                    datasets_synced=datasets_synced,
+                    datasets_skipped=datasets_skipped,
+                    image=image_name,
+                ),
             )
         finally:
             self.runtime._mark_active_job(None)

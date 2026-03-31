@@ -176,6 +176,8 @@ Deucalion-only variables:
 | `DEUCALION_SIF_VERSION` | Desired SIF version marker for change detection (optional). |
 | `DEUCALION_SIF_BUILD_MODE` | `slurm` (default) or `login`. `slurm` builds SIF via batch job on compute node. |
 | `DEUCALION_SIF_BUILD_TIMEOUT_SECONDS` | Max wait for SIF build job completion (default `5400`). |
+| `DEUCALION_SIF_BUILD_RETRIES` | Retries for transient SIF build network failures (default `3`). |
+| `DEUCALION_SIF_BUILD_RETRY_BACKOFF` | Base backoff seconds for SIF build retries (default `10.0`). |
 | `DEUCALION_SIF_BUILD_POLL_INTERVAL` | Poll interval for SIF build Slurm state (default `5`). |
 | `DEUCALION_SIF_BUILD_ACCOUNT` | Optional Slurm account override for SIF build job. |
 | `DEUCALION_SIF_BUILD_PARTITION` | Optional Slurm partition override for SIF build job. |
