@@ -729,7 +729,7 @@ def test_deucalion_executor_exec_mode_requires_executable(tmp_path, monkeypatch)
     assert called["sbatch"] is False
 
 
-def test_deucalion_executor_dataset_sync_copy_missing_skip_existing(tmp_path, monkeypatch):
+def test_deucalion_executor_dataset_sync_default_always_replaces_existing(tmp_path, monkeypatch):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
     session = DummySession()
@@ -769,8 +769,67 @@ def test_deucalion_executor_dataset_sync_copy_missing_skip_existing(tmp_path, mo
 
     copied_remote_paths = [remote for _local, remote, _recursive in fake_ssh.copy_to_calls]
     assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in copied_remote_paths
-    assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" not in copied_remote_paths
+    assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" in copied_remote_paths
+    assert any("rm -rf /projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" in cmd for cmd in fake_ssh.commands)
+    assert any("rm -rf /projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in cmd for cmd in fake_ssh.commands)
     assert any("ln -sfn /projects/F202508843CPCAA0/tiagocalof/datasets" in cmd for cmd in fake_ssh.commands)
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    final_details = status_calls[-1]["details"]
+    assert final_details["datasets_synced"] == ["datasets/site_a/a.csv", "datasets/site_b/b.csv"]
+    assert final_details["datasets_skipped"] == []
+
+
+def test_deucalion_executor_dataset_sync_exists_mode_skips_existing(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    (shared_dir / "datasets" / "site_a").mkdir(parents=True, exist_ok=True)
+    (shared_dir / "datasets" / "site_a" / "a.csv").write_text("a", encoding="utf-8")
+    (shared_dir / "datasets" / "site_b").mkdir(parents=True, exist_ok=True)
+    (shared_dir / "datasets" / "site_b" / "b.csv").write_text("b", encoding="utf-8")
+
+    existing = {
+        "/projects/F202508843CPCAA0/tiagocalof",
+        "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        "/projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv",
+    }
+    fake_ssh = FakeSSHClient(existing_paths=existing)
+
+    _write_config(
+        shared_dir,
+        {
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+                    "datasets": [
+                        "datasets/site_a/a.csv",
+                        "datasets/site_b/b.csv",
+                    ],
+                }
+            }
+        },
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "778")
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0))
+
+    agent = _build_agent(
+        shared_dir,
+        session,
+        fake_ssh,
+        env={
+            "DEUCALION_SYNC_INTERVAL": "0",
+            "DEUCALION_DATASET_SYNC_MODE": "exists",
+        },
+    )
+    agent._run_job({"job_id": "job-data-exists", "config_path": "configs/demo.yaml", "job_name": "DataExists", "image": "calof/algorithms:latest"})
+
+    copied_remote_paths = [remote for _local, remote, _recursive in fake_ssh.copy_to_calls]
+    assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in copied_remote_paths
+    assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" not in copied_remote_paths
+    assert not any("rm -rf /projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" in cmd for cmd in fake_ssh.commands)
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     final_details = status_calls[-1]["details"]
