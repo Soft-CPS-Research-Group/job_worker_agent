@@ -902,11 +902,25 @@ class DeucalionExecutor(BaseExecutor):
                 f"mkdir -p {shlex.quote(posixpath.join(remote_job_dir, 'progress'))}",
             ]
         )
+        runtime_log_path = posixpath.join(remote_data_dir, "jobs", job_id, "logs", "runtime.log")
+        lines.append(f"mkdir -p {shlex.quote(posixpath.dirname(runtime_log_path))}")
         for key, value in env_vars.items():
             if value is None:
                 continue
             lines.append(f"export {key}={shlex.quote(str(value))}")
-        lines.append(self._build_singularity_command(cfg=cfg, remote_data_dir=remote_data_dir, command=command))
+        # Keep job logs clean when Git metadata is unavailable inside the runtime image.
+        lines.append("export GIT_PYTHON_REFRESH=${GIT_PYTHON_REFRESH:-quiet}")
+        lines.append("export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}")
+        singularity_cmd = self._build_singularity_command(cfg=cfg, remote_data_dir=remote_data_dir, command=command)
+        lines.extend(
+            [
+                "if command -v stdbuf >/dev/null 2>&1; then",
+                f"  stdbuf -oL -eL {singularity_cmd} 2>&1 | tee -a {shlex.quote(runtime_log_path)}",
+                "else",
+                f"  {singularity_cmd} 2>&1 | tee -a {shlex.quote(runtime_log_path)}",
+                "fi",
+            ]
+        )
         return "\n".join(lines) + "\n"
 
     def _map_terminal_status(self, stop_reason: str | None, state: SlurmState) -> tuple[str, int | None, str | None]:
