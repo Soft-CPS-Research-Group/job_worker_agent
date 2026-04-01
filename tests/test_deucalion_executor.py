@@ -151,6 +151,50 @@ class FakeSSHClient:
             self.existing_paths.discard(source)
             return ""
 
+        m = re.match(r"rm -f (\S+)$", command)
+        if m:
+            target = m.group(1).strip("'\"")
+            self.existing_paths.discard(target)
+            self.remote_files.pop(target, None)
+            return ""
+
+        m = re.match(r"rm -rf (\S+)$", command)
+        if m:
+            target = m.group(1).strip("'\"")
+            prefix = target.rstrip("/") + "/"
+            self.existing_paths = {path for path in self.existing_paths if path != target and not path.startswith(prefix)}
+            for key in list(self.remote_files.keys()):
+                if key == target or key.startswith(prefix):
+                    self.remote_files.pop(key, None)
+            return ""
+
+        m = re.match(r"cp -a (\S+) (\S+)$", command)
+        if m:
+            source = m.group(1).strip("'\"")
+            target = m.group(2).strip("'\"")
+            source_prefix = source.rstrip("/") + "/"
+            target_prefix = target.rstrip("/") + "/"
+            copied = False
+            if source in self.remote_files:
+                self.remote_files[target] = self.remote_files[source]
+                copied = True
+            if source in self.existing_paths:
+                self.existing_paths.add(target)
+                copied = True
+            for path in list(self.existing_paths):
+                if path.startswith(source_prefix):
+                    rel = path[len(source_prefix):]
+                    self.existing_paths.add(target_prefix + rel)
+                    copied = True
+            for path, value in list(self.remote_files.items()):
+                if path.startswith(source_prefix):
+                    rel = path[len(source_prefix):]
+                    self.remote_files[target_prefix + rel] = value
+                    copied = True
+            if not copied and check:
+                raise SSHCommandError("cp source missing")
+            return ""
+
         return ""
 
     def copy_to(self, local_path, remote_path, timeout=60, recursive=False):
@@ -303,6 +347,7 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     # sbatch script uses singularity run by default
     sbatch_remote = f"{remote_job_dir}/run.sbatch"
     assert "singularity run" in fake_ssh.remote_files[sbatch_remote]
+    assert "--bind /projects/F202508843CPCAA0/tiagocalof/runs/job-1/data:/data " in fake_ssh.remote_files[sbatch_remote]
 
     # log sync is incremental: content appears once even with multiple sync loops
     log_path = shared_dir / "jobs" / job_id / "logs" / f"{job_id}.log"
@@ -772,7 +817,19 @@ def test_deucalion_executor_dataset_sync_default_always_replaces_existing(tmp_pa
     assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" in copied_remote_paths
     assert any("rm -rf /projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv" in cmd for cmd in fake_ssh.commands)
     assert any("rm -rf /projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in cmd for cmd in fake_ssh.commands)
-    assert any("ln -sfn /projects/F202508843CPCAA0/tiagocalof/datasets" in cmd for cmd in fake_ssh.commands)
+    assert any("mkdir -p /projects/F202508843CPCAA0/tiagocalof/runs/job-data/data/datasets" in cmd for cmd in fake_ssh.commands)
+    assert any(
+        "cp -a /projects/F202508843CPCAA0/tiagocalof/datasets/site_a/a.csv "
+        "/projects/F202508843CPCAA0/tiagocalof/runs/job-data/data/datasets/site_a/a.csv"
+        in cmd
+        for cmd in fake_ssh.commands
+    )
+    assert any(
+        "cp -a /projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv "
+        "/projects/F202508843CPCAA0/tiagocalof/runs/job-data/data/datasets/site_b/b.csv"
+        in cmd
+        for cmd in fake_ssh.commands
+    )
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     final_details = status_calls[-1]["details"]

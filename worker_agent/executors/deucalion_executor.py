@@ -667,15 +667,76 @@ class DeucalionExecutor(BaseExecutor):
             synced.append(rel_path)
         return synced, skipped
 
-    def _ensure_datasets_symlink(self, remote_root: str, remote_job_dir: str) -> None:
+    def _ensure_datasets_mountpoint(self, remote_root: str, remote_job_dir: str) -> None:
         datasets_root = posixpath.join(remote_root, "datasets")
-        link_path = posixpath.join(remote_job_dir, "data", "datasets")
+        mountpoint = posixpath.join(remote_job_dir, "data", "datasets")
+        # Keep datasets cached under remote_root and materialize a per-job copy under
+        # runs/<job>/data/datasets, so a single /data bind is enough in Singularity.
         self._ensure_remote_dir(datasets_root)
-        self._ensure_remote_dir(posixpath.dirname(link_path))
-        self.ssh.run(
-            f"ln -sfn {shlex.quote(datasets_root)} {shlex.quote(link_path)}",
-            timeout=30,
-        )
+        self._ensure_remote_dir(mountpoint)
+
+    def _materialize_job_datasets(
+        self,
+        *,
+        remote_root: str,
+        remote_data_dir: str,
+        dataset_paths: list[str],
+    ) -> None:
+        for rel_path in dataset_paths:
+            remote_source = posixpath.join(remote_root, rel_path)
+            remote_target = posixpath.join(remote_data_dir, rel_path)
+            if not self._remote_exists(remote_source, kind="e"):
+                raise FileNotFoundError(
+                    f"Dataset expected in remote cache but missing: {remote_source}"
+                )
+            self._ensure_remote_dir(posixpath.dirname(remote_target))
+            self.ssh.run(f"rm -rf {shlex.quote(remote_target)}", timeout=60, check=False)
+            self.ssh.run(
+                f"cp -a {shlex.quote(remote_source)} {shlex.quote(remote_target)}",
+                timeout=self.dataset_copy_timeout_seconds,
+                check=True,
+            )
+
+    @staticmethod
+    def _extract_dataset_paths_from_config(config: dict[str, Any]) -> list[str]:
+        simulator = config.get("simulator") if isinstance(config, dict) else None
+        if not isinstance(simulator, dict):
+            return []
+        paths: list[str] = []
+        seen: set[str] = set()
+        raw_values = simulator.get("dataset_paths")
+        if raw_values is None:
+            raw_values = simulator.get("dataset_path")
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            candidate = value.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            paths.append(candidate)
+        return paths
+
+    @staticmethod
+    def _map_container_path_to_remote_data(path: str, remote_data_dir: str) -> str | None:
+        normalized = path.strip().replace("\\", "/")
+        if normalized.startswith("/data/"):
+            suffix = normalized[len("/data/") :].lstrip("/")
+            return posixpath.join(remote_data_dir, suffix)
+        return None
+
+    def _verify_config_dataset_paths(self, *, job_yaml: dict[str, Any], remote_data_dir: str) -> None:
+        for container_path in self._extract_dataset_paths_from_config(job_yaml):
+            remote_path = self._map_container_path_to_remote_data(container_path, remote_data_dir)
+            if not remote_path:
+                continue
+            if self._remote_exists(remote_path, kind="e"):
+                continue
+            raise FileNotFoundError(
+                "Configured dataset path is not available for Deucalion run: "
+                f"{container_path} (expected remote path: {remote_path})"
+            )
 
     @staticmethod
     def _derive_image_version(image_ref: str) -> str | None:
@@ -1017,7 +1078,25 @@ class DeucalionExecutor(BaseExecutor):
                 f"{shlex.quote(posixpath.dirname(remote_cfg_path))}",
                 timeout=30,
             )
-            self._ensure_datasets_symlink(remote_root=remote_root, remote_job_dir=remote_job_dir)
+            self._ensure_datasets_mountpoint(remote_root=remote_root, remote_job_dir=remote_job_dir)
+            preflight_stage = "preflight:dataset_materialize"
+            preflight_last_probe = self._maybe_interrupt_preflight(
+                job_id=job_id,
+                stage=preflight_stage,
+                last_probe_at=preflight_last_probe,
+            )
+            self._materialize_job_datasets(
+                remote_root=remote_root,
+                remote_data_dir=remote_data_dir,
+                dataset_paths=cfg.datasets,
+            )
+            preflight_stage = "preflight:dataset_paths"
+            preflight_last_probe = self._maybe_interrupt_preflight(
+                job_id=job_id,
+                stage=preflight_stage,
+                last_probe_at=preflight_last_probe,
+            )
+            self._verify_config_dataset_paths(job_yaml=job_yaml, remote_data_dir=remote_data_dir)
             self.ssh.copy_to(local_config_path, remote_cfg_path, timeout=60)
 
             script = self._render_sbatch_script(
