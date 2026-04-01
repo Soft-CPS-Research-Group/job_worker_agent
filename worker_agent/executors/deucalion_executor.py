@@ -67,6 +67,13 @@ class DeucalionExecutor(BaseExecutor):
             0.0,
             float(self.env.get("DEUCALION_DATASET_COPY_RETRY_BACKOFF", "2.0")),
         )
+        self.dataset_sync_mode = self.env.get("DEUCALION_DATASET_SYNC_MODE", "always").strip().lower()
+        if self.dataset_sync_mode not in {"always", "exists"}:
+            _LOGGER.warning(
+                "Invalid DEUCALION_DATASET_SYNC_MODE=%r. Falling back to 'always'.",
+                self.dataset_sync_mode,
+            )
+            self.dataset_sync_mode = "always"
         self.dataset_copy_timeout_seconds = max(
             60,
             int(self.env.get("DEUCALION_DATASET_COPY_TIMEOUT_SECONDS", "1800")),
@@ -621,9 +628,12 @@ class DeucalionExecutor(BaseExecutor):
             remote_target = posixpath.join(cfg.remote_root, rel_path)
             if not local_source.exists():
                 raise FileNotFoundError(f"Dataset path not found in shared dir: {local_source}")
-            if self._remote_exists(remote_target, kind="e"):
+            if self.dataset_sync_mode == "exists" and self._remote_exists(remote_target, kind="e"):
                 skipped.append(rel_path)
                 continue
+            if self.dataset_sync_mode == "always":
+                # Force a full refresh to avoid stale/partial remote datasets.
+                self.ssh.run(f"rm -rf {shlex.quote(remote_target)}", timeout=60, check=False)
             self._ensure_remote_dir(posixpath.dirname(remote_target))
             is_dir = local_source.is_dir()
             timeout = self.dataset_copy_timeout_seconds if is_dir else 300
