@@ -49,7 +49,7 @@ export DEUCALION_SSH_HOST=<login-node>
 export DEUCALION_SSH_USER=<username>
 export DEUCALION_SSH_KEY_PATH_HOST=/etc/opeva/deucalion/id_ed25519
 export DEUCALION_SSH_KNOWN_HOSTS_HOST=/etc/opeva/deucalion/known_hosts
-export DEUCALION_SIF_PATH=/projects/F202508843CPCAA0/tiagocalof/images/simulator.sif
+export DEUCALION_SIF_REPOSITORY=calof/opeva_simulator_sif
 export DEUCALION_REMOTE_ROOT=/projects/F202508843CPCAA0/tiagocalof
 
 docker compose -f docker-compose.deucalion.yml up -d
@@ -57,7 +57,8 @@ docker compose -f docker-compose.deucalion.yml up -d
 
 Notes:
 - Backend remains unchanged; this worker still uses `/api/agent/*`.
-- `.sif` must exist in Deucalion storage.
+- Worker resolves SIF by job image tag from OCI artifacts (default repo: `calof/opeva_simulator_sif`)
+  and stores them in a versioned cache under Deucalion remote storage.
 - Datasets can be synchronized automatically per job using
   `execution.deucalion.datasets` (paths relative to the shared root, e.g.
   `datasets/site_a/input.csv`).
@@ -171,19 +172,17 @@ Deucalion-only variables:
 | `DEUCALION_SSH_KEY_PATH` | Path inside container to private key (recommended mount RO). |
 | `DEUCALION_SSH_KNOWN_HOSTS` | Path inside container to known_hosts file (recommended mount RO). |
 | `DEUCALION_REMOTE_ROOT` | Remote root directory (default `/projects/F202508843CPCAA0/tiagocalof`). |
-| `DEUCALION_SIF_PATH` | Remote path to Singularity image (`.sif`) used to execute jobs. |
-| `DEUCALION_SIF_IMAGE` | Docker image reference used to rebuild SIF when missing/version-changed. |
-| `DEUCALION_SIF_VERSION` | Desired SIF version marker for change detection (optional). |
-| `DEUCALION_SIF_BUILD_MODE` | `slurm` (default) or `login`. `slurm` builds SIF via batch job on compute node. |
-| `DEUCALION_SIF_BUILD_TIMEOUT_SECONDS` | Max wait for SIF build job completion (default `5400`). |
-| `DEUCALION_SIF_BUILD_RETRIES` | Retries for transient SIF build network failures (default `3`). |
-| `DEUCALION_SIF_BUILD_RETRY_BACKOFF` | Base backoff seconds for SIF build retries (default `10.0`). |
-| `DEUCALION_SIF_BUILD_POLL_INTERVAL` | Poll interval for SIF build Slurm state (default `5`). |
-| `DEUCALION_SIF_BUILD_ACCOUNT` | Optional Slurm account override for SIF build job. |
-| `DEUCALION_SIF_BUILD_PARTITION` | Optional Slurm partition override for SIF build job. |
-| `DEUCALION_SIF_BUILD_TIME` | Optional Slurm time limit override for SIF build job. |
-| `DEUCALION_SIF_BUILD_CPUS` | CPU cores for SIF build job (default `2`). |
-| `DEUCALION_SIF_BUILD_MEM_GB` | Memory for SIF build job in GB (default `8`). |
+| `DEUCALION_SIF_REPOSITORY` | OCI repository containing pre-built SIF artifacts (default `calof/opeva_simulator_sif`). |
+| `DEUCALION_SIF_REGISTRY` | OCI registry host for SIF artifacts (default `docker.io`). |
+| `DEUCALION_SIF_REMOTE_CACHE_DIR` | Remote versioned cache directory for downloaded `.sif` files (default `<remote_root>/images/cache`). |
+| `DEUCALION_SIF_LOCAL_CACHE_DIR` | Local worker cache directory for pulled artifacts (default `/tmp/opeva_sif_artifacts`). |
+| `DEUCALION_SIF_PULL_TIMEOUT_SECONDS` | Timeout for each ORAS pull attempt (default `1800`). |
+| `DEUCALION_SIF_PULL_RETRIES` | Retry count for transient artifact pull failures (default `3`). |
+| `DEUCALION_SIF_PULL_RETRY_BACKOFF` | Base backoff seconds for SIF pull retries (default `5`). |
+| `DEUCALION_SIF_LOCK_WAIT_TIMEOUT_SECONDS` | Max wait for remote per-tag lock acquisition (default `900`). |
+| `DEUCALION_SIF_LOCK_POLL_INTERVAL` | Poll interval while waiting for remote lock (default `2`). |
+| `DEUCALION_SIF_LOCK_STALE_SECONDS` | Age after which stale lock directories are cleaned up (default `1800`). |
+| `DEUCALION_SIF_PATH` | Optional legacy override path; normally the worker computes a versioned cache path from image tag. |
 | `DEUCALION_SIF_COMMAND_MODE` | Singularity mode (`run` or `exec`). Default: `run`. |
 | `DEUCALION_CONTAINER_WORKDIR` | Working directory inside container for Singularity actions (default `/app`). |
 | `DEUCALION_DATASET_COPY_RETRIES` | Retries for dataset SCP sync (default `3`). |
@@ -202,7 +201,6 @@ Deucalion-only variables:
 
 Per-job overrides in YAML (`execution.deucalion`) support:
 - `command_mode: run|exec` (default `run`)
-- `sif_image: <repo/image>` and `sif_version: <tag>` (optional refresh-by-version)
 - `datasets: [datasets/...,...]` (relative to shared root; copied to
   `<remote_root>/datasets/...` only when missing)
 - existing keys: `account`, `partition`, `time`, `cpus_per_task`, `mem_gb`,

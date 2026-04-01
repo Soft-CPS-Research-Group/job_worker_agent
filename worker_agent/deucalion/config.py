@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import posixpath
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
@@ -126,9 +127,14 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
         modules=_as_list(_pick(deucalion, "modules")) or _as_list(env.get("DEUCALION_MODULES")),
     )
 
-    sif_path = _as_str(_pick(deucalion, "sif_path"), env.get("DEUCALION_SIF_PATH", ""))
-    if not sif_path:
-        raise ValueError("Missing Deucalion SIF path. Set DEUCALION_SIF_PATH or execution.deucalion.sif_path")
+    remote_root = _as_str(
+        env.get("DEUCALION_REMOTE_ROOT"),
+        DEFAULT_DEUCALION_REMOTE_ROOT,
+    ).rstrip("/")
+    sif_path = _as_str(
+        _pick(deucalion, "sif_path"),
+        env.get("DEUCALION_SIF_PATH", posixpath.join(remote_root, "images", "cache", "simulator.sif")),
+    )
 
     sif_image = _as_str(
         _pick(deucalion, "sif_image"),
@@ -143,11 +149,6 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
     )
     if not sif_version:
         sif_version = None
-
-    remote_root = _as_str(
-        env.get("DEUCALION_REMOTE_ROOT"),
-        DEFAULT_DEUCALION_REMOTE_ROOT,
-    ).rstrip("/")
 
     command_mode = _parse_command_mode(
         _pick(deucalion, "command_mode"),

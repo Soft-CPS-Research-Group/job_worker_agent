@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
+import re
+import shutil
 import shlex
+import subprocess
 import tempfile
 import time
 import traceback
@@ -30,6 +33,10 @@ class PreflightInterrupted(RuntimeError):
         self.status = status
         self.stage = stage
         super().__init__(f"Preflight interrupted by backend status '{status}' during stage '{stage}'")
+
+
+class SIFArtifactNotFound(FileNotFoundError):
+    """Raised when the selected image tag has no published SIF artifact."""
 
 
 class DeucalionExecutor(BaseExecutor):
@@ -65,31 +72,37 @@ class DeucalionExecutor(BaseExecutor):
             int(self.env.get("DEUCALION_DATASET_COPY_TIMEOUT_SECONDS", "1800")),
         )
         self.container_workdir = self.env.get("DEUCALION_CONTAINER_WORKDIR", "/app").strip()
-        self.sif_pull_procs = max(1, int(self.env.get("DEUCALION_SIF_PULL_PROCS", "1")))
-        self.sif_mksquashfs_args = self.env.get("DEUCALION_SIF_MKSQUASHFS_ARGS", "").strip()
-        self.sif_build_mode = self.env.get("DEUCALION_SIF_BUILD_MODE", "slurm").strip().lower() or "slurm"
-        self.sif_build_timeout_seconds = max(
+        self.sif_repository = self.env.get("DEUCALION_SIF_REPOSITORY", "calof/opeva_simulator_sif").strip().strip("/")
+        self.sif_registry = self.env.get("DEUCALION_SIF_REGISTRY", "docker.io").strip().rstrip("/")
+        self.sif_remote_cache_dir_env = self.env.get("DEUCALION_SIF_REMOTE_CACHE_DIR", "").strip()
+        self.sif_local_cache_dir = Path(
+            self.env.get("DEUCALION_SIF_LOCAL_CACHE_DIR", "/tmp/opeva_sif_artifacts")
+        ).resolve()
+        self.sif_pull_timeout_seconds = max(
             60.0,
-            float(self.env.get("DEUCALION_SIF_BUILD_TIMEOUT_SECONDS", "5400")),
+            float(self.env.get("DEUCALION_SIF_PULL_TIMEOUT_SECONDS", "1800")),
         )
-        self.sif_build_retries = max(1, int(self.env.get("DEUCALION_SIF_BUILD_RETRIES", "3")))
-        self.sif_build_retry_backoff = max(
+        self.sif_pull_retries = max(1, int(self.env.get("DEUCALION_SIF_PULL_RETRIES", "3")))
+        self.sif_pull_retry_backoff = max(
             0.0,
-            float(self.env.get("DEUCALION_SIF_BUILD_RETRY_BACKOFF", "10.0")),
+            float(self.env.get("DEUCALION_SIF_PULL_RETRY_BACKOFF", "5.0")),
         )
-        self.sif_build_poll_interval = max(
-            1.0,
-            float(self.env.get("DEUCALION_SIF_BUILD_POLL_INTERVAL", "5")),
+        self.sif_lock_wait_timeout_seconds = max(
+            10.0,
+            float(self.env.get("DEUCALION_SIF_LOCK_WAIT_TIMEOUT_SECONDS", "900")),
+        )
+        self.sif_lock_poll_interval = max(
+            0.5,
+            float(self.env.get("DEUCALION_SIF_LOCK_POLL_INTERVAL", "2.0")),
+        )
+        self.sif_lock_stale_seconds = max(
+            30.0,
+            float(self.env.get("DEUCALION_SIF_LOCK_STALE_SECONDS", "1800")),
         )
         self.preflight_status_update_interval = max(
             5.0,
             float(self.env.get("DEUCALION_PREFLIGHT_STATUS_UPDATE_INTERVAL", "20")),
         )
-        self.sif_build_time_limit = self.env.get("DEUCALION_SIF_BUILD_TIME", "").strip()
-        self.sif_build_partition = self.env.get("DEUCALION_SIF_BUILD_PARTITION", "").strip()
-        self.sif_build_account = self.env.get("DEUCALION_SIF_BUILD_ACCOUNT", "").strip()
-        self.sif_build_cpus = max(1, int(self.env.get("DEUCALION_SIF_BUILD_CPUS", "2")))
-        self.sif_build_mem_gb = max(1, int(self.env.get("DEUCALION_SIF_BUILD_MEM_GB", "8")))
         self.budget_refresh_interval = max(
             60.0,
             float(self.env.get("DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS", "3600")),
@@ -210,95 +223,232 @@ class DeucalionExecutor(BaseExecutor):
     def _sif_exists(self, sif_path: str) -> bool:
         return self._remote_exists(sif_path, kind="f")
 
-    def _sif_version_marker_path(self, cfg: DeucalionJobConfig) -> str:
-        marker_dir = posixpath.join(self._remote_root(cfg), ".opeva", "sif_versions")
-        marker_name = f"{cfg.sif_path.strip('/').replace('/', '__')}.version"
-        return posixpath.join(marker_dir, marker_name)
+    @staticmethod
+    def _sanitize_sif_tag(tag: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", tag.strip())
+        sanitized = sanitized.strip(".-")
+        if not sanitized:
+            raise ValueError(f"Invalid image tag for SIF cache path: {tag!r}")
+        return sanitized
 
-    def _read_remote_file_text(self, remote_path: str) -> str | None:
-        output = self.ssh.run(
-            f"if [ -f {shlex.quote(remote_path)} ]; then cat {shlex.quote(remote_path)}; fi",
-            timeout=30,
-            check=False,
-        ).strip()
-        return output or None
+    def _remote_sif_cache_dir(self, cfg: DeucalionJobConfig) -> str:
+        if self.sif_remote_cache_dir_env:
+            return self.sif_remote_cache_dir_env
+        return posixpath.join(self._remote_root(cfg), "images", "cache")
 
-    def _write_remote_file_text(self, remote_path: str, content: str) -> None:
-        remote_dir = posixpath.dirname(remote_path)
-        self._ensure_remote_dir(remote_dir)
+    def _remote_sif_lock_root(self, cfg: DeucalionJobConfig) -> str:
+        return posixpath.join(self._remote_sif_cache_dir(cfg), ".locks")
+
+    def _remote_sif_path_for_tag(self, cfg: DeucalionJobConfig, tag: str) -> str:
+        return posixpath.join(self._remote_sif_cache_dir(cfg), f"{self._sanitize_sif_tag(tag)}.sif")
+
+    def _remote_sif_lock_path(self, cfg: DeucalionJobConfig, tag: str) -> str:
+        lock_name = f"{self._sanitize_sif_tag(tag)}.lock"
+        return posixpath.join(self._remote_sif_lock_root(cfg), lock_name)
+
+    def _sif_artifact_ref_for_tag(self, tag: str) -> str:
+        repository = self.sif_repository
+        if not repository:
+            raise RuntimeError("Missing DEUCALION_SIF_REPOSITORY")
+        first = repository.split("/", 1)[0]
+        has_registry_prefix = "." in first or ":" in first or first == "localhost"
+        if has_registry_prefix:
+            return f"{repository}:{tag}"
+        return f"{self.sif_registry}/{repository}:{tag}"
+
+    def _cleanup_stale_remote_lock(self, lock_path: str) -> None:
+        max_age = int(self.sif_lock_stale_seconds)
         self.ssh.run(
-            f"printf %s {shlex.quote(content)} > {shlex.quote(remote_path)}",
-            timeout=30,
-        )
-
-    def _image_ref_for_version(self, cfg: DeucalionJobConfig) -> str | None:
-        if not cfg.sif_image:
-            return None
-        if not cfg.sif_version:
-            return cfg.sif_image
-        if "@" in cfg.sif_image:
-            return cfg.sif_image
-
-        image = cfg.sif_image
-        last_segment = image.rsplit("/", 1)[-1]
-        if ":" in last_segment:
-            base, _tag = image.rsplit(":", 1)
-            return f"{base}:{cfg.sif_version}"
-        return f"{image}:{cfg.sif_version}"
-
-    def _render_sif_build_script(
-        self,
-        cfg: DeucalionJobConfig,
-        image_ref: str,
-        cache_dir: str,
-        tmp_dir: str,
-        account: str,
-        partition: str,
-        time_limit: str,
-        cpus: int,
-        mem_gb: int,
-        out_path: str,
-        err_path: str,
-    ) -> str:
-        mksquashfs_line = ""
-        if self.sif_mksquashfs_args:
-            mksquashfs_line = f"APPTAINER_MKSQUASHFS_ARGS={shlex.quote(self.sif_mksquashfs_args)} "
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH -J opeva_sif_{uuid.uuid4().hex[:8]}",
-            f"#SBATCH -A {account}",
-            f"#SBATCH -p {partition}",
-            f"#SBATCH -t {time_limit}",
-            f"#SBATCH --cpus-per-task={cpus}",
-            f"#SBATCH --mem={mem_gb}G",
-            f"#SBATCH -o {out_path}",
-            f"#SBATCH -e {err_path}",
-            "",
-            "set -euo pipefail",
-            "module purge >/dev/null 2>&1 || true",
-            "module load singularity >/dev/null 2>&1 || true",
-            f"mkdir -p {shlex.quote(posixpath.dirname(cfg.sif_path))}",
-            f"mkdir -p {shlex.quote(cache_dir)}",
-            f"mkdir -p {shlex.quote(tmp_dir)}",
-            f"export APPTAINER_CACHEDIR={shlex.quote(cache_dir)}",
-            f"export APPTAINER_TMPDIR={shlex.quote(tmp_dir)}",
-            f"export APPTAINER_MKSQUASHFS_PROCS={self.sif_pull_procs}",
-            f"export SINGULARITY_CACHEDIR={shlex.quote(cache_dir)}",
-            f"export SINGULARITY_TMPDIR={shlex.quote(tmp_dir)}",
-            f"export SINGULARITY_MKSQUASHFS_PROCS={self.sif_pull_procs}",
             (
-                "if command -v apptainer >/dev/null 2>&1; then "
-                f"{mksquashfs_line}apptainer build --force {shlex.quote(cfg.sif_path)} "
-                f"docker://{shlex.quote(image_ref)}; "
-                "elif command -v singularity >/dev/null 2>&1; then "
-                f"singularity build --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}; "
-                "else "
-                "echo 'Neither apptainer nor singularity found on PATH' >&2; exit 127; "
+                f"if [ -d {shlex.quote(lock_path)} ]; then "
+                f"now=$(date +%s); "
+                f"mtime=$(stat -c %Y {shlex.quote(lock_path)} 2>/dev/null || echo 0); "
+                "age=$((now-mtime)); "
+                f"if [ \"$age\" -ge {max_age} ]; then rmdir {shlex.quote(lock_path)} >/dev/null 2>&1 || true; fi; "
                 "fi"
             ),
-            f"test -f {shlex.quote(cfg.sif_path)}",
-        ]
-        return "\n".join(lines) + "\n"
+            timeout=30,
+            check=False,
+        )
+
+    def _try_acquire_remote_lock(self, lock_path: str) -> bool:
+        output = self.ssh.run(
+            f"mkdir {shlex.quote(lock_path)} >/dev/null 2>&1 && echo acquired || true",
+            timeout=30,
+            check=False,
+        )
+        return output.strip() == "acquired"
+
+    def _release_remote_lock(self, lock_path: str) -> None:
+        self.ssh.run(f"rmdir {shlex.quote(lock_path)} >/dev/null 2>&1 || true", timeout=30, check=False)
+
+    def _acquire_remote_sif_lock(
+        self,
+        *,
+        cfg: DeucalionJobConfig,
+        tag: str,
+        remote_sif_path: str,
+        local_log_path: Path | None = None,
+    ) -> bool:
+        lock_path = self._remote_sif_lock_path(cfg, tag)
+        deadline = self.now_fn() + self.sif_lock_wait_timeout_seconds
+        while self.now_fn() <= deadline:
+            if self._sif_exists(remote_sif_path):
+                return False
+            self._cleanup_stale_remote_lock(lock_path)
+            if self._try_acquire_remote_lock(lock_path):
+                return True
+            self.sleep_fn(self.sif_lock_poll_interval)
+        if local_log_path is not None:
+            self._append_local_log(local_log_path, f"Timed out waiting for remote SIF lock {lock_path}")
+        raise TimeoutError(
+            f"Timed out waiting for remote SIF lock for tag '{tag}' at {lock_path}"
+        )
+
+    @staticmethod
+    def _is_transient_sif_pull_error(error_message: str) -> bool:
+        message = (error_message or "").lower()
+        transient_tokens = (
+            "i/o timeout",
+            "dial tcp",
+            "connection timed out",
+            "connection reset by peer",
+            "temporary failure in name resolution",
+            "tls handshake timeout",
+            "context deadline exceeded",
+            "no route to host",
+            "network is unreachable",
+            "too many requests",
+            "rate limit",
+        )
+        return any(token in message for token in transient_tokens)
+
+    @staticmethod
+    def _resolve_pulled_sif_path(artifact_dir: Path) -> Path:
+        sif_files = sorted(path for path in artifact_dir.rglob("*.sif") if path.is_file())
+        if len(sif_files) == 1:
+            return sif_files[0]
+        if len(sif_files) > 1:
+            for candidate in sif_files:
+                if candidate.name == "simulator.sif":
+                    return candidate
+            return sif_files[0]
+        all_files = sorted(path for path in artifact_dir.rglob("*") if path.is_file())
+        if len(all_files) == 1:
+            return all_files[0]
+        raise FileNotFoundError(f"No SIF file found in pulled artifact directory: {artifact_dir}")
+
+    def _pull_sif_artifact_local(self, *, tag: str, destination: Path) -> None:
+        oras_binary = shutil.which("oras")
+        if not oras_binary:
+            raise RuntimeError("oras CLI not found in worker container PATH")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        artifact_ref = self._sif_artifact_ref_for_tag(tag)
+        for attempt in range(1, self.sif_pull_retries + 1):
+            with tempfile.TemporaryDirectory(prefix="opeva-sif-pull-") as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                cmd = [oras_binary, "pull", artifact_ref, "--output", str(tmp_path)]
+                try:
+                    completed = subprocess.run(
+                        cmd,
+                        text=True,
+                        capture_output=True,
+                        timeout=self.sif_pull_timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    output = f"oras pull timeout for {artifact_ref}: {exc}"
+                    if attempt >= self.sif_pull_retries:
+                        raise RuntimeError(output) from exc
+                    backoff = min(120.0, self.sif_pull_retry_backoff * (2 ** (attempt - 1)))
+                    if backoff > 0:
+                        self.sleep_fn(backoff)
+                    continue
+                output = "\n".join(part for part in [completed.stdout, completed.stderr] if part).strip()
+                if completed.returncode == 0:
+                    source = self._resolve_pulled_sif_path(tmp_path)
+                    tmp_dest = destination.with_suffix(destination.suffix + ".tmp")
+                    shutil.copyfile(source, tmp_dest)
+                    os.replace(tmp_dest, destination)
+                    return
+
+            normalized_output = output.lower()
+            if (
+                "not found" in normalized_output
+                or "manifest unknown" in normalized_output
+                or "name unknown" in normalized_output
+            ):
+                raise SIFArtifactNotFound(
+                    f"sif_not_published_for_tag: artifact {artifact_ref} is not available"
+                )
+            if attempt >= self.sif_pull_retries or not self._is_transient_sif_pull_error(output):
+                raise RuntimeError(f"Failed to pull SIF artifact {artifact_ref}: {output or 'unknown error'}")
+            backoff = min(120.0, self.sif_pull_retry_backoff * (2 ** (attempt - 1)))
+            if backoff > 0:
+                self.sleep_fn(backoff)
+
+    def _ensure_remote_sif(
+        self,
+        cfg: DeucalionJobConfig,
+        job_id: str | None = None,
+        local_log_path: Path | None = None,
+    ) -> None:
+        if not cfg.sif_version:
+            raise ValueError("Missing image tag for Deucalion SIF resolution")
+        tag = self._sanitize_sif_tag(cfg.sif_version)
+        remote_sif_path = cfg.sif_path or self._remote_sif_path_for_tag(cfg, tag)
+        cfg.sif_path = remote_sif_path
+
+        cache_dir = posixpath.dirname(remote_sif_path)
+        lock_root = self._remote_sif_lock_root(cfg)
+        self._ensure_remote_dir(cache_dir)
+        self._ensure_remote_dir(lock_root)
+
+        if self._sif_exists(remote_sif_path):
+            if local_log_path is not None:
+                self._append_local_log(local_log_path, f"SIF cache hit for tag {tag} at {remote_sif_path}")
+            return
+
+        acquired = self._acquire_remote_sif_lock(
+            cfg=cfg,
+            tag=tag,
+            remote_sif_path=remote_sif_path,
+            local_log_path=local_log_path,
+        )
+        if not acquired:
+            if local_log_path is not None:
+                self._append_local_log(local_log_path, f"SIF cache filled by another worker for tag {tag}")
+            return
+
+        lock_path = self._remote_sif_lock_path(cfg, tag)
+        try:
+            if self._sif_exists(remote_sif_path):
+                if local_log_path is not None:
+                    self._append_local_log(local_log_path, f"SIF cache hit for tag {tag} after lock acquire")
+                return
+            if local_log_path is not None:
+                self._append_local_log(local_log_path, f"Pulling SIF artifact for tag {tag} into local cache")
+            local_sif_path = self.sif_local_cache_dir / f"{tag}.sif"
+            self._pull_sif_artifact_local(tag=tag, destination=local_sif_path)
+
+            remote_tmp = f"{remote_sif_path}.part-{uuid.uuid4().hex[:8]}"
+            try:
+                if local_log_path is not None:
+                    self._append_local_log(local_log_path, f"Uploading SIF to Deucalion cache: {remote_sif_path}")
+                self.ssh.copy_to(local_sif_path, remote_tmp, timeout=int(self.sif_pull_timeout_seconds), recursive=False)
+                self.ssh.run(
+                    f"mv {shlex.quote(remote_tmp)} {shlex.quote(remote_sif_path)}",
+                    timeout=60,
+                    check=True,
+                )
+            finally:
+                self.ssh.run(f"rm -f {shlex.quote(remote_tmp)}", timeout=30, check=False)
+            if not self._sif_exists(remote_sif_path):
+                raise FileNotFoundError(f"Uploaded SIF missing at remote path: {remote_sif_path}")
+            if local_log_path is not None:
+                self._append_local_log(local_log_path, f"SIF published in Deucalion cache for tag {tag}")
+        finally:
+            self._release_remote_lock(lock_path)
 
     def _read_remote_tail(self, remote_path: str, lines: int = 80) -> str:
         return self.ssh.run(
@@ -340,325 +490,6 @@ class DeucalionExecutor(BaseExecutor):
         if status in _BACKEND_STOP_STATES:
             raise PreflightInterrupted(status=status, stage=stage)
         return now
-
-    def _ensure_remote_sif_via_slurm(
-        self,
-        cfg: DeucalionJobConfig,
-        image_ref: str,
-        marker_path: str,
-        cache_dir: str,
-        tmp_dir: str,
-        job_id: str | None = None,
-        preflight_stage: str = "sif_build",
-        local_log_path: Path | None = None,
-    ) -> None:
-        remote_root = self._remote_root(cfg)
-        build_root = posixpath.join(remote_root, ".opeva", "sif_builds")
-        build_id = uuid.uuid4().hex[:10]
-        build_dir = posixpath.join(build_root, build_id)
-        self._ensure_remote_dir(build_dir)
-        remote_script_path = posixpath.join(build_dir, "build_sif.sbatch")
-
-        account = self.sif_build_account or cfg.profile.account
-        partition = self.sif_build_partition or cfg.profile.partition
-        time_limit = self.sif_build_time_limit or cfg.profile.time_limit
-        cpus = self.sif_build_cpus
-        mem_gb = self.sif_build_mem_gb
-        out_path = posixpath.join(build_dir, "sif-build.out")
-        err_path = posixpath.join(build_dir, "sif-build.err")
-        script_text = self._render_sif_build_script(
-            cfg=cfg,
-            image_ref=image_ref,
-            cache_dir=cache_dir,
-            tmp_dir=tmp_dir,
-            account=account,
-            partition=partition,
-            time_limit=time_limit,
-            cpus=cpus,
-            mem_gb=mem_gb,
-            out_path=out_path,
-            err_path=err_path,
-        )
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
-            tmp.write(script_text)
-            tmp_path = Path(tmp.name)
-        try:
-            self.ssh.copy_to(tmp_path, remote_script_path, timeout=60, recursive=False)
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-        slurm_job_id = sbatch_submit(self.ssh, remote_script_path=remote_script_path, remote_workdir=build_dir)
-        if local_log_path is not None:
-            self._append_local_log(
-                local_log_path,
-                f"SIF build submitted via Slurm: job={slurm_job_id}, image=docker://{image_ref}",
-            )
-        deadline = self.now_fn() + self.sif_build_timeout_seconds
-        last_probe_at = self.now_fn()
-        last_progress_log_at = 0.0
-        last_progress_signature: tuple[str | None, str | None, int | None, int | None] | None = None
-        while True:
-            now = self.now_fn()
-            if job_id and (now - last_probe_at) >= self.preflight_status_update_interval:
-                last_probe_at = now
-                backend_status = self._poll_backend_stop_status(job_id)
-                if backend_status in _BACKEND_STOP_STATES:
-                    if local_log_path is not None:
-                        self._append_local_log(
-                            local_log_path,
-                            f"SIF build canceled due to backend status '{backend_status}' (slurm_job={slurm_job_id})",
-                        )
-                    scancel_job(self.ssh, slurm_job_id)
-                    raise PreflightInterrupted(status=backend_status, stage=preflight_stage)
-            state = query_state(self.ssh, slurm_job_id)
-            if local_log_path is not None:
-                progress_signature = (
-                    state.state,
-                    state.reason,
-                    state.queue_position,
-                    state.jobs_ahead,
-                )
-                should_log_progress = (
-                    progress_signature != last_progress_signature
-                    or (now - last_progress_log_at) >= self.preflight_status_update_interval
-                )
-                if should_log_progress:
-                    extra_parts: list[str] = []
-                    if state.partition:
-                        extra_parts.append(f"partition={state.partition}")
-                    if state.reason:
-                        extra_parts.append(f"reason={state.reason}")
-                    if state.queue_position is not None:
-                        extra_parts.append(f"queue_pos={state.queue_position}")
-                    if state.jobs_ahead is not None:
-                        extra_parts.append(f"ahead={state.jobs_ahead}")
-                    extra_suffix = f" ({', '.join(extra_parts)})" if extra_parts else ""
-                    self._append_local_log(
-                        local_log_path,
-                        f"SIF build Slurm state: {state.state}{extra_suffix}",
-                    )
-                    last_progress_signature = progress_signature
-                    last_progress_log_at = now
-            if state.state in ACTIVE_STATES or state.state == "UNKNOWN":
-                if now > deadline:
-                    if local_log_path is not None:
-                        self._append_local_log(
-                            local_log_path,
-                            f"SIF build timeout reached; canceling Slurm job {slurm_job_id}",
-                        )
-                    scancel_job(self.ssh, slurm_job_id)
-                    raise TimeoutError(
-                        f"SIF build timed out (job={slurm_job_id}, state={state.state}) for docker://{image_ref}"
-                    )
-                self.sleep_fn(self.sif_build_poll_interval)
-                continue
-            if state.state == "COMPLETED" and self._sif_exists(cfg.sif_path):
-                if local_log_path is not None:
-                    self._append_local_log(
-                        local_log_path,
-                        f"SIF build completed successfully (slurm_job={slurm_job_id})",
-                    )
-                break
-            out_tail = self._read_remote_tail(out_path)
-            err_tail = self._read_remote_tail(err_path)
-            details = "; ".join(
-                part
-                for part in [
-                    f"state={state.state}",
-                    f"exit_code={state.exit_code}",
-                    f"stdout_tail={out_tail}" if out_tail else "",
-                    f"stderr_tail={err_tail}" if err_tail else "",
-                ]
-                if part
-            )
-            if local_log_path is not None:
-                self._append_local_log(
-                    local_log_path,
-                    f"SIF build failed (slurm_job={slurm_job_id}): {details}",
-                )
-            raise FileNotFoundError(
-                f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref} via Slurm job {slurm_job_id}. {details}"
-            )
-
-        if cfg.sif_version:
-            self._write_remote_file_text(marker_path, cfg.sif_version)
-
-    def _ensure_remote_sif(
-        self,
-        cfg: DeucalionJobConfig,
-        job_id: str | None = None,
-        local_log_path: Path | None = None,
-    ) -> None:
-        sif_exists = self._sif_exists(cfg.sif_path)
-        marker_path = self._sif_version_marker_path(cfg)
-        remote_version = self._read_remote_file_text(marker_path)
-        version_changed = bool(cfg.sif_version) and cfg.sif_version != remote_version
-        needs_refresh = (not sif_exists) or version_changed
-
-        if not needs_refresh:
-            return
-
-        image_ref = self._image_ref_for_version(cfg)
-        if not image_ref:
-            reason = "version mismatch" if version_changed else "missing SIF"
-            raise FileNotFoundError(
-                f"Cannot refresh SIF ({reason}) at {cfg.sif_path}: no sif_image provided."
-            )
-
-        remote_root = self._remote_root(cfg)
-        sif_dir = posixpath.dirname(cfg.sif_path)
-        cache_dir = self.env.get(
-            "DEUCALION_SIF_CACHE_DIR",
-            posixpath.join(remote_root, ".opeva", "sif_cache"),
-        )
-        tmp_dir = self.env.get(
-            "DEUCALION_SIF_TMP_DIR",
-            posixpath.join(remote_root, ".opeva", "sif_tmp"),
-        )
-        self._ensure_remote_dir(sif_dir)
-        self._ensure_remote_dir(cache_dir)
-        self._ensure_remote_dir(tmp_dir)
-
-        if self.sif_build_mode == "slurm":
-            last_error: Exception | None = None
-            for attempt in range(1, self.sif_build_retries + 1):
-                try:
-                    self._ensure_remote_sif_via_slurm(
-                        cfg=cfg,
-                        image_ref=image_ref,
-                        marker_path=marker_path,
-                        cache_dir=cache_dir,
-                        tmp_dir=tmp_dir,
-                        job_id=job_id,
-                        preflight_stage="preflight:sif_build",
-                        local_log_path=local_log_path,
-                    )
-                    return
-                except FileNotFoundError as exc:
-                    last_error = exc
-                    if attempt >= self.sif_build_retries:
-                        raise
-                    error_message = str(exc)
-                    if not self._is_transient_sif_build_error(error_message):
-                        raise
-                    backoff = min(120.0, self.sif_build_retry_backoff * (2 ** (attempt - 1)))
-                    _LOGGER.warning(
-                        "Transient SIF build failure for docker://%s (attempt %d/%d): %s. Retrying in %.1fs",
-                        image_ref,
-                        attempt,
-                        self.sif_build_retries,
-                        error_message,
-                        backoff,
-                    )
-                    if backoff > 0:
-                        self.sleep_fn(backoff)
-            if last_error is not None:
-                raise last_error
-            return
-
-        pull_env = (
-            f"APPTAINER_CACHEDIR={shlex.quote(cache_dir)} "
-            f"APPTAINER_TMPDIR={shlex.quote(tmp_dir)} "
-            f"APPTAINER_MKSQUASHFS_PROCS={self.sif_pull_procs} "
-            f"SINGULARITY_CACHEDIR={shlex.quote(cache_dir)} "
-            f"SINGULARITY_TMPDIR={shlex.quote(tmp_dir)} "
-            f"SINGULARITY_MKSQUASHFS_PROCS={self.sif_pull_procs}"
-        )
-
-        build_ok = False
-        attempt_errors: list[str] = []
-        mksquashfs_flag = (
-            f"--mksquashfs-args {shlex.quote(self.sif_mksquashfs_args)} " if self.sif_mksquashfs_args else ""
-        )
-
-        build_attempts = [
-            (
-                "apptainer+mksquashfs-args",
-                f"{pull_env} command -v apptainer >/dev/null 2>&1 && "
-                f"apptainer build --force {mksquashfs_flag}{shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-            (
-                "singularity+keep-layers",
-                f"{pull_env} command -v singularity >/dev/null 2>&1 && "
-                f"singularity build --force --keep-layers {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-            (
-                "singularity+build",
-                f"{pull_env} command -v singularity >/dev/null 2>&1 && "
-                f"singularity build --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-            (
-                "apptainer",
-                f"{pull_env} command -v apptainer >/dev/null 2>&1 && "
-                f"apptainer pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-            (
-                "singularity",
-                f"{pull_env} command -v singularity >/dev/null 2>&1 && "
-                f"singularity pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-            (
-                "module+apptainer",
-                f"source /etc/profile >/dev/null 2>&1 || true; "
-                f"source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
-                f"module load apptainer >/dev/null 2>&1 || true; "
-                f"{pull_env} "
-                f"command -v apptainer >/dev/null 2>&1 && "
-                f"apptainer pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-            (
-                "module+singularity",
-                f"source /etc/profile >/dev/null 2>&1 || true; "
-                f"source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
-                f"module load singularity >/dev/null 2>&1 || true; "
-                f"{pull_env} "
-                f"command -v singularity >/dev/null 2>&1 && "
-                f"singularity pull --force {shlex.quote(cfg.sif_path)} docker://{shlex.quote(image_ref)}",
-            ),
-        ]
-
-        for attempt_name, build_cmd in build_attempts:
-            try:
-                self.ssh.run(build_cmd, timeout=1800, check=True)
-            except SSHCommandError as exc:
-                stderr = (exc.stderr or exc.stdout or str(exc)).strip().replace("\n", " | ")
-                if stderr:
-                    attempt_errors.append(f"{attempt_name}: {stderr}")
-                else:
-                    attempt_errors.append(f"{attempt_name}: command failed (rc={exc.returncode})")
-                continue
-            if self._sif_exists(cfg.sif_path):
-                build_ok = True
-                break
-            attempt_errors.append(f"{attempt_name}: command completed but SIF path still missing")
-
-        if not build_ok:
-            details = "; ".join(attempt_errors) if attempt_errors else "no pull attempt details available"
-            raise FileNotFoundError(
-                f"Failed to build SIF at {cfg.sif_path} from docker://{image_ref}. Attempts: {details}"
-            )
-
-        if cfg.sif_version:
-            self._write_remote_file_text(
-                marker_path,
-                cfg.sif_version,
-            )
-
-    @staticmethod
-    def _is_transient_sif_build_error(error_message: str) -> bool:
-        message = (error_message or "").lower()
-        transient_tokens = (
-            "i/o timeout",
-            "dial tcp",
-            "connection timed out",
-            "connection reset by peer",
-            "temporary failure in name resolution",
-            "tls handshake timeout",
-            "context deadline exceeded",
-            "no route to host",
-            "network is unreachable",
-        )
-        return any(token in message for token in transient_tokens)
 
     def _remote_exists(self, path: str, kind: str = "e") -> bool:
         output = self.ssh.run(
@@ -803,8 +634,9 @@ class DeucalionExecutor(BaseExecutor):
         if not ref:
             return None
         if "@" in ref:
-            digest = ref.split("@", 1)[1].strip()
-            return digest or None
+            # Digest refs are intentionally not supported for Deucalion SIF
+            # resolution because OCI artifact tags are resolved by image tag.
+            return None
         last_segment = ref.rsplit("/", 1)[-1]
         if ":" in last_segment:
             return ref.rsplit(":", 1)[1].strip() or None
@@ -815,10 +647,15 @@ class DeucalionExecutor(BaseExecutor):
         if not image_ref:
             raise ValueError("Missing job image in payload for deucalion executor")
 
+        tag = self._derive_image_version(image_ref)
+        if not tag:
+            raise ValueError(
+                "Deucalion requires a tagged Docker image (example: calof/opeva_simulator:sha-xxxx)"
+            )
+        tag = self._sanitize_sif_tag(tag)
         cfg.sif_image = image_ref
-        derived_version = self._derive_image_version(image_ref)
-        # The job payload image is authoritative; never fall back to YAML versioning.
-        cfg.sif_version = derived_version
+        cfg.sif_version = tag
+        cfg.sif_path = self._remote_sif_path_for_tag(cfg, tag)
         return cfg
 
     def _build_singularity_command(self, cfg: DeucalionJobConfig, remote_data_dir: str, command: str) -> str:

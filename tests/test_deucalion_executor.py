@@ -1,5 +1,6 @@
 import re
 import time
+from types import MethodType
 from pathlib import Path
 
 import yaml
@@ -56,6 +57,12 @@ class FakeSSHClient:
         prefix = path.rstrip("/") + "/"
         return any(p.startswith(prefix) for p in self.existing_paths | set(self.remote_files.keys()))
 
+    @staticmethod
+    def _to_text(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        return str(value)
+
     def run(self, command, timeout=60, check=True):
         self.commands.append(command)
 
@@ -78,6 +85,24 @@ class FakeSSHClient:
                 self.existing_paths.add(part.strip("'\""))
             return ""
 
+        m = re.match(r"mkdir (\S+) >/dev/null 2>&1 && echo acquired \|\| true$", command)
+        if m:
+            path = m.group(1).strip("'\"")
+            if self._exists(path):
+                return ""
+            self.existing_paths.add(path)
+            return "acquired"
+
+        m = re.match(r"rmdir (\S+) >/dev/null 2>&1 \|\| true$", command)
+        if m:
+            path = m.group(1).strip("'\"")
+            self.existing_paths.discard(path)
+            return ""
+
+        if command.startswith("if [ -d ") and "stat -c %Y" in command:
+            # stale-lock cleanup helper
+            return ""
+
         if command.startswith("ln -sfn "):
             parts = command.split()
             target = parts[2].strip("'\"")
@@ -97,27 +122,33 @@ class FakeSSHClient:
         m = re.match(r"if \[ -f (\S+) \]; then wc -c < (\S+); else echo 0; fi$", command)
         if m:
             path = m.group(1).strip("'\"")
-            return str(len(self.remote_files.get(path, "")))
+            content = self.remote_files.get(path, "")
+            if isinstance(content, bytes):
+                return str(len(content))
+            return str(len(str(content)))
 
         m = re.match(r"if \[ -f (\S+) \]; then tail -c \+(\d+) (\S+); fi$", command)
         if m:
             path = m.group(1).strip("'\"")
             start = int(m.group(2))
-            content = self.remote_files.get(path, "")
+            content = self._to_text(self.remote_files.get(path, ""))
             idx = max(0, start - 1)
             return content[idx:]
 
         m = re.match(r"if \[ -f (\S+) \]; then cat (\S+); fi$", command)
         if m:
             path = m.group(1).strip("'\"")
-            return self.remote_files.get(path, "")
+            return self._to_text(self.remote_files.get(path, ""))
 
-        if " pull --force " in command and " docker://" in command:
-            m = re.search(r"pull --force (\S+) docker://", command)
-            if m:
-                sif_path = m.group(1).strip("'\"")
-                self.existing_paths.add(sif_path)
-                self.remote_files[sif_path] = "sif-binary"
+        m = re.match(r"mv (\S+) (\S+)$", command)
+        if m:
+            source = m.group(1).strip("'\"")
+            target = m.group(2).strip("'\"")
+            if source in self.remote_files:
+                self.remote_files[target] = self.remote_files[source]
+                del self.remote_files[source]
+            self.existing_paths.add(target)
+            self.existing_paths.discard(source)
             return ""
 
         return ""
@@ -127,7 +158,11 @@ class FakeSSHClient:
         self.existing_paths.add(remote_path)
         lp = Path(local_path)
         if lp.exists() and lp.is_file():
-            self.remote_files[remote_path] = lp.read_text(encoding="utf-8")
+            data = lp.read_bytes()
+            try:
+                self.remote_files[remote_path] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                self.remote_files[remote_path] = data
 
     def copy_from(self, remote_path, local_path, timeout=60, recursive=False):
         remaining_failures = self.copy_from_failures.get(remote_path, 0)
@@ -138,7 +173,11 @@ class FakeSSHClient:
         if not recursive and remote_path in self.remote_files:
             lp = Path(local_path)
             lp.parent.mkdir(parents=True, exist_ok=True)
-            lp.write_text(self.remote_files[remote_path], encoding="utf-8")
+            data = self.remote_files[remote_path]
+            if isinstance(data, bytes):
+                lp.write_bytes(data)
+            else:
+                lp.write_text(str(data), encoding="utf-8")
 
 
 class BudgetSSHClient(FakeSSHClient):
@@ -167,7 +206,29 @@ def _write_config(shared_dir: Path, content: dict):
     return config_path
 
 
-def _build_agent(shared_dir: Path, session: DummySession, fake_ssh: FakeSSHClient, env: dict | None = None, now_fn=None):
+def _build_agent(
+    shared_dir: Path,
+    session: DummySession,
+    fake_ssh: FakeSSHClient,
+    env: dict | None = None,
+    now_fn=None,
+    stub_pull: bool = True,
+):
+    def _factory(runtime):
+        executor = DeucalionExecutor(
+            runtime,
+            env=env or {"DEUCALION_SYNC_INTERVAL": "0"},
+            ssh_client=fake_ssh,
+            sleep_fn=lambda _x: None,
+            now_fn=now_fn or time.monotonic,
+        )
+        if stub_pull:
+            def _fake_pull(self, *, tag: str, destination: Path) -> None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(f"sif-{tag}".encode("utf-8"))
+            executor._pull_sif_artifact_local = MethodType(_fake_pull, executor)
+        return executor
+
     return WorkerAgent(
         server_url="http://server",
         worker_id="deucalion",
@@ -176,13 +237,7 @@ def _build_agent(shared_dir: Path, session: DummySession, fake_ssh: FakeSSHClien
         session=session,
         executor="deucalion",
         status_poll_interval=0.01,
-        deucalion_executor_factory=lambda runtime: DeucalionExecutor(
-            runtime,
-            env=env or {"DEUCALION_SYNC_INTERVAL": "0"},
-            ssh_client=fake_ssh,
-            sleep_fn=lambda _x: None,
-            now_fn=now_fn or time.monotonic,
-        ),
+        deucalion_executor_factory=_factory,
     )
 
 
@@ -237,7 +292,7 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
             "job_id": job_id,
             "config_path": "configs/demo.yaml",
             "job_name": "Demo",
-            "image": "calof/algorithms",
+            "image": "calof/algorithms:latest",
         }
     )
 
@@ -263,19 +318,12 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
     session = DummySession()
-    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
-    marker_path = (
-        "/projects/F202508843CPCAA0/tiagocalof/.opeva/sif_versions/"
-        "projects__F202508843CPCAA0__tiagocalof__images__sim.sif.version"
-    )
+    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/cache/v0.2.5.sif"
     fake_ssh = FakeSSHClient(
         existing_paths={
             "/projects/F202508843CPCAA0/tiagocalof",
-            sif_path,
-            marker_path,
         }
     )
-    fake_ssh.remote_files[marker_path] = "v0.2.4\n"
 
     job_id = "job-version-refresh"
     remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
@@ -288,9 +336,7 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
         {
             "execution": {
                 "deucalion": {
-                    "sif_path": sif_path,
-                    "sif_image": "calof/opeva_simulator",
-                    "sif_version": "v0.2.5",
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
                 }
             }
         },
@@ -310,20 +356,19 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
         }
     )
 
-    # Worker should rebuild with the requested version tag via SIF build sbatch script.
+    # Worker should publish a versioned SIF in remote cache and use it in job script.
+    assert sif_path in fake_ssh.remote_files
     assert any(
-        "docker://calof/algorithms:v0.2.5" in content
-        for content in fake_ssh.remote_files.values()
-        if isinstance(content, str)
+        remote_path.startswith(f"{sif_path}.part-") for _local, remote_path, _recursive in fake_ssh.copy_to_calls
     )
-    assert fake_ssh.remote_files[marker_path].strip() == "v0.2.5"
+    sbatch_remote = f"{remote_job_dir}/run.sbatch"
+    assert sif_path in fake_ssh.remote_files[sbatch_remote]
 
 
-def test_deucalion_executor_untagged_image_does_not_reuse_yaml_sif_version(tmp_path, monkeypatch):
+def test_deucalion_executor_rejects_untagged_image(tmp_path):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
     session = DummySession()
-    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
     fake_ssh = FakeSSHClient(
         existing_paths={
             "/projects/F202508843CPCAA0/tiagocalof",
@@ -341,50 +386,37 @@ def test_deucalion_executor_untagged_image_does_not_reuse_yaml_sif_version(tmp_p
         {
             "execution": {
                 "deucalion": {
-                    "sif_path": sif_path,
-                    "sif_image": "calof/legacy-image",
-                    "sif_version": "v0.2.5",
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
                 }
             }
         },
     )
 
-    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "22346")
-    states = iter([SlurmState(state="PENDING"), SlurmState(state="COMPLETED", exit_code=0)])
-    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
-
     agent = _build_agent(shared_dir, session, fake_ssh)
     agent._run_job(
         {
-            "job_id": job_id,
+            "job_id": "job-untagged",
             "config_path": "configs/demo.yaml",
             "job_name": "Demo",
             "image": "calof/algorithms",
         }
     )
 
-    built_scripts = [content for content in fake_ssh.remote_files.values() if isinstance(content, str)]
-    assert any("docker://calof/algorithms" in content for content in built_scripts)
-    assert all("docker://calof/algorithms:v0.2.5" not in content for content in built_scripts)
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    assert status_calls[-1]["status"] == "failed"
+    assert "requires a tagged Docker image" in status_calls[-1]["error"]
 
 
 def test_deucalion_executor_uses_job_image_override(tmp_path, monkeypatch):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
     session = DummySession()
-    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
-    marker_path = (
-        "/projects/F202508843CPCAA0/tiagocalof/.opeva/sif_versions/"
-        "projects__F202508843CPCAA0__tiagocalof__images__sim.sif.version"
-    )
     fake_ssh = FakeSSHClient(
         existing_paths={
             "/projects/F202508843CPCAA0/tiagocalof",
-            sif_path,
-            marker_path,
         }
     )
-    fake_ssh.remote_files[marker_path] = "v0.2.4\n"
 
     job_id = "job-image-override"
     remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
@@ -397,9 +429,7 @@ def test_deucalion_executor_uses_job_image_override(tmp_path, monkeypatch):
         {
             "execution": {
                 "deucalion": {
-                    "sif_path": sif_path,
-                    "sif_image": "calof/old-image",
-                    "sif_version": "v0.2.4",
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
                 }
             }
         },
@@ -419,12 +449,8 @@ def test_deucalion_executor_uses_job_image_override(tmp_path, monkeypatch):
         }
     )
 
-    assert any(
-        "docker://calof/algorithms:v9.1.0" in content
-        for content in fake_ssh.remote_files.values()
-        if isinstance(content, str)
-    )
-    assert fake_ssh.remote_files[marker_path].strip() == "v9.1.0"
+    sbatch_remote = f"{remote_job_dir}/run.sbatch"
+    assert "/projects/F202508843CPCAA0/tiagocalof/images/cache/v9.1.0.sif" in fake_ssh.remote_files[sbatch_remote]
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[0]["details"]["image"] == "calof/algorithms:v9.1.0"
 
@@ -481,7 +507,7 @@ def test_deucalion_executor_preflight_failure_writes_local_log_and_stage(tmp_pat
 
     agent = _build_agent(shared_dir, session, fake_ssh)
     job_id = "job-preflight-fail"
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Broken", "image": "calof/algorithms"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Broken", "image": "calof/algorithms:latest"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls
@@ -495,45 +521,31 @@ def test_deucalion_executor_preflight_failure_writes_local_log_and_stage(tmp_pat
     assert "preflight:remote_root_check" in log_text
 
 
-def test_deucalion_executor_logs_sif_build_progress(tmp_path, monkeypatch):
+def test_deucalion_executor_logs_sif_cache_progress(tmp_path, monkeypatch):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
     session = DummySession()
-    sif_path = "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"
-    marker_path = (
-        "/projects/F202508843CPCAA0/tiagocalof/.opeva/sif_versions/"
-        "projects__F202508843CPCAA0__tiagocalof__images__sim.sif.version"
-    )
     fake_ssh = FakeSSHClient(
         existing_paths={
             "/projects/F202508843CPCAA0/tiagocalof",
-            sif_path,
-            marker_path,
         }
     )
-    fake_ssh.remote_files[marker_path] = "v0.2.4\n"
 
     _write_config(
         shared_dir,
         {
             "execution": {
                 "deucalion": {
-                    "sif_path": sif_path,
-                    "sif_image": "calof/opeva_simulator",
-                    "sif_version": "v0.2.5",
+                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
                 }
             }
         },
     )
 
-    submitted_ids = iter(["build-123", "job-123"])
-    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: next(submitted_ids))
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "job-123")
     states = iter(
         [
             SlurmState(state="PENDING", partition="normal", reason="Priority", queue_position=4, jobs_ahead=3),
-            SlurmState(state="COMPLETED", exit_code=0),
-            SlurmState(state="PENDING"),
-            SlurmState(state="RUNNING"),
             SlurmState(state="COMPLETED", exit_code=0),
         ]
     )
@@ -545,9 +557,10 @@ def test_deucalion_executor_logs_sif_build_progress(tmp_path, monkeypatch):
 
     log_path = shared_dir / "jobs" / job_id / "logs" / f"{job_id}.log"
     log_text = log_path.read_text(encoding="utf-8")
-    assert "SIF build submitted via Slurm: job=build-123" in log_text
-    assert "SIF build Slurm state: PENDING" in log_text
-    assert "SIF build completed successfully (slurm_job=build-123)" in log_text
+    assert "Preflight stage preflight:sif (ensure SIF image)" in log_text
+    assert "Pulling SIF artifact for tag v0.2.5 into local cache" in log_text
+    assert "Uploading SIF to Deucalion cache" in log_text
+    assert "SIF published in Deucalion cache for tag v0.2.5" in log_text
 
 
 def test_deucalion_heartbeat_includes_budget_snapshot_and_uses_cache(tmp_path):
@@ -616,7 +629,7 @@ def test_deucalion_executor_syncs_progress_snapshot_during_execution(tmp_path, m
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
 
     agent = _build_agent(shared_dir, session, fake_ssh, env={"DEUCALION_SYNC_INTERVAL": "0"})
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Progress", "image": "calof/algorithms"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Progress", "image": "calof/algorithms:latest"})
 
     local_progress = shared_dir / "jobs" / job_id / "progress" / "progress.json"
     assert local_progress.exists()
@@ -667,7 +680,7 @@ def test_deucalion_executor_sync_fallback_to_legacy_artifact_paths(tmp_path, mon
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Legacy", "image": "calof/algorithms"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "Legacy", "image": "calof/algorithms:latest"})
 
     copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
     assert f"{remote_job_dir}/results" in copied_from
@@ -708,7 +721,7 @@ def test_deucalion_executor_exec_mode_requires_executable(tmp_path, monkeypatch)
 
     agent = _build_agent(shared_dir, session, fake_ssh)
     # default command is only "--config ... --job_id ...", invalid for exec mode
-    agent._run_job({"job_id": "job-exec", "config_path": "configs/demo.yaml", "job_name": "Exec", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-exec", "config_path": "configs/demo.yaml", "job_name": "Exec", "image": "calof/algorithms:latest"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -752,7 +765,7 @@ def test_deucalion_executor_dataset_sync_copy_missing_skip_existing(tmp_path, mo
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0))
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-data", "config_path": "configs/demo.yaml", "job_name": "Data", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-data", "config_path": "configs/demo.yaml", "job_name": "Data", "image": "calof/algorithms:latest"})
 
     copied_remote_paths = [remote for _local, remote, _recursive in fake_ssh.copy_to_calls]
     assert "/projects/F202508843CPCAA0/tiagocalof/datasets/site_b/b.csv" in copied_remote_paths
@@ -800,7 +813,7 @@ def test_deucalion_executor_dataset_directory_uses_recursive_copy(tmp_path, monk
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-dir", "config_path": "configs/demo.yaml", "job_name": "Dir", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-dir", "config_path": "configs/demo.yaml", "job_name": "Dir", "image": "calof/algorithms:latest"})
 
     dataset_copy_calls = [
         (_local, remote, recursive)
@@ -839,7 +852,7 @@ def test_deucalion_executor_stop_requested(tmp_path, monkeypatch):
     monkeypatch.setattr(deucalion_executor_module, "scancel_job", _fake_cancel)
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-stop", "config_path": "configs/demo.yaml", "job_name": "Stop", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-stop", "config_path": "configs/demo.yaml", "job_name": "Stop", "image": "calof/algorithms:latest"})
 
     assert cancel_called["value"] is True
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
@@ -874,7 +887,7 @@ def test_deucalion_executor_stops_when_backend_requeues(tmp_path, monkeypatch):
     monkeypatch.setattr(deucalion_executor_module, "scancel_job", _fake_cancel)
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-requeue", "config_path": "configs/demo.yaml", "job_name": "Requeue", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-requeue", "config_path": "configs/demo.yaml", "job_name": "Requeue", "image": "calof/algorithms:latest"})
 
     assert cancel_called["value"] is True
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
@@ -909,7 +922,7 @@ def test_deucalion_executor_stops_when_backend_marks_failed(tmp_path, monkeypatc
     monkeypatch.setattr(deucalion_executor_module, "scancel_job", _fake_cancel)
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": "job-failed", "config_path": "configs/demo.yaml", "job_name": "Failed", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-failed", "config_path": "configs/demo.yaml", "job_name": "Failed", "image": "calof/algorithms:latest"})
 
     assert cancel_called["value"] is True
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
@@ -935,7 +948,12 @@ def test_deucalion_executor_unknown_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "unknown-1")
     monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: SlurmState(state="UNKNOWN"))
 
-    now_values = iter([0.0, 0.2, 0.8, 1.3, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6])
+    now_state = {"value": 0.0}
+
+    def _now():
+        now_state["value"] += 0.4
+        return now_state["value"]
+
     agent = _build_agent(
         shared_dir,
         session,
@@ -944,10 +962,10 @@ def test_deucalion_executor_unknown_timeout(tmp_path, monkeypatch):
             "DEUCALION_SYNC_INTERVAL": "0",
             "DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS": "1",
         },
-        now_fn=lambda: next(now_values),
+        now_fn=_now,
     )
 
-    agent._run_job({"job_id": "job-unknown", "config_path": "configs/demo.yaml", "job_name": "Unknown", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-unknown", "config_path": "configs/demo.yaml", "job_name": "Unknown", "image": "calof/algorithms:latest"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -978,7 +996,12 @@ def test_deucalion_executor_unreachable_timeout(tmp_path, monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(SSHCommandError("network down")),
     )
 
-    now_values = iter([0.0, 0.6, 1.2, 1.8, 2.4, 3.0, 3.6, 4.2, 4.8, 5.4])
+    now_state = {"value": 0.0}
+
+    def _now():
+        now_state["value"] += 0.6
+        return now_state["value"]
+
     agent = _build_agent(
         shared_dir,
         session,
@@ -987,10 +1010,10 @@ def test_deucalion_executor_unreachable_timeout(tmp_path, monkeypatch):
             "DEUCALION_SYNC_INTERVAL": "0",
             "DEUCALION_UNREACHABLE_GRACE_SECONDS": "1",
         },
-        now_fn=lambda: next(now_values),
+        now_fn=_now,
     )
 
-    agent._run_job({"job_id": "job-timeout", "config_path": "configs/demo.yaml", "job_name": "Timeout", "image": "calof/algorithms"})
+    agent._run_job({"job_id": "job-timeout", "config_path": "configs/demo.yaml", "job_name": "Timeout", "image": "calof/algorithms:latest"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -1032,7 +1055,7 @@ def test_deucalion_executor_completed_but_artifact_sync_failure_marks_failed(tmp
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsFail", "image": "calof/algorithms"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsFail", "image": "calof/algorithms:latest"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "failed"
@@ -1077,7 +1100,7 @@ def test_deucalion_executor_artifact_sync_transient_failure_keeps_finished(tmp_p
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
-    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsRetry", "image": "calof/algorithms"})
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "ArtifactsRetry", "image": "calof/algorithms:latest"})
 
     status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls[-1]["status"] == "finished"

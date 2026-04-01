@@ -52,6 +52,14 @@ def test_resolve_config_command_mode_env_default():
     assert cfg.command_mode == "exec"
 
 
+def test_resolve_config_defaults_sif_path_from_remote_root():
+    cfg = resolve_deucalion_job_config(
+        config={"execution": {"deucalion": {}}},
+        env={"DEUCALION_REMOTE_ROOT": "/projects/demo/root"},
+    )
+    assert cfg.sif_path == "/projects/demo/root/images/cache/simulator.sif"
+
+
 def test_resolve_config_sif_version_from_yaml_and_env():
     cfg = resolve_deucalion_job_config(
         config={"execution": {"deucalion": {"sif_path": "/remote/sim.sif", "sif_version": "v0.2.5"}}},
