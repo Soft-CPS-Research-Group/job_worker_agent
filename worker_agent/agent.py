@@ -29,6 +29,7 @@ _RETRY_INITIAL_BACKOFF_SECONDS = 0.5
 _RETRY_MAX_BACKOFF_SECONDS = 5.0
 _TERMINAL_QUEUE_MAX_BACKOFF_SECONDS = 30.0
 _TERMINAL_JOB_STATUSES = {"finished", "failed", "stopped", "canceled"}
+_JOB_THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -70,12 +71,15 @@ class WorkerAgent:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._external_session = session is not None
         self._session = session or requests.Session()
-        self._active_job_id: Optional[str] = None
-        self._active_job_status: Optional[str] = None
+        self._state_lock = threading.Lock()
+        self._session_lock = threading.Lock()
+        self._active_jobs: dict[str, dict[str, Any]] = {}
+        self._job_threads: dict[str, threading.Thread] = {}
         self._last_job_id: Optional[str] = None
         self._last_terminal_status: Optional[str] = None
         self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", False)
         self._last_request_failure: Optional[str] = None
+        self._has_processed_job = False
         self._pending_terminal_statuses: deque[dict[str, Any]] = deque()
         self._pending_terminal_statuses_lock = threading.Lock()
         self._env = dict(env or os.environ)
@@ -90,13 +94,82 @@ class WorkerAgent:
                 self._executor = DeucalionExecutor(self, env=self._env)
         else:
             raise ValueError(f"Unknown executor '{self.executor}'. Allowed: docker, deucalion")
+        self.max_active_jobs = self._resolve_max_active_jobs()
         self._worker_version = self._resolve_worker_version()
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
     def _mark_active_job(self, job_id: str | None) -> None:
-        self._active_job_id = job_id
-        self._active_job_status = None
+        # Backward-compatible helper used by older tests/executors.
+        if job_id is None:
+            with self._state_lock:
+                if len(self._active_jobs) == 1:
+                    only_job_id = next(iter(self._active_jobs.keys()))
+                    self._active_jobs.pop(only_job_id, None)
+            return
+        self._register_active_job(job_id)
+
+    def _resolve_max_active_jobs(self) -> int:
+        default_slots = 3 if self.executor == "deucalion" else 1
+        raw_value = self._env.get("WORKER_MAX_ACTIVE_JOBS")
+        if raw_value is None and self.executor == "deucalion":
+            raw_value = self._env.get("DEUCALION_MAX_ACTIVE_JOBS")
+        if raw_value is None:
+            return default_slots
+        try:
+            parsed = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            _LOGGER.warning("Invalid WORKER_MAX_ACTIVE_JOBS=%r; using %d", raw_value, default_slots)
+            return default_slots
+        if parsed < 1:
+            _LOGGER.warning("WORKER_MAX_ACTIVE_JOBS must be >= 1; using %d", default_slots)
+            return default_slots
+        return parsed
+
+    def _register_active_job(self, job_id: str, job_name: str | None = None) -> None:
+        now = time.time()
+        with self._state_lock:
+            self._active_jobs[job_id] = {
+                "job_id": job_id,
+                "job_name": (job_name or "").strip() or None,
+                "status": "dispatched",
+                "phase": "accepted",
+                "started_at": now,
+                "updated_at": now,
+            }
+
+    def _unregister_active_job(self, job_id: str) -> None:
+        with self._state_lock:
+            self._active_jobs.pop(job_id, None)
+
+    def _update_active_job(self, job_id: str, **fields: object) -> None:
+        with self._state_lock:
+            entry = self._active_jobs.get(job_id)
+            if entry is None:
+                return
+            for key, value in fields.items():
+                if value is None:
+                    entry.pop(key, None)
+                else:
+                    entry[key] = value
+            entry["updated_at"] = time.time()
+
+    def _active_jobs_snapshot(self) -> list[dict[str, Any]]:
+        with self._state_lock:
+            rows = [dict(value) for value in self._active_jobs.values()]
+        rows.sort(key=lambda row: float(row.get("started_at") or 0.0))
+        return rows
+
+    def _active_job_count(self) -> int:
+        with self._state_lock:
+            return len(self._active_jobs)
+
+    def _running_thread_count(self) -> int:
+        with self._state_lock:
+            return len(self._job_threads)
+
+    def _available_slots(self) -> int:
+        return max(0, self.max_active_jobs - self._running_thread_count())
 
     def _resolve_worker_version(self) -> str:
         if self._env.get("WORKER_VERSION"):
@@ -107,17 +180,26 @@ class WorkerAgent:
             return "dev"
 
     def _build_heartbeat_info(self) -> Dict[str, Any]:
+        active_jobs = self._active_jobs_snapshot()
+        active_job_ids = [str(entry.get("job_id")) for entry in active_jobs if entry.get("job_id")]
+        first_active = active_jobs[0] if active_jobs else None
+        with self._state_lock:
+            last_job_id = self._last_job_id
+            last_terminal_status = self._last_terminal_status
         info: Dict[str, Any] = {
             "executor": self.executor,
             "worker_version": self._worker_version,
             "gpu_enabled": self._gpu_request_enabled,
-            "active_job_id": self._active_job_id,
-            "active_job_count": 1 if self._active_job_id else 0,
-            "last_job_id": self._last_job_id,
-            "last_terminal_status": self._last_terminal_status,
+            "max_active_jobs": self.max_active_jobs,
+            "active_job_id": first_active.get("job_id") if first_active else None,
+            "active_job_count": len(active_jobs),
+            "active_job_ids": active_job_ids,
+            "active_jobs": active_jobs,
+            "last_job_id": last_job_id,
+            "last_terminal_status": last_terminal_status,
         }
-        if self._active_job_id and self._active_job_status:
-            info["active_job_status"] = self._active_job_status
+        if first_active and first_active.get("status"):
+            info["active_job_status"] = first_active.get("status")
         try:
             executor_info = self._executor.heartbeat_info()
             if isinstance(executor_info, dict):
@@ -131,10 +213,11 @@ class WorkerAgent:
 
     def run_forever(self) -> None:
         _LOGGER.info(
-            "Starting worker '%s' with executor '%s' polling %s",
+            "Starting worker '%s' with executor '%s' polling %s (max_active_jobs=%d)",
             self.worker_id,
             self.executor,
             self.server_url,
+            self.max_active_jobs,
         )
         self._start_heartbeat_loop()
         try:
@@ -149,25 +232,84 @@ class WorkerAgent:
             self._stop_event.set()
             if self._heartbeat_thread:
                 self._heartbeat_thread.join(timeout=2)
+            self._join_job_threads(timeout=_JOB_THREAD_SHUTDOWN_TIMEOUT_SECONDS)
             self._executor.close()
 
     def poll_once(self) -> bool:
+        self._reap_finished_job_threads()
         self._flush_pending_terminal_statuses()
         self._send_heartbeat()
         self._flush_pending_terminal_statuses()
-        job = self._request_next_job()
-        if not job:
-            return False
-        _LOGGER.info("Received job %s", job["job_id"])
-        self._run_job(job)
+        handled = False
+
+        while not self._stop_event.is_set() and self._available_slots() > 0:
+            job = self._request_next_job()
+            if not job:
+                break
+            _LOGGER.info("Received job %s", job["job_id"])
+            self._has_processed_job = True
+            handled = True
+            if self.max_active_jobs <= 1:
+                self._run_job(job)
+                break
+            self._start_job_thread(job)
+            if self._exit_after_job:
+                break
+
         self._flush_pending_terminal_statuses(force=True)
-        if self._exit_after_job:
+        if self._exit_after_job and self._has_processed_job and self._running_thread_count() == 0:
             _LOGGER.info("Exit-after-job flag set; stopping worker once current job completes")
             self.stop()
-        return True
+        return handled
 
     def _run_job(self, job: Dict[str, Any]) -> None:
         self._executor.run_job(job)
+
+    def _start_job_thread(self, job: Dict[str, Any]) -> None:
+        job_id = str(job.get("job_id", "unknown"))
+
+        def _runner() -> None:
+            try:
+                self._run_job(job)
+            except Exception:
+                _LOGGER.exception("Unhandled worker exception while executing job %s", job_id)
+            finally:
+                with self._state_lock:
+                    self._job_threads.pop(job_id, None)
+                self._flush_pending_terminal_statuses(force=True)
+
+        thread = threading.Thread(target=_runner, name=f"job-{job_id[:8]}", daemon=True)
+        with self._state_lock:
+            self._job_threads[job_id] = thread
+        thread.start()
+
+    def _reap_finished_job_threads(self) -> None:
+        with self._state_lock:
+            finished = [job_id for job_id, thread in self._job_threads.items() if not thread.is_alive()]
+            for job_id in finished:
+                self._job_threads.pop(job_id, None)
+
+    def _join_job_threads(self, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._state_lock:
+                threads = list(self._job_threads.values())
+            if not threads:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            join_for = min(0.2, remaining)
+            for thread in threads:
+                thread.join(timeout=join_for)
+            self._reap_finished_job_threads()
+
+        remaining_jobs = self._running_thread_count()
+        if remaining_jobs > 0:
+            _LOGGER.warning(
+                "Worker shutdown reached timeout with %d active job thread(s) still running",
+                remaining_jobs,
+            )
 
     # ------------------------------------------------------------------
     # HTTP interactions
@@ -195,11 +337,12 @@ class WorkerAgent:
         last_retryable_exc: Optional[requests.RequestException] = None
         for attempt in range(1, _IMMEDIATE_POST_RETRIES + 1):
             try:
-                response = self._session.post(
-                    f"{self.server_url}{endpoint}",
-                    json=payload,
-                    timeout=timeout,
-                )
+                with self._session_lock:
+                    response = self._session.post(
+                        f"{self.server_url}{endpoint}",
+                        json=payload,
+                        timeout=timeout,
+                    )
                 response.raise_for_status()
                 self._last_request_failure = None
                 return {"ok": True, "retryable": False}
@@ -322,11 +465,12 @@ class WorkerAgent:
     def _request_next_job(self) -> Optional[Dict[str, Any]]:
         _LOGGER.info("POST /api/agent/next-job payload=%s", {"worker_id": self.worker_id})
         try:
-            response = self._session.post(
-                f"{self.server_url}/api/agent/next-job",
-                json={"worker_id": self.worker_id},
-                timeout=30,
-            )
+            with self._session_lock:
+                response = self._session.post(
+                    f"{self.server_url}/api/agent/next-job",
+                    json={"worker_id": self.worker_id},
+                    timeout=30,
+                )
             self._last_request_failure = None
         except requests.RequestException as exc:  # pragma: no cover
             self._handle_request_exception("next-job", exc, warning=True)
@@ -338,12 +482,42 @@ class WorkerAgent:
         response.raise_for_status()
         return response.json()
 
+    def _update_active_job_from_status(self, job_id: str, status: str, extra: dict[str, object]) -> None:
+        details = extra.get("details")
+        detail_map = details if isinstance(details, dict) else {}
+        phase = detail_map.get("executor_stage")
+        if not isinstance(phase, str) or not phase:
+            phase = status
+        slurm_job_id = detail_map.get("slurm_job_id") if isinstance(detail_map.get("slurm_job_id"), str) else None
+        slurm_state = detail_map.get("slurm_state") if isinstance(detail_map.get("slurm_state"), str) else None
+        slurm_partition = (
+            detail_map.get("slurm_partition") if isinstance(detail_map.get("slurm_partition"), str) else None
+        )
+        slurm_nodes = detail_map.get("slurm_nodes")
+        slurm_cpus = detail_map.get("slurm_cpus")
+        slurm_gpus = detail_map.get("slurm_gpus")
+        queue_pos = detail_map.get("slurm_queue_position")
+        ahead = detail_map.get("slurm_jobs_ahead")
+        updated_fields: dict[str, object] = {
+            "status": status,
+            "phase": phase,
+            "slurm_job_id": slurm_job_id,
+            "slurm_state": slurm_state,
+            "slurm_partition": slurm_partition,
+            "slurm_nodes": slurm_nodes,
+            "slurm_cpus": slurm_cpus,
+            "slurm_gpus": slurm_gpus,
+            "queue_pos": queue_pos,
+            "ahead": ahead,
+        }
+        self._update_active_job(job_id, **updated_fields)
+
     def _post_status(self, job_id: str, status: str, **extra: object) -> None:
-        self._last_job_id = job_id
-        if self._active_job_id == job_id:
-            self._active_job_status = status
-        if status in _TERMINAL_JOB_STATUSES:
-            self._last_terminal_status = status
+        with self._state_lock:
+            self._last_job_id = job_id
+            if status in _TERMINAL_JOB_STATUSES:
+                self._last_terminal_status = status
+        self._update_active_job_from_status(job_id, status, dict(extra))
         payload = {"job_id": job_id, "status": status, "worker_id": self.worker_id}
         payload.update({k: v for k, v in extra.items() if v is not None})
         _LOGGER.info("POST /api/agent/job-status payload=%s", payload)
@@ -360,7 +534,8 @@ class WorkerAgent:
     def _fetch_status(self, job_id: str) -> Optional[str]:
         _LOGGER.info("GET /status/%s", job_id)
         try:
-            response = self._session.get(f"{self.server_url}/status/{job_id}", timeout=10)
+            with self._session_lock:
+                response = self._session.get(f"{self.server_url}/status/{job_id}", timeout=10)
             if response.status_code == 404:
                 return None
             response.raise_for_status()
@@ -405,11 +580,12 @@ class WorkerAgent:
     def _reset_session(self) -> None:
         if self._external_session:
             return
-        try:
-            self._session.close()
-        except Exception:
-            pass
-        self._session = requests.Session()
+        with self._session_lock:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = requests.Session()
 
     def _handle_request_exception(self, context: str, exc: requests.RequestException, warning: bool = False) -> None:
         is_repeat = self._last_request_failure == context
@@ -431,7 +607,7 @@ class WorkerAgent:
     def request_exit_after_current_job(self) -> None:
         """Ensure the worker stops after the currently running job."""
         self._exit_after_job = True
-        if self._active_job_id is None:
+        if self._running_thread_count() == 0:
             _LOGGER.info("Exit-after-job requested while idle; stopping worker immediately")
             self.stop()
 

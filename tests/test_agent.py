@@ -1,5 +1,6 @@
 import json
 import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -543,3 +544,138 @@ def test_heartbeat_payload_contains_runtime_metadata():
     assert info["active_job_count"] == 0
     assert info["last_job_id"] == "job-meta"
     assert info["last_terminal_status"] == "finished"
+
+
+def test_deucalion_defaults_to_three_active_slots():
+    session = DummySession()
+
+    class NoopExecutor:
+        def run_job(self, job):  # pragma: no cover - should not run in this test
+            return None
+
+        def heartbeat_info(self):
+            return {}
+
+        def close(self):
+            return None
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="deucalion",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        executor="deucalion",
+        deucalion_executor_factory=lambda runtime: NoopExecutor(),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    assert agent.max_active_jobs == 3
+
+
+def test_deucalion_poll_once_fills_only_available_slots():
+    session = DummySession()
+    release_jobs = threading.Event()
+    started_jobs: list[str] = []
+
+    class BlockingExecutor:
+        def __init__(self, runtime):
+            self.runtime = runtime
+
+        def run_job(self, job):
+            job_id = job["job_id"]
+            started_jobs.append(job_id)
+            self.runtime._register_active_job(job_id)
+            self.runtime._update_active_job(job_id, status="dispatched", phase="execution:dispatched")
+            release_jobs.wait(timeout=2)
+            self.runtime._unregister_active_job(job_id)
+
+        def heartbeat_info(self):
+            return {}
+
+        def close(self):
+            return None
+
+    for idx in range(1, 5):
+        session.next_job_responses.append(
+            DummyResponse(200, {"job_id": f"job-{idx}", "config_path": "cfg.yaml", "job_name": f"Demo {idx}"})
+        )
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="deucalion",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        executor="deucalion",
+        deucalion_executor_factory=lambda runtime: BlockingExecutor(runtime),
+        env={"DEUCALION_MAX_ACTIVE_JOBS": "3"},
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    handled = agent.poll_once()
+    assert handled is True
+    assert len(started_jobs) == 3
+    assert agent._running_thread_count() == 3
+
+    next_job_calls = [call for call in session.calls if call["url"].endswith("/next-job")]
+    assert len(next_job_calls) == 3
+
+    release_jobs.set()
+    agent._join_job_threads(timeout=2)
+    assert agent._running_thread_count() == 0
+
+
+def test_heartbeat_payload_includes_multiple_active_jobs_details():
+    session = DummySession()
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="deucalion",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        executor="deucalion",
+        deucalion_executor_factory=lambda runtime: type(
+            "NoopExecutor",
+            (),
+            {"run_job": lambda self, job: None, "heartbeat_info": lambda self: {}, "close": lambda self: None},
+        )(),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    agent._register_active_job("job-a")
+    agent._update_active_job(
+        "job-a",
+        status="dispatched",
+        phase="execution:poll",
+        slurm_job_id="101",
+        slurm_state="PENDING",
+        queue_pos=9,
+        ahead=8,
+    )
+    agent._register_active_job("job-b")
+    agent._update_active_job(
+        "job-b",
+        status="running",
+        phase="execution:poll",
+        slurm_job_id="102",
+        slurm_state="RUNNING",
+    )
+
+    agent._send_heartbeat(force=True)
+
+    heartbeat_calls = [call for call in session.calls if call["url"].endswith("/heartbeat")]
+    assert heartbeat_calls
+    info = heartbeat_calls[-1]["json"]["info"]
+
+    assert info["active_job_count"] == 2
+    assert set(info["active_job_ids"]) == {"job-a", "job-b"}
+    rows = {row["job_id"]: row for row in info["active_jobs"]}
+    assert rows["job-a"]["slurm_state"] == "PENDING"
+    assert rows["job-a"]["queue_pos"] == 9
+    assert rows["job-a"]["ahead"] == 8
+    assert rows["job-b"]["slurm_state"] == "RUNNING"

@@ -63,10 +63,17 @@ def _pick(mapping: dict[str, Any], key: str) -> Any:
     return value if value is not None else None
 
 
+def _first_non_none(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping.get(key) is not None:
+            return mapping.get(key)
+    return None
+
+
 def _parse_command_mode(value: Any, default: str = "run") -> str:
     mode = _as_str(value, default).lower()
     if mode not in {"run", "exec"}:
-        raise ValueError(f"Invalid execution.deucalion.command_mode: {mode!r}. Expected 'run' or 'exec'")
+        raise ValueError(f"Invalid deucalion command_mode: {mode!r}. Expected 'run' or 'exec'")
     return mode
 
 
@@ -89,7 +96,60 @@ def _as_relative_dataset_list(value: Any) -> list[str]:
     return [_validate_relative_dataset_path(p) for p in _as_list(value)]
 
 
-def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str, str] | None = None) -> DeucalionJobConfig:
+def _infer_dataset_root_from_path(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    if normalized.startswith("/data/"):
+        normalized = normalized[len("/data/") :]
+    normalized = normalized.lstrip("/")
+    if not normalized.startswith("datasets/"):
+        return None
+    pure = PurePosixPath(normalized)
+    parts = pure.parts
+    if len(parts) < 2:
+        return None
+    dataset_root = str(PurePosixPath("datasets", parts[1]))
+    return _validate_relative_dataset_path(dataset_root)
+
+
+def _infer_datasets_from_config(config: dict[str, Any] | None) -> list[str]:
+    if not isinstance(config, dict):
+        return []
+    simulator = config.get("simulator")
+    if not isinstance(simulator, dict):
+        return []
+
+    inferred: list[str] = []
+    seen: set[str] = set()
+
+    def _append_dataset(path: str | None) -> None:
+        if not path or path in seen:
+            return
+        seen.add(path)
+        inferred.append(path)
+
+    for key in ("dataset_path", "dataset_paths"):
+        raw = simulator.get(key)
+        for entry in _as_list(raw):
+            _append_dataset(_infer_dataset_root_from_path(entry))
+
+    dataset_name = simulator.get("dataset_name")
+    if dataset_name is not None:
+        maybe_path = _infer_dataset_root_from_path(f"datasets/{str(dataset_name).strip()}")
+        _append_dataset(maybe_path)
+
+    return inferred
+
+
+def resolve_deucalion_job_config(
+    config: dict[str, Any] | None,
+    env: Mapping[str, str] | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
+) -> DeucalionJobConfig:
     env = env or {}
     execution = (config or {}).get("execution", {}) if isinstance(config, dict) else {}
     if not isinstance(execution, dict):
@@ -97,9 +157,11 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
     deucalion = execution.get("deucalion", {})
     if not isinstance(deucalion, dict):
         deucalion = {}
+    options = dict(runtime_options or {})
+    source = options if options else deucalion
 
     env_gpus = _parse_int("DEUCALION_SLURM_GPUS", env.get("DEUCALION_SLURM_GPUS"), 0)
-    gpus = _parse_int("execution.deucalion.gpus", _pick(deucalion, "gpus"), env_gpus)
+    gpus = _parse_int("deucalion_options.gpus", _pick(source, "gpus"), env_gpus)
 
     account_default = env.get("DEUCALION_SLURM_ACCOUNT_GPU") if gpus > 0 else env.get("DEUCALION_SLURM_ACCOUNT_CPU")
     if not account_default:
@@ -110,21 +172,21 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
         partition_default = "normal-a100-80" if gpus > 0 else "normal-x86"
 
     profile = SlurmProfile(
-        account=_as_str(_pick(deucalion, "account"), account_default),
-        partition=_as_str(_pick(deucalion, "partition"), partition_default),
-        time_limit=_as_str(_pick(deucalion, "time"), env.get("DEUCALION_SLURM_TIME", "04:00:00")),
+        account=_as_str(_pick(source, "account"), account_default),
+        partition=_as_str(_pick(source, "partition"), partition_default),
+        time_limit=_as_str(_first_non_none(source, "time_limit", "time"), env.get("DEUCALION_SLURM_TIME", "04:00:00")),
         cpus_per_task=_parse_int(
-            "execution.deucalion.cpus_per_task",
-            _pick(deucalion, "cpus_per_task"),
+            "deucalion_options.cpus_per_task",
+            _pick(source, "cpus_per_task"),
             _parse_int("DEUCALION_SLURM_CPUS_PER_TASK", env.get("DEUCALION_SLURM_CPUS_PER_TASK"), 4),
         ),
         mem_gb=_parse_int(
-            "execution.deucalion.mem_gb",
-            _pick(deucalion, "mem_gb"),
+            "deucalion_options.mem_gb",
+            _pick(source, "mem_gb"),
             _parse_int("DEUCALION_SLURM_MEM_GB", env.get("DEUCALION_SLURM_MEM_GB"), 8),
         ),
         gpus=max(0, gpus),
-        modules=_as_list(_pick(deucalion, "modules")) or _as_list(env.get("DEUCALION_MODULES")),
+        modules=_as_list(_pick(source, "modules")) or _as_list(env.get("DEUCALION_MODULES")),
     )
 
     remote_root = _as_str(
@@ -132,30 +194,34 @@ def resolve_deucalion_job_config(config: dict[str, Any] | None, env: Mapping[str
         DEFAULT_DEUCALION_REMOTE_ROOT,
     ).rstrip("/")
     sif_path = _as_str(
-        _pick(deucalion, "sif_path"),
+        _pick(source, "sif_path"),
         env.get("DEUCALION_SIF_PATH", posixpath.join(remote_root, "images", "cache", "simulator.sif")),
     )
 
     sif_image = _as_str(
-        _pick(deucalion, "sif_image"),
+        _pick(source, "sif_image"),
         env.get("DEUCALION_SIF_IMAGE", ""),
     )
     if not sif_image:
         sif_image = None
 
     sif_version = _as_str(
-        _pick(deucalion, "sif_version"),
+        _pick(source, "sif_version"),
         env.get("DEUCALION_SIF_VERSION", ""),
     )
     if not sif_version:
         sif_version = None
 
     command_mode = _parse_command_mode(
-        _pick(deucalion, "command_mode"),
+        _pick(source, "command_mode"),
         env.get("DEUCALION_SIF_COMMAND_MODE", "run"),
     )
-    datasets = _as_relative_dataset_list(_pick(deucalion, "datasets"))
-    required_paths = _as_list(_pick(deucalion, "required_paths"))
+    source_datasets = _pick(source, "datasets")
+    if source_datasets is None:
+        datasets = _infer_datasets_from_config(config if isinstance(config, dict) else None)
+    else:
+        datasets = _as_relative_dataset_list(source_datasets)
+    required_paths = _as_list(_pick(source, "required_paths"))
 
     return DeucalionJobConfig(
         remote_root=remote_root,

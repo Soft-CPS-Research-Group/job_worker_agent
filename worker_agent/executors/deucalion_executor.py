@@ -574,6 +574,45 @@ class DeucalionExecutor(BaseExecutor):
                     pass
                 return
 
+    def _sync_remote_job_info_snapshot(
+        self,
+        remote_job_dir: str,
+        remote_data_dir: str,
+        job_id: str,
+        local_job_dir: Path,
+    ) -> dict[str, Any]:
+        local_job_dir.mkdir(parents=True, exist_ok=True)
+        local_info_path = local_job_dir / "job_info.json"
+        summary: dict[str, Any] = {"status": "missing", "source": None, "error": None}
+
+        candidate_paths = (
+            posixpath.join(remote_data_dir, "jobs", job_id, "job_info.json"),
+            posixpath.join(remote_job_dir, "job_info.json"),
+        )
+        for remote_path in candidate_paths:
+            exists = self.ssh.run(f"test -f {shlex.quote(remote_path)} && echo yes || true", check=False)
+            if exists.strip() != "yes":
+                continue
+            tmp_path = local_info_path.with_name("job_info.json.tmp")
+            try:
+                self.ssh.copy_from(remote_path, tmp_path, timeout=60, recursive=False)
+                os.replace(tmp_path, local_info_path)
+                summary["status"] = "synced"
+                summary["source"] = remote_path
+                return summary
+            except SSHCommandError as exc:
+                summary["status"] = "failed"
+                summary["source"] = remote_path
+                summary["error"] = exc.stderr or str(exc)
+                _LOGGER.warning("Failed to sync remote job_info snapshot from %s: %s", remote_path, exc)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+                return summary
+        return summary
+
     def _sync_datasets(self, cfg: DeucalionJobConfig) -> tuple[list[str], list[str]]:
         synced: list[str] = []
         skipped: list[str] = []
@@ -744,6 +783,14 @@ class DeucalionExecutor(BaseExecutor):
                     folder_summary["status"] = "missing"
                     _LOGGER.debug("No remote '%s' artifacts found for job %s", folder, job_id)
             summary["folders"][folder] = folder_summary
+        summary["job_info"] = self._sync_remote_job_info_snapshot(
+            remote_job_dir=remote_job_dir,
+            remote_data_dir=remote_data_dir,
+            job_id=job_id,
+            local_job_dir=local_job_dir,
+        )
+        if isinstance(summary["job_info"], dict) and summary["job_info"].get("status") == "failed":
+            summary["had_failure"] = True
         return summary
 
     def _render_sbatch_script(
@@ -893,11 +940,13 @@ class DeucalionExecutor(BaseExecutor):
         preflight_last_probe = preflight_last_update
 
         try:
-            self.runtime._mark_active_job(job_id)
+            self.runtime._register_active_job(job_id, job_name)
+            self.runtime._update_active_job(job_id, phase="preflight:init", status="dispatched")
             self._append_local_log(local_log_path, f"Job accepted by deucalion worker: {job_id}")
             job_yaml = self._load_job_yaml(local_config_path)
             self._append_local_log(local_log_path, f"Loaded config: {config_path}")
-            cfg = resolve_deucalion_job_config(job_yaml, env=self.env)
+            runtime_options = job.get("deucalion_options")
+            cfg = resolve_deucalion_job_config(job_yaml, env=self.env, runtime_options=runtime_options)
             cfg = self._apply_job_image(cfg, job)
             image_name = cfg.sif_image
             remote_root = self._remote_root(cfg)
@@ -1047,6 +1096,12 @@ class DeucalionExecutor(BaseExecutor):
                     if now >= next_sync:
                         log_offsets = self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
                         self._sync_remote_progress_snapshot(
+                            remote_job_dir=remote_job_dir,
+                            remote_data_dir=remote_data_dir,
+                            job_id=job_id,
+                            local_job_dir=local_job_dir,
+                        )
+                        self._sync_remote_job_info_snapshot(
                             remote_job_dir=remote_job_dir,
                             remote_data_dir=remote_data_dir,
                             job_id=job_id,
@@ -1246,5 +1301,5 @@ class DeucalionExecutor(BaseExecutor):
                 ),
             )
         finally:
-            self.runtime._mark_active_job(None)
+            self.runtime._unregister_active_job(job_id)
             self.runtime._send_heartbeat(force=True)

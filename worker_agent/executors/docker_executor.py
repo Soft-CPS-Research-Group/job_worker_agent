@@ -93,7 +93,8 @@ class DockerExecutor(BaseExecutor):
         monitor_state = {"status": None}
         monitor_stop = threading.Event()
         try:
-            self.runtime._mark_active_job(job_id)
+            self.runtime._register_active_job(job_id, str(job_name))
+            self.runtime._update_active_job(job_id, phase="startup")
             container_name = job.get("container_name") or self.runtime._build_container_name(job_id, job_name)
             command = job.get("command") or self.runtime._build_command(job_id, config_path)
             volumes = self.runtime._build_volumes(job.get("volumes"))
@@ -232,7 +233,7 @@ class DockerExecutor(BaseExecutor):
                     container.remove(force=True)
                 except Exception:  # pragma: no cover
                     pass
-            self.runtime._mark_active_job(None)
+            self.runtime._unregister_active_job(job_id)
             self.runtime._send_heartbeat(force=True)
 
     def close(self) -> None:

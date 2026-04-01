@@ -118,3 +118,42 @@ def test_resolve_config_rejects_parent_dataset_path():
             },
             env={},
         )
+
+
+def test_resolve_config_infers_dataset_root_from_simulator_dataset_path():
+    cfg = resolve_deucalion_job_config(
+        config={
+            "simulator": {
+                "dataset_path": "/data/datasets/citylearn_charging_constraints_demo/schema.json",
+            }
+        },
+        env={},
+    )
+    assert cfg.datasets == ["datasets/citylearn_charging_constraints_demo"]
+
+
+def test_resolve_config_infers_dataset_root_from_simulator_dataset_name():
+    cfg = resolve_deucalion_job_config(
+        config={
+            "simulator": {
+                "dataset_name": "citylearn_charging_constraints_demo",
+            }
+        },
+        env={},
+    )
+    assert cfg.datasets == ["datasets/citylearn_charging_constraints_demo"]
+
+
+def test_runtime_options_datasets_override_config_inference():
+    cfg = resolve_deucalion_job_config(
+        config={
+            "simulator": {
+                "dataset_path": "/data/datasets/citylearn_charging_constraints_demo/schema.json",
+            }
+        },
+        env={},
+        runtime_options={
+            "datasets": ["datasets/custom_override"],
+        },
+    )
+    assert cfg.datasets == ["datasets/custom_override"]
