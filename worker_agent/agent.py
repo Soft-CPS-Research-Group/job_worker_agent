@@ -219,6 +219,10 @@ class WorkerAgent:
             self.server_url,
             self.max_active_jobs,
         )
+        try:
+            self._executor.on_startup()
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOGGER.warning("Executor startup hook failed: %s", exc)
         self._start_heartbeat_loop()
         try:
             while not self._stop_event.is_set():

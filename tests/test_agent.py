@@ -107,6 +107,32 @@ class PullTrackingDockerClient(DummyDockerClient):
         self.images = PullTrackingImages()
 
 
+class LabeledContainer:
+    def __init__(self, job_id: str, worker_id: str, status: str):
+        self.id = f"cid-{job_id}"
+        self.name = f"job_{job_id}"
+        self.labels = {"opeva.job_id": job_id, "opeva.worker_id": worker_id}
+        self.status = status
+        self.removed = False
+        self.stop_called = False
+
+    def remove(self, force=True):
+        self.removed = True
+
+    def stop(self):
+        self.stop_called = True
+
+
+class CleanupAwareDockerClient(PullTrackingDockerClient):
+    def __init__(self, container, existing):
+        super().__init__(container)
+        self._existing = existing
+        self.containers = self
+
+    def list(self, all=False, filters=None):  # noqa: A003
+        return list(self._existing)
+
+
 def test_run_job_success(tmp_path):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
@@ -167,6 +193,73 @@ def test_run_job_pulls_image_before_start(tmp_path, monkeypatch):
     agent._run_job(job)
 
     assert docker_client.images.pulled == ["calof/algorithms:v1"]
+
+
+def test_orphan_cleanup_removes_exited_job_container(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    active_container = DummyContainer(exit_code=0, logs=[b"ok\n"])
+    orphan = LabeledContainer(job_id="old-job", worker_id="worker-a", status="exited")
+    docker_client = CleanupAwareDockerClient(active_container, [orphan])
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.0,
+    )
+    agent._run_job({"job_id": "job-clean", "config_path": "cfg.yaml", "job_name": "Demo"})
+    assert orphan.removed is True
+
+
+def test_orphan_cleanup_keeps_running_container_when_backend_running(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses.append("running")  # for existing orphan-labeled running container
+    active_container = DummyContainer(exit_code=0, logs=[b"ok\n"])
+    running = LabeledContainer(job_id="running-job", worker_id="worker-a", status="running")
+    docker_client = CleanupAwareDockerClient(active_container, [running])
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.0,
+    )
+    agent._run_job({"job_id": "job-keep", "config_path": "cfg.yaml", "job_name": "Demo"})
+    assert running.removed is False
+    assert running.stop_called is False
+
+
+def test_orphan_cleanup_removes_running_container_when_backend_terminal(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.status_responses.append("failed")  # for existing running orphan container
+    active_container = DummyContainer(exit_code=0, logs=[b"ok\n"])
+    running = LabeledContainer(job_id="failed-job", worker_id="worker-a", status="running")
+    docker_client = CleanupAwareDockerClient(active_container, [running])
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        status_poll_interval=0.0,
+    )
+    agent._run_job({"job_id": "job-clean-running", "config_path": "cfg.yaml", "job_name": "Demo"})
+    assert running.stop_called is True
+    assert running.removed is True
 
 
 def test_run_job_failure(tmp_path):

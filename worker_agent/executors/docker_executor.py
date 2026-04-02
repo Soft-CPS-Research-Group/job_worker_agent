@@ -14,6 +14,9 @@ except ImportError:  # pragma: no cover - tests inject a fake client
 from .base import BaseExecutor, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
+_RUNNING_CONTAINER_STATES = {"running", "restarting"}
+_BACKEND_ACTIVE_JOB_STATUSES = {"launching", "dispatched", "running", "stop_requested"}
+_BACKEND_TERMINAL_OR_QUEUED_STATUSES = {"queued", "finished", "failed", "stopped", "canceled"}
 
 
 class DockerExecutor(BaseExecutor):
@@ -32,6 +35,17 @@ class DockerExecutor(BaseExecutor):
             docker_client_factory = lambda: docker.DockerClient(base_url="unix://var/run/docker.sock")
         self._docker_client_factory = docker_client_factory
         self._docker_client_instance: Optional["docker.DockerClient"] = None
+        self._cleanup_enabled = os.environ.get("WORKER_DOCKER_ORPHAN_CLEANUP", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._cleanup_interval_seconds = max(
+            0.0,
+            float(os.environ.get("WORKER_DOCKER_ORPHAN_CLEANUP_INTERVAL_SECONDS", "30")),
+        )
+        self._last_cleanup_ts = 0.0
 
     def _get_docker_client(self) -> "docker.DockerClient":
         if self._docker_client_instance is None:
@@ -83,6 +97,113 @@ class DockerExecutor(BaseExecutor):
         except Exception as exc:  # pragma: no cover - depends on daemon/network
             _LOGGER.warning("Failed to pull image %s (policy=%s): %s", image_ref, self.pull_policy, exc)
 
+    @staticmethod
+    def _container_labels(container: Any) -> Dict[str, str]:
+        labels = getattr(container, "labels", None)
+        if isinstance(labels, dict):
+            return {str(k): str(v) for k, v in labels.items()}
+        attrs = getattr(container, "attrs", None)
+        if isinstance(attrs, dict):
+            config = attrs.get("Config")
+            if isinstance(config, dict):
+                attrs_labels = config.get("Labels")
+                if isinstance(attrs_labels, dict):
+                    return {str(k): str(v) for k, v in attrs_labels.items()}
+        return {}
+
+    @staticmethod
+    def _container_status(container: Any) -> str:
+        state = str(getattr(container, "status", "") or "").strip().lower()
+        if state:
+            return state
+        attrs = getattr(container, "attrs", None)
+        if isinstance(attrs, dict):
+            state_payload = attrs.get("State")
+            if isinstance(state_payload, dict):
+                status = str(state_payload.get("Status") or "").strip().lower()
+                if status:
+                    return status
+        return "unknown"
+
+    def _list_job_labeled_containers(self, client: "docker.DockerClient") -> list[Any]:
+        containers_api = getattr(client, "containers", None)
+        if containers_api is None or not hasattr(containers_api, "list"):
+            return []
+        try:
+            return list(containers_api.list(all=True, filters={"label": "opeva.job_id"}))
+        except TypeError:
+            return list(containers_api.list(all=True))
+        except Exception as exc:  # pragma: no cover - daemon/runtime dependent
+            _LOGGER.warning("Failed to list existing containers for orphan cleanup: %s", exc)
+            return []
+
+    def _cleanup_orphan_job_containers(self, client: "docker.DockerClient", *, force: bool = False) -> None:
+        if not self._cleanup_enabled:
+            return
+        now = time.monotonic()
+        if not force and self._cleanup_interval_seconds > 0 and (now - self._last_cleanup_ts) < self._cleanup_interval_seconds:
+            return
+        self._last_cleanup_ts = now
+
+        for container in self._list_job_labeled_containers(client):
+            labels = self._container_labels(container)
+            job_id = str(labels.get("opeva.job_id", "")).strip()
+            if not job_id:
+                continue
+            owner_worker = str(labels.get("opeva.worker_id", "")).strip()
+            if owner_worker and owner_worker != self.runtime.worker_id:
+                continue
+
+            status = self._container_status(container)
+            container_name = str(getattr(container, "name", "<unknown>"))
+            if status not in _RUNNING_CONTAINER_STATES:
+                try:
+                    container.remove(force=True)
+                    _LOGGER.info(
+                        "Removed stale job container '%s' (job=%s, state=%s)",
+                        container_name,
+                        job_id,
+                        status,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    _LOGGER.warning(
+                        "Failed to remove stale job container '%s' (job=%s): %s",
+                        container_name,
+                        job_id,
+                        exc,
+                    )
+                continue
+
+            backend_status = self.runtime._fetch_status(job_id)
+            if backend_status in _BACKEND_ACTIVE_JOB_STATUSES or backend_status is None:
+                # Keep healthy/unknown running jobs to avoid unsafe interruption.
+                continue
+            if backend_status in _BACKEND_TERMINAL_OR_QUEUED_STATUSES:
+                try:
+                    if hasattr(container, "stop"):
+                        container.stop()
+                except Exception:
+                    pass
+                try:
+                    container.remove(force=True)
+                    _LOGGER.info(
+                        "Removed orphan running container '%s' (job=%s, backend_status=%s)",
+                        container_name,
+                        job_id,
+                        backend_status,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    _LOGGER.warning(
+                        "Failed to remove orphan running container '%s' (job=%s): %s",
+                        container_name,
+                        job_id,
+                        exc,
+                    )
+
+    def on_startup(self) -> None:
+        client = self._get_docker_client()
+        self._cleanup_orphan_job_containers(client, force=True)
+
     def run_job(self, job: Dict[str, Any]) -> None:
         job_id = job["job_id"]
         config_path = job["config_path"]
@@ -110,6 +231,7 @@ class DockerExecutor(BaseExecutor):
             }
             _LOGGER.info("Starting container %s for job %s", container_name, job_id)
             client = self._get_docker_client()
+            self._cleanup_orphan_job_containers(client)
             run_kwargs = {
                 "image": job.get("image", self.runtime.image),
                 "command": command,

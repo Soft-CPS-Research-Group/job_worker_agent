@@ -49,6 +49,9 @@ class WorkerRuntime(Protocol):
 
 
 class BaseExecutor:
+    def on_startup(self) -> None:
+        return None
+
     def run_job(self, job: Dict[str, Any]) -> None:
         raise NotImplementedError
 
