@@ -818,6 +818,10 @@ class DeucalionExecutor(BaseExecutor):
         command_text = command.strip()
         if not command_text:
             raise ValueError("Empty job command")
+        if "--config" in command_text and not re.search(r"(^|\s)--base-dir(?:\s|=|$)", command_text):
+            # Ensure algorithms writes job artifacts to the shared /data bind so
+            # backend can expose live progress/logs in Deucalion runs.
+            command_text = f"{command_text} --base-dir /data"
         if cfg.command_mode == "exec":
             parts = shlex.split(command_text)
             if not parts or parts[0].startswith("-"):
@@ -1046,6 +1050,9 @@ class DeucalionExecutor(BaseExecutor):
         )
         runtime_log_path = posixpath.join(remote_data_dir, "jobs", job_id, "logs", "runtime.log")
         lines.append(f"mkdir -p {shlex.quote(posixpath.dirname(runtime_log_path))}")
+        # Force algorithms runtime output to the /data bind (shared with backend).
+        if "OPEVA_BASE_DIR" not in env_vars:
+            lines.append("export OPEVA_BASE_DIR=/data")
         for key, value in env_vars.items():
             if value is None:
                 continue

@@ -349,6 +349,8 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     sbatch_remote = f"{remote_job_dir}/run.sbatch"
     assert "singularity run" in fake_ssh.remote_files[sbatch_remote]
     assert "--bind /projects/F202508843CPCAA0/tiagocalof/runs/job-1/data:/data " in fake_ssh.remote_files[sbatch_remote]
+    assert "export OPEVA_BASE_DIR=/data" in fake_ssh.remote_files[sbatch_remote]
+    assert "--base-dir /data" in fake_ssh.remote_files[sbatch_remote]
 
     # log sync is incremental: content appears once even with multiple sync loops
     log_path = shared_dir / "jobs" / job_id / "logs" / f"{job_id}.log"
