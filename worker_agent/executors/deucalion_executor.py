@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import posixpath
 import re
@@ -78,6 +79,18 @@ class DeucalionExecutor(BaseExecutor):
             60,
             int(self.env.get("DEUCALION_DATASET_COPY_TIMEOUT_SECONDS", "1800")),
         )
+        self.mlflow_sync_enabled = self.env.get("DEUCALION_SYNC_MLFLOW_RUN", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.mlflow_local_mlruns_dir = Path(
+            self.env.get(
+                "DEUCALION_MLFLOW_LOCAL_MLRUNS_DIR",
+                str(Path(self.runtime.shared_dir) / "mlflow" / "mlruns"),
+            )
+        ).resolve()
         self.container_workdir = self.env.get("DEUCALION_CONTAINER_WORKDIR", "/app").strip()
         self.sif_repository = self.env.get("DEUCALION_SIF_REPOSITORY", "calof/opeva_simulator_sif").strip().strip("/")
         self.sif_registry = self.env.get("DEUCALION_SIF_REGISTRY", "docker.io").strip().rstrip("/")
@@ -860,9 +873,105 @@ class DeucalionExecutor(BaseExecutor):
             job_id=job_id,
             local_job_dir=local_job_dir,
         )
+        summary["mlflow"] = self._sync_remote_mlflow_run(
+            remote_data_dir=remote_data_dir,
+            local_job_dir=local_job_dir,
+        )
         if isinstance(summary["job_info"], dict) and summary["job_info"].get("status") == "failed":
             summary["had_failure"] = True
         return summary
+
+    @staticmethod
+    def _tracking_uri_to_remote_mlruns_root(tracking_uri: str, remote_data_dir: str) -> str | None:
+        raw = tracking_uri.strip()
+        if not raw:
+            return None
+        if raw.startswith("file://"):
+            raw = raw[len("file://") :]
+        elif raw.startswith("file:"):
+            raw = raw[len("file:") :]
+        else:
+            return None
+        path = raw.strip()
+        if not path:
+            return None
+        normalized = path.replace("\\", "/")
+        if normalized.startswith("/data/"):
+            suffix = normalized[len("/data/") :].lstrip("/")
+            return posixpath.join(remote_data_dir, suffix)
+        return None
+
+    def _sync_remote_mlflow_run(self, *, remote_data_dir: str, local_job_dir: Path) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "status": "skipped",
+            "reason": "disabled",
+            "source": None,
+            "target": None,
+            "run_id": None,
+            "experiment_id": None,
+            "error": None,
+        }
+        if not self.mlflow_sync_enabled:
+            return summary
+
+        local_info_path = local_job_dir / "job_info.json"
+        if not local_info_path.exists():
+            summary["reason"] = "missing_job_info"
+            return summary
+        try:
+            info = json.loads(local_info_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary["reason"] = "invalid_job_info"
+            return summary
+        if not isinstance(info, dict):
+            summary["reason"] = "invalid_job_info"
+            return summary
+
+        tracking_uri = str(info.get("tracking_uri") or info.get("mlflow_uri") or "").strip()
+        remote_mlruns_root = self._tracking_uri_to_remote_mlruns_root(tracking_uri, remote_data_dir)
+        if not remote_mlruns_root:
+            summary["reason"] = "tracking_uri_not_file_data"
+            return summary
+
+        run_id = str(info.get("mlflow_run_id") or info.get("run_id") or "").strip()
+        experiment_id = str(info.get("mlflow_experiment_id") or info.get("experiment_id") or "").strip()
+        if not run_id or not experiment_id:
+            summary["reason"] = "missing_run_identity"
+            return summary
+
+        remote_experiment_dir = posixpath.join(remote_mlruns_root, experiment_id)
+        remote_run_dir = posixpath.join(remote_experiment_dir, run_id)
+        if not self._remote_exists(remote_run_dir, kind="d"):
+            summary["reason"] = "missing_remote_run_dir"
+            summary["source"] = remote_run_dir
+            summary["run_id"] = run_id
+            summary["experiment_id"] = experiment_id
+            return summary
+
+        local_experiment_dir = self.mlflow_local_mlruns_dir / experiment_id
+        local_experiment_dir.mkdir(parents=True, exist_ok=True)
+        local_run_dir = local_experiment_dir / run_id
+
+        summary["source"] = remote_run_dir
+        summary["target"] = str(local_run_dir)
+        summary["run_id"] = run_id
+        summary["experiment_id"] = experiment_id
+
+        try:
+            # Copy run folder (metrics/params/tags/meta/artifacts for file-store runs).
+            self.ssh.copy_from(remote_run_dir, local_experiment_dir, timeout=120, recursive=True)
+            remote_experiment_meta = posixpath.join(remote_experiment_dir, "meta.yaml")
+            local_experiment_meta = local_experiment_dir / "meta.yaml"
+            if self._remote_exists(remote_experiment_meta, kind="f"):
+                self.ssh.copy_from(remote_experiment_meta, local_experiment_meta, timeout=60, recursive=False)
+            summary["status"] = "synced"
+            summary["reason"] = "ok"
+            return summary
+        except SSHCommandError as exc:
+            summary["status"] = "failed"
+            summary["reason"] = "copy_failed"
+            summary["error"] = exc.stderr or exc.stdout or str(exc)
+            return summary
 
     def _render_sbatch_script(
         self,

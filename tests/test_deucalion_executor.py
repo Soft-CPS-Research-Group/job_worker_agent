@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from types import MethodType
@@ -1223,3 +1224,63 @@ def test_deucalion_executor_artifact_sync_transient_failure_keeps_finished(tmp_p
     artifact_sync = status_calls[-1]["details"]["artifact_sync"]
     assert artifact_sync["had_failure"] is False
     assert artifact_sync["folders"]["results"]["status"] == "synced"
+
+
+def test_deucalion_executor_syncs_mlflow_run_from_remote_file_store(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    job_id = "job-mlflow-sync"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    remote_data_dir = f"{remote_job_dir}/data"
+    remote_mlruns_root = f"{remote_data_dir}/mlflow/mlruns"
+    experiment_id = "123"
+    run_id = "run-abc"
+    remote_run_dir = f"{remote_mlruns_root}/{experiment_id}/{run_id}"
+    remote_experiment_meta = f"{remote_mlruns_root}/{experiment_id}/meta.yaml"
+    remote_job_info_path = f"{remote_data_job_dir}/job_info.json"
+
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+            f"{remote_data_job_dir}/results",
+            f"{remote_data_job_dir}/progress",
+            remote_run_dir,
+        },
+    )
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "out\n"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "err\n"
+    fake_ssh.remote_files[remote_experiment_meta] = "name: demo\n"
+    fake_ssh.remote_files[remote_job_info_path] = json.dumps(
+        {
+            "job_id": job_id,
+            "tracking_uri": "file:/data/mlflow/mlruns",
+            "experiment_id": experiment_id,
+            "run_id": run_id,
+        }
+    )
+
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "903")
+    monkeypatch.setattr(
+        deucalion_executor_module,
+        "query_state",
+        lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0),
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job({"job_id": job_id, "config_path": "configs/demo.yaml", "job_name": "MlflowSync", "image": "calof/algorithms:latest"})
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls[-1]["status"] == "finished"
+    artifact_sync = status_calls[-1]["details"]["artifact_sync"]
+    assert artifact_sync["mlflow"]["status"] == "synced"
+    copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
+    assert remote_run_dir in copied_from
