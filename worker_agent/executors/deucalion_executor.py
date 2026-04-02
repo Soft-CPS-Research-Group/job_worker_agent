@@ -540,15 +540,47 @@ class DeucalionExecutor(BaseExecutor):
             check=False,
         )
 
-    def _sync_remote_logs(self, remote_job_dir: str, local_log_path: Path, offsets: dict[str, int]) -> dict[str, int]:
+    def _sync_remote_logs(
+        self,
+        *,
+        remote_job_dir: str,
+        remote_data_dir: str,
+        job_id: str,
+        local_log_path: Path,
+        offsets: dict[str, int],
+    ) -> dict[str, int]:
         local_log_path.parent.mkdir(parents=True, exist_ok=True)
+        local_job_dir = local_log_path.parent.parent
+        local_info_path = local_job_dir / "job_info.json"
+        run_id: str | None = None
+        if local_info_path.exists():
+            try:
+                payload = json.loads(local_info_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    candidate = payload.get("mlflow_run_id") or payload.get("run_id")
+                    if isinstance(candidate, str) and candidate.strip():
+                        run_id = candidate.strip()
+            except Exception:
+                run_id = None
+
+        remote_sources: list[tuple[str, str]] = [
+            ("slurm.out", posixpath.join(remote_job_dir, "slurm.out")),
+            ("slurm.err", posixpath.join(remote_job_dir, "slurm.err")),
+            ("runtime.log", posixpath.join(remote_data_dir, "jobs", job_id, "logs", "runtime.log")),
+            ("job.log", posixpath.join(remote_data_dir, "jobs", job_id, "logs", f"{job_id}.log")),
+        ]
+        if run_id:
+            remote_sources.append(
+                ("run.log", posixpath.join(remote_data_dir, "jobs", job_id, "logs", f"{run_id}.log"))
+            )
+
         with open(local_log_path, "a", encoding="utf-8") as log_file:
-            for name in ("slurm.out", "slurm.err"):
-                remote_path = posixpath.join(remote_job_dir, name)
-                prev_size = offsets.get(name, 0)
+            for source_name, remote_path in remote_sources:
+                offset_key = f"{source_name}:{remote_path}"
+                prev_size = offsets.get(offset_key, 0)
                 current_size = self._remote_file_size(remote_path)
                 if current_size <= 0:
-                    offsets[name] = 0
+                    offsets[offset_key] = 0
                     continue
                 # File rotated/truncated remotely; resync from beginning.
                 start = 1 if current_size < prev_size else prev_size + 1
@@ -558,7 +590,7 @@ class DeucalionExecutor(BaseExecutor):
                 if delta:
                     log_file.write(delta)
                     log_file.flush()
-                offsets[name] = current_size
+                offsets[offset_key] = current_size
         return offsets
 
     def _sync_remote_progress_snapshot(
@@ -574,6 +606,7 @@ class DeucalionExecutor(BaseExecutor):
 
         candidate_paths = (
             posixpath.join(remote_data_dir, "jobs", job_id, "progress", "progress.json"),
+            posixpath.join(remote_data_dir, "progress", "progress.json"),
             posixpath.join(remote_job_dir, "progress", "progress.json"),
         )
         for remote_path in candidate_paths:
@@ -1128,7 +1161,7 @@ class DeucalionExecutor(BaseExecutor):
         datasets_synced: list[str] = []
         datasets_skipped: list[str] = []
         command_mode = "run"
-        log_offsets = {"slurm.out": 0, "slurm.err": 0}
+        log_offsets: dict[str, int] = {}
         preflight_stage = "preflight:init"
         preflight_last_update = self.now_fn()
         preflight_last_probe = preflight_last_update
@@ -1306,7 +1339,13 @@ class DeucalionExecutor(BaseExecutor):
                     )
 
                     if now >= next_sync:
-                        log_offsets = self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
+                        log_offsets = self._sync_remote_logs(
+                            remote_job_dir=remote_job_dir,
+                            remote_data_dir=remote_data_dir,
+                            job_id=job_id,
+                            local_log_path=local_log_path,
+                            offsets=log_offsets,
+                        )
                         self._sync_remote_progress_snapshot(
                             remote_job_dir=remote_job_dir,
                             remote_data_dir=remote_data_dir,
@@ -1362,7 +1401,13 @@ class DeucalionExecutor(BaseExecutor):
                         continue
 
                     final_status, exit_code, error = self._map_terminal_status(stop_reason, state)
-                    self._sync_remote_logs(remote_job_dir, local_log_path, log_offsets)
+                    self._sync_remote_logs(
+                        remote_job_dir=remote_job_dir,
+                        remote_data_dir=remote_data_dir,
+                        job_id=job_id,
+                        local_log_path=local_log_path,
+                        offsets=log_offsets,
+                    )
                     self._sync_remote_progress_snapshot(
                         remote_job_dir=remote_job_dir,
                         remote_data_dir=remote_data_dir,
