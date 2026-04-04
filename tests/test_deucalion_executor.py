@@ -1228,6 +1228,66 @@ def test_deucalion_executor_artifact_sync_transient_failure_keeps_finished(tmp_p
     assert artifact_sync["folders"]["results"]["status"] == "synced"
 
 
+def test_deucalion_executor_syncs_bundle_and_resolved_config_on_terminal(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    job_id = "job-bundle-config-sync"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    remote_bundle_dir = f"{remote_data_job_dir}/bundle"
+    remote_config_resolved = f"{remote_data_job_dir}/config.resolved.yaml"
+
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+            f"{remote_data_job_dir}/results",
+            f"{remote_data_job_dir}/progress",
+            remote_bundle_dir,
+        },
+    )
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "out\n"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.err"] = "err\n"
+    fake_ssh.remote_files[remote_config_resolved] = "simulator:\n  seed: 42\n"
+
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "904")
+    monkeypatch.setattr(
+        deucalion_executor_module,
+        "query_state",
+        lambda *args, **kwargs: SlurmState(state="COMPLETED", exit_code=0),
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job(
+        {
+            "job_id": job_id,
+            "config_path": "configs/demo.yaml",
+            "job_name": "BundleConfigSync",
+            "image": "calof/algorithms:latest",
+        }
+    )
+
+    status_calls = [call["json"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls[-1]["status"] == "finished"
+    artifact_sync = status_calls[-1]["details"]["artifact_sync"]
+    assert artifact_sync["folders"]["bundle"]["status"] == "synced"
+    assert artifact_sync["files"]["config.resolved.yaml"]["status"] == "synced"
+
+    copied_from = [remote for remote, _local, _recursive in fake_ssh.copy_from_calls]
+    assert remote_bundle_dir in copied_from
+    assert remote_config_resolved in copied_from
+
+    local_config_resolved = shared_dir / "jobs" / job_id / "config.resolved.yaml"
+    assert local_config_resolved.read_text(encoding="utf-8") == "simulator:\n  seed: 42\n"
+
+
 def test_deucalion_executor_syncs_mlflow_run_from_remote_file_store(tmp_path, monkeypatch):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()

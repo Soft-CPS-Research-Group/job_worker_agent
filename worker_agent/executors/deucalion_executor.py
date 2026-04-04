@@ -848,18 +848,53 @@ class DeucalionExecutor(BaseExecutor):
         summary: dict[str, Any] = {
             "had_failure": False,
             "folders": {},
+            "files": {},
         }
-        for folder in ("results", "progress"):
+
+        folder_specs = (
+            (
+                "results",
+                (
+                    posixpath.join(remote_data_dir, "jobs", job_id, "results"),
+                    posixpath.join(remote_job_dir, "results"),
+                ),
+                True,
+            ),
+            (
+                "progress",
+                (
+                    posixpath.join(remote_data_dir, "jobs", job_id, "progress"),
+                    posixpath.join(remote_job_dir, "progress"),
+                ),
+                True,
+            ),
+            (
+                "bundle",
+                (
+                    posixpath.join(remote_data_dir, "jobs", job_id, "bundle"),
+                    posixpath.join(remote_data_dir, "bundle"),
+                    posixpath.join(remote_job_dir, "bundle"),
+                ),
+                False,
+            ),
+            (
+                "checkpoints",
+                (
+                    posixpath.join(remote_data_dir, "jobs", job_id, "checkpoints"),
+                    posixpath.join(remote_data_dir, "checkpoints"),
+                    posixpath.join(remote_job_dir, "checkpoints"),
+                ),
+                False,
+            ),
+        )
+
+        for folder, candidate_paths, required_for_success in folder_specs:
             folder_summary = {
                 "status": "missing",
                 "source": None,
                 "attempts": 0,
                 "errors": [],
             }
-            candidate_paths = (
-                posixpath.join(remote_data_dir, "jobs", job_id, folder),
-                posixpath.join(remote_job_dir, folder),
-            )
             found_existing = False
             for remote_path in candidate_paths:
                 exists = self.ssh.run(f"test -d {shlex.quote(remote_path)} && echo yes || true", check=False)
@@ -898,12 +933,77 @@ class DeucalionExecutor(BaseExecutor):
             if folder_summary["status"] != "synced":
                 if found_existing:
                     folder_summary["status"] = "failed"
-                    summary["had_failure"] = True
+                    if required_for_success:
+                        summary["had_failure"] = True
                     _LOGGER.error("Failed to sync remote '%s' artifacts for job %s", folder, job_id)
                 else:
                     folder_summary["status"] = "missing"
                     _LOGGER.debug("No remote '%s' artifacts found for job %s", folder, job_id)
             summary["folders"][folder] = folder_summary
+
+        config_summary = {
+            "status": "missing",
+            "source": None,
+            "attempts": 0,
+            "errors": [],
+        }
+        config_candidate_paths = (
+            posixpath.join(remote_data_dir, "jobs", job_id, "config.resolved.yaml"),
+            posixpath.join(remote_data_dir, "config.resolved.yaml"),
+            posixpath.join(remote_job_dir, "config.resolved.yaml"),
+        )
+        found_config = False
+        local_config_path = local_job_dir / "config.resolved.yaml"
+        for remote_path in config_candidate_paths:
+            exists = self.ssh.run(f"test -f {shlex.quote(remote_path)} && echo yes || true", check=False)
+            if exists.strip() != "yes":
+                continue
+            found_config = True
+            for attempt in range(1, self.artifact_copy_retries + 1):
+                tmp_path = local_config_path.with_name("config.resolved.yaml.tmp")
+                try:
+                    self.ssh.copy_from(remote_path, tmp_path, timeout=60, recursive=False)
+                    os.replace(tmp_path, local_config_path)
+                    config_summary["status"] = "synced"
+                    config_summary["source"] = remote_path
+                    config_summary["attempts"] = attempt
+                    break
+                except SSHCommandError as exc:
+                    config_summary["source"] = remote_path
+                    config_summary["attempts"] = attempt
+                    config_summary["errors"].append(exc.stderr or str(exc))
+                    if attempt < self.artifact_copy_retries:
+                        backoff = min(
+                            self.artifact_copy_retry_backoff * (2 ** (attempt - 1)),
+                            _ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS,
+                        )
+                        if backoff > 0:
+                            self.sleep_fn(backoff)
+                    _LOGGER.warning(
+                        "Failed to sync remote '%s' from %s (attempt %d/%d): %s",
+                        "config.resolved.yaml",
+                        remote_path,
+                        attempt,
+                        self.artifact_copy_retries,
+                        exc,
+                    )
+                    try:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                    except OSError:
+                        pass
+            if config_summary["status"] == "synced":
+                break
+
+        if config_summary["status"] != "synced":
+            if found_config:
+                config_summary["status"] = "failed"
+                _LOGGER.error("Failed to sync remote '%s' artifacts for job %s", "config.resolved.yaml", job_id)
+            else:
+                config_summary["status"] = "missing"
+                _LOGGER.debug("No remote '%s' artifacts found for job %s", "config.resolved.yaml", job_id)
+        summary["files"]["config.resolved.yaml"] = config_summary
+
         summary["job_info"] = self._sync_remote_job_info_snapshot(
             remote_job_dir=remote_job_dir,
             remote_data_dir=remote_data_dir,
