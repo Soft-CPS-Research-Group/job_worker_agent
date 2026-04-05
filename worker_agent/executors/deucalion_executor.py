@@ -127,6 +127,12 @@ class DeucalionExecutor(BaseExecutor):
             60.0,
             float(self.env.get("DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS", "3600")),
         )
+        self.relax_local_permissions = self.env.get("DEUCALION_RELAX_LOCAL_PERMISSIONS", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
         self._budget_snapshot: dict[str, Any] | None = None
         self._budget_refreshed_at: float | None = None
         self._budget_last_attempt_at = 0.0
@@ -522,6 +528,41 @@ class DeucalionExecutor(BaseExecutor):
     def _ensure_remote_dir(self, path: str) -> None:
         self.ssh.run(f"mkdir -p {shlex.quote(path)}", timeout=30)
 
+    def _relax_local_permissions(self, path: Path) -> None:
+        if not self.relax_local_permissions:
+            return
+        try:
+            if not path.exists():
+                return
+            if path.is_dir():
+                os.chmod(path, 0o777)
+                for root, dirs, files in os.walk(path):
+                    root_path = Path(root)
+                    try:
+                        os.chmod(root_path, 0o777)
+                    except OSError:
+                        pass
+                    for directory in dirs:
+                        try:
+                            os.chmod(root_path / directory, 0o777)
+                        except OSError:
+                            continue
+                    for file_name in files:
+                        try:
+                            os.chmod(root_path / file_name, 0o666)
+                        except OSError:
+                            continue
+            else:
+                os.chmod(path, 0o666)
+                parent = path.parent
+                if parent.exists():
+                    try:
+                        os.chmod(parent, 0o777)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            _LOGGER.debug("Failed to relax local permissions for %s: %s", path, exc)
+
     def _remote_file_size(self, remote_path: str) -> int:
         output = self.ssh.run(
             f"if [ -f {shlex.quote(remote_path)} ]; then wc -c < {shlex.quote(remote_path)}; else echo 0; fi",
@@ -591,6 +632,7 @@ class DeucalionExecutor(BaseExecutor):
                     log_file.write(delta)
                     log_file.flush()
                 offsets[offset_key] = current_size
+        self._relax_local_permissions(local_log_path)
         return offsets
 
     def _sync_remote_progress_snapshot(
@@ -617,6 +659,7 @@ class DeucalionExecutor(BaseExecutor):
             try:
                 self.ssh.copy_from(remote_path, tmp_path, timeout=60, recursive=False)
                 os.replace(tmp_path, local_progress_path)
+                self._relax_local_permissions(local_progress_dir)
                 return
             except SSHCommandError as exc:
                 _LOGGER.warning("Failed to sync remote progress snapshot from %s: %s", remote_path, exc)
@@ -650,6 +693,7 @@ class DeucalionExecutor(BaseExecutor):
             try:
                 self.ssh.copy_from(remote_path, tmp_path, timeout=60, recursive=False)
                 os.replace(tmp_path, local_info_path)
+                self._relax_local_permissions(local_info_path)
                 summary["status"] = "synced"
                 summary["source"] = remote_path
                 return summary
@@ -907,6 +951,7 @@ class DeucalionExecutor(BaseExecutor):
                         folder_summary["status"] = "synced"
                         folder_summary["source"] = remote_path
                         folder_summary["attempts"] = attempt
+                        self._relax_local_permissions(local_job_dir / folder)
                         break
                     except SSHCommandError as exc:
                         folder_summary["source"] = remote_path
@@ -967,6 +1012,7 @@ class DeucalionExecutor(BaseExecutor):
                     config_summary["status"] = "synced"
                     config_summary["source"] = remote_path
                     config_summary["attempts"] = attempt
+                    self._relax_local_permissions(local_config_path)
                     break
                 except SSHCommandError as exc:
                     config_summary["source"] = remote_path
@@ -1016,6 +1062,7 @@ class DeucalionExecutor(BaseExecutor):
         )
         if isinstance(summary["job_info"], dict) and summary["job_info"].get("status") == "failed":
             summary["had_failure"] = True
+        self._relax_local_permissions(local_job_dir)
         return summary
 
     @staticmethod

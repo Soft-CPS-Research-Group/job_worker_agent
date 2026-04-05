@@ -603,10 +603,28 @@ class WorkerAgent:
         safe_job = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in job_name)[:40]
         return f"job_{self.worker_id}_{safe_job}_{job_id[:8]}"
 
+    @staticmethod
+    def _chmod_best_effort(path: Path, mode: int) -> None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            return
+
     def _prepare_log_file(self, job_id: str) -> Path:
-        logs_dir = Path(self.shared_dir) / "jobs" / job_id / "logs"
+        jobs_dir = Path(self.shared_dir) / "jobs"
+        job_dir = jobs_dir / job_id
+        logs_dir = job_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        return logs_dir / f"{job_id}.log"
+        log_path = logs_dir / f"{job_id}.log"
+        log_path.touch(exist_ok=True)
+
+        # Keep files/directories accessible from backend/UI processes that may run
+        # under a different uid than this worker container.
+        self._chmod_best_effort(jobs_dir, 0o777)
+        self._chmod_best_effort(job_dir, 0o777)
+        self._chmod_best_effort(logs_dir, 0o777)
+        self._chmod_best_effort(log_path, 0o666)
+        return log_path
 
     def request_exit_after_current_job(self) -> None:
         """Ensure the worker stops after the currently running job."""
