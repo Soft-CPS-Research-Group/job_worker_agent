@@ -6,7 +6,7 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  -s, --server URL           Backend base URL (default: http://localhost:8000)
+  -s, --server URL           Job Orchestrator base URL (default: http://localhost:8011)
   -w, --worker-id ID         Worker identifier (default: hostname)
   -n, --nfs-server HOST      NFS server host or IP (required)
   -e, --nfs-export PATH      NFS export path on the server (default: /opt/opeva_shared_data)
@@ -20,7 +20,7 @@ Options:
 
 Example:
   sudo $0 \
-    --server http://backend:8000 \
+    --server http://job_orchestrator_agent:8011 \
     --worker-id worker-a \
     --nfs-server 10.0.0.5 \
     --nfs-export /opt/opeva_shared_data
@@ -28,7 +28,7 @@ USAGE
 }
 
 DRY_RUN=false
-SERVER_URL="http://localhost:8000"
+SERVER_URL="http://localhost:8011"
 WORKER_ID="$(hostname)"
 NFS_SERVER=""
 NFS_EXPORT="/opt/opeva_shared_data"

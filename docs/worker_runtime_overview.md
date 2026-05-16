@@ -1,8 +1,8 @@
 # Worker Runtime Overview
 
-This document summarizes how the worker agent operates so that backend
+This document summarizes how the worker agent operates so that Job Orchestrator
 implementations can provide the correct contracts. The intent is to keep this
-as the single reference when coordinating changes between the backend and the
+as the single reference when coordinating changes between the orchestrator and the
 worker service.
 
 ## High-level flow
@@ -26,7 +26,7 @@ worker service.
    mode, incremental remote sync in deucalion mode).
 5. **Status updates:**
    - The worker posts `POST /api/agent/job-status` with
-     `{"job_id": <id>, "worker_id": <id>, "status": <status>, ...}`.
+     `{"job_id": <id>, "worker_id": <id>, "worker_version": <version>, "status": <status>, ...}`.
    - While running, it sends periodic `status="running"` updates to refresh
      `status_updated_at` on the server (avoids stale-job handling).
    - Terminal transitions: `finished`, `failed`, `stopped`, or `canceled`.
@@ -94,10 +94,10 @@ updates.
   - monitor active states: `squeue`
   - resolve terminal state/exit code: `sacct` (prefers root job row over steps)
   - cooperative stop/cancel: `scancel`
-- Status mapping to backend:
+- Status mapping to orchestrator:
   - queued/running Slurm states -> `dispatched` / `running`
   - completed exit 0 -> `finished`
-  - cancellation by backend -> `stopped` or `canceled`
+  - cancellation by orchestrator -> `stopped` or `canceled`
   - other terminal states -> `failed`
 - Connectivity policy:
   - heartbeat continues independently from SSH availability
@@ -120,7 +120,7 @@ reads matching environment variables:
 
 | CLI flag | Environment variable | Default |
 | --- | --- | --- |
-| `--server` | `OPEVA_SERVER` | `http://localhost:8000` |
+| `--server` | `OPEVA_SERVER` | `http://localhost:8011` |
 | `--worker-id` | `WORKER_ID` | hostname at runtime |
 | `--shared-dir` | `OPEVA_SHARED_DIR` | `/opt/opeva_shared_data` |
 | `--image` | `WORKER_IMAGE` | `calof/opeva_simulator:latest` |
@@ -141,14 +141,14 @@ Deucalion mode requires SSH settings and Slurm defaults via environment:
 transient Docker Hub/network failures, `DEUCALION_SIF_COMMAND_MODE`,
 `DEUCALION_UNKNOWN_STATE_TIMEOUT_SECONDS`, and optional `DEUCALION_SLURM_*`.
 
-## Backend expectations
+## Job Orchestrator expectations
 
 - `/api/agent/heartbeat` and `/api/agent/job-status` should be idempotent.
 - `/api/agent/next-job` must respond quickly; long-polling should either be
-  implemented on the backend or via short poll intervals on the worker.
+  implemented on the orchestrator or via short poll intervals on the worker.
 - `/status/<job_id>` should return `404` when the job is unknown and include a
   JSON object with at least a `status` field when known.
-- Backend should ensure that the referenced config files exist on the shared
+- Orchestrator should ensure that the referenced config files exist on the shared
   filesystem prior to assigning a job.
 
 ### Heartbeat `info` payload (current contract)
@@ -162,6 +162,9 @@ Every heartbeat includes:
 - `last_job_id` – latest job seen by this worker
 - `last_terminal_status` – last terminal status emitted by this worker
 
+Every `POST /api/agent/job-status` also includes `worker_version`, allowing the
+orchestrator to expose which worker build produced the latest status publication.
+
 Deucalion workers additionally include:
 
 - `budget` – parsed snapshot from `billing` output (`accounts`, used/limit/percent)
@@ -170,5 +173,5 @@ Deucalion workers additionally include:
 Budget refresh is cached and executed at most once per
 `DEUCALION_BUDGET_REFRESH_INTERVAL_SECONDS` (default `3600`).
 
-Keeping this contract stable allows the worker agent and backend to evolve
+Keeping this contract stable allows the worker agent and orchestrator to evolve
 independently while preserving compatibility.

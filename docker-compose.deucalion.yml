@@ -5,7 +5,7 @@ services:
     image: ${WORKER_IMAGE:-calof/job_worker_agent:latest}
     container_name: ${WORKER_CONTAINER_NAME:-worker-agent-deucalion}
     environment:
-      OPEVA_SERVER: ${OPEVA_SERVER:-http://localhost:8000}
+      OPEVA_SERVER: ${OPEVA_SERVER:-http://localhost:8011}
       WORKER_ID: ${WORKER_ID:-deucalion}
       OPEVA_SHARED_DIR: ${OPEVA_SHARED_DIR:-/mnt/opeva_shared}
       WORKER_EXECUTOR: deucalion

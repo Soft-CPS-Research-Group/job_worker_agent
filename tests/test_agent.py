@@ -617,6 +617,7 @@ def test_heartbeat_payload_contains_runtime_metadata():
         image="img",
         session=session,
         docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        env={"WORKER_VERSION": "9.9.9"},
         heartbeat_interval=0,
         status_poll_interval=0.0,
     )
@@ -632,11 +633,35 @@ def test_heartbeat_payload_contains_runtime_metadata():
     info = payload["info"]
     assert payload["worker_id"] == "worker-a"
     assert info["executor"] == "docker"
-    assert isinstance(info["worker_version"], str)
+    assert info["worker_version"] == "9.9.9"
     assert info["active_job_id"] is None
     assert info["active_job_count"] == 0
     assert info["last_job_id"] == "job-meta"
     assert info["last_terminal_status"] == "finished"
+
+
+def test_status_payload_contains_worker_version():
+    session = DummySession()
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        env={"WORKER_VERSION": "9.9.9"},
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    agent._post_status("job-version", "running")
+
+    status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    payload = status_calls[-1]["json"]
+    assert payload["worker_id"] == "worker-a"
+    assert payload["worker_version"] == "9.9.9"
 
 
 def test_deucalion_defaults_to_three_active_slots():

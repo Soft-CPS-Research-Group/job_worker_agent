@@ -1,6 +1,6 @@
 # Job Worker Agent
 
-Worker implementation for the OPEVA backend. Each agent polls the API for
+Worker implementation for the OPEVA Job Orchestrator. Each agent polls the API for
 queued jobs, executes workloads via the configured executor (`docker` or
 `deucalion`), and streams status/log updates back to the server.
 
@@ -8,7 +8,7 @@ queued jobs, executes workloads via the configured executor (`docker` or
 
 - Polls `/api/agent/next-job`, `/api/agent/job-status`, and `/api/agent/heartbeat`.
 - Writes logs to `jobs/<job_id>/logs/<job_id>.log` inside the shared directory.
-- Backend provides the full container payload (image, command, container name,
+- Job Orchestrator provides the full container payload (image, command, container name,
   volumes, env) and the worker runs it as-is.
 - Executor modes:
   - `docker`: runs jobs in Docker as before.
@@ -18,6 +18,8 @@ queued jobs, executes workloads via the configured executor (`docker` or
   becomes `stop_requested` or `canceled`).
 - Periodic `job-status` updates while running to avoid stale-job handling.
 
+Current package version: `0.4.1`. Release notes live in [`docs/releases.md`](docs/releases.md).
+
 ## Quick start (recommended)
 
 1. Install Docker and the NFS client (`nfs-common` on Debian/Ubuntu).
@@ -26,7 +28,7 @@ queued jobs, executes workloads via the configured executor (`docker` or
 
 ```bash
 sudo scripts/setup_worker.sh \
-  --server http://backend:8000 \
+  --server http://job_orchestrator_agent:8011 \
   --worker-id worker-a \
   --nfs-server 10.0.0.5 \
   --nfs-export /opt/opeva_shared_data
@@ -41,7 +43,7 @@ Use the dedicated compose file when running the worker that targets Deucalion:
 
 ```bash
 export WORKER_ID=deucalion
-export OPEVA_SERVER=http://<backend>:8000
+export OPEVA_SERVER=http://<orchestrator>:8011
 export LOCAL_SHARED_DIR=/mnt/opeva_shared
 export OPEVA_SHARED_DIR=/mnt/opeva_shared
 
@@ -56,14 +58,14 @@ docker compose -f docker-compose.deucalion.yml up -d
 ```
 
 Notes:
-- Backend remains unchanged; this worker still uses `/api/agent/*`.
+- The worker talks to the Job Orchestrator using `/api/agent/*`.
 - Worker resolves SIF by job image tag from OCI artifacts (default repo: `calof/opeva_simulator_sif`)
   and stores them in a versioned cache under Deucalion remote storage.
 - Datasets can be synchronized automatically per job using
   `execution.deucalion.datasets` (paths relative to the shared root, e.g.
   `datasets/site_a/input.csv`).
 - The worker copies config + submits with `sbatch`, monitors with `squeue/sacct`,
-  syncs logs incrementally, and reports final status back to backend.
+  syncs logs incrementally, and reports final status back to the orchestrator.
 - Artifact sync prioritizes the current simulator layout under
   `<remote_root>/runs/<job_id>/data/jobs/<job_id>/(results|progress)` and falls
   back to legacy `<remote_root>/runs/<job_id>/(results|progress)` if needed.
@@ -79,7 +81,7 @@ full lifecycle:
 ```bash
 # Export overrides once per session (or source a file with these values)
 export WORKER_ID=tiago-laptop
-export OPEVA_SERVER=http://193.136.62.78:8000    # backend reachable via VPN/public IP
+export OPEVA_SERVER=http://193.136.62.78:8011    # orchestrator reachable via VPN/public IP
 export SHUTDOWN_TIMEOUT=900                     # allow 15 minutes for graceful stop
 
 # Mount the share (if needed) and start the worker container
@@ -92,13 +94,13 @@ sudo WORKER_ID=tiago-laptop scripts/local_worker.sh stop
 Tune the behaviour by exporting variables (e.g. `NFS_SERVER`, `MOUNT_POINT`,
 `WORKER_ID`, `WORKER_IMAGE`, `OPEVA_SERVER`) before running the script. The
 compose definition lives in `docker-compose.local.yml`. The worker should point
-to the backend using the address that is accessible from the laptop (typically
-the server’s public/VPN-routed IP, e.g. `http://193.136.62.78:8000`).
+to the orchestrator using the address that is accessible from the laptop (typically
+the server's public/VPN-routed IP, e.g. `http://193.136.62.78:8011`).
 
 If you prefer a one-liner without `export`, prefix the command:
 
 ```bash
-sudo WORKER_ID=tiago-laptop OPEVA_SERVER=http://193.136.62.78:8000 SHUTDOWN_TIMEOUT=900 scripts/local_worker.sh start
+sudo WORKER_ID=tiago-laptop OPEVA_SERVER=http://193.136.62.78:8011 SHUTDOWN_TIMEOUT=900 scripts/local_worker.sh start
 ```
 
 While the worker runs you can:
@@ -135,7 +137,7 @@ it to persist across reboots.
 ```bash
 docker run -d --restart unless-stopped \
   --name job-worker-worker-a \
-  -e OPEVA_SERVER=http://backend:8000 \
+  -e OPEVA_SERVER=http://job_orchestrator_agent:8011 \
   -e WORKER_ID=worker-a \
   -e OPEVA_SHARED_DIR=/opt/opeva_shared_data \
   -e POLL_INTERVAL=5 \
@@ -149,9 +151,10 @@ Environment variables:
 
 | Variable | Description |
 |----------|-------------|
-| `OPEVA_SERVER` | Backend base URL (default `http://localhost:8000`). |
+| `OPEVA_SERVER` | Job Orchestrator base URL (default `http://localhost:8011`). |
 | `WORKER_ID` | Worker identifier; defaults to container hostname. |
 | `WORKER_EXECUTOR` | `docker` (default) or `deucalion`. |
+| `WORKER_VERSION` | Optional override for the version reported to the orchestrator; otherwise the installed package version is used. |
 | `OPEVA_SHARED_DIR` | Local path to the mounted NFS share. |
 | `POLL_INTERVAL` | Seconds between queue polls when idle. |
 | `WORKER_HEARTBEAT_INTERVAL` | Heartbeat interval in seconds. |
@@ -159,9 +162,14 @@ Environment variables:
 | `LOG_LEVEL` | Python logging level (`INFO`, `DEBUG`, …). |
 | `WORKER_EXIT_AFTER_JOB` | Set to `1`/`true` to stop polling after the next job finishes. |
 
-Cadence alignment with backend:
-- Typical setup: `WORKER_HEARTBEAT_INTERVAL=30` with backend `HOST_HEARTBEAT_TTL=60`.
-- More responsive host status in UI: `WORKER_HEARTBEAT_INTERVAL=15` and backend `HOST_HEARTBEAT_TTL=45`.
+Cadence alignment with the orchestrator:
+- Typical setup: `WORKER_HEARTBEAT_INTERVAL=30` with orchestrator `HOST_HEARTBEAT_TTL=60`.
+- More responsive host status in UI: `WORKER_HEARTBEAT_INTERVAL=15` and orchestrator `HOST_HEARTBEAT_TTL=45`.
+
+Runtime version reporting:
+- Every heartbeat includes `info.worker_version`.
+- Every `POST /api/agent/job-status` includes `worker_version`.
+- The orchestrator exposes the latest value in `/hosts` under `hosts.<worker_id>.info.worker_version`, plus `last_status_*` fields for the last status publication.
 
 Deucalion-only variables:
 
@@ -230,5 +238,5 @@ pytest
 ## Continuous integration & image publishing
 
 `.github/workflows/ci.yml` runs tests and pushes
-`calof/job_worker_agent:<sha>` (and `:latest` on `main`). Configure the secrets
+`calof/job_worker_agent:<sha>` (and `:latest` on `main`, plus `:vX.Y.Z` for release tags). Configure the secrets
 `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in GitHub to enable the push step.

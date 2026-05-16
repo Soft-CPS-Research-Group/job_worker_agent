@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - older docker SDK or missing package
 from .executors.base import BaseExecutor
 from .executors.deucalion_executor import DeucalionExecutor
 from .executors.docker_executor import DockerExecutor
+from .version import __version__
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 class WorkerAgent:
-    """Agent that polls the OPEVA backend for work and executes jobs."""
+    """Agent that polls the OPEVA Job Orchestrator for work and executes jobs."""
 
     def __init__(
         self,
@@ -177,7 +178,7 @@ class WorkerAgent:
         try:
             return version("job-worker-agent")
         except PackageNotFoundError:
-            return "dev"
+            return __version__
 
     def _build_heartbeat_info(self) -> Dict[str, Any]:
         active_jobs = self._active_jobs_snapshot()
@@ -522,7 +523,12 @@ class WorkerAgent:
             if status in _TERMINAL_JOB_STATUSES:
                 self._last_terminal_status = status
         self._update_active_job_from_status(job_id, status, dict(extra))
-        payload = {"job_id": job_id, "status": status, "worker_id": self.worker_id}
+        payload = {
+            "job_id": job_id,
+            "status": status,
+            "worker_id": self.worker_id,
+            "worker_version": self._worker_version,
+        }
         payload.update({k: v for k, v in extra.items() if v is not None})
         _LOGGER.info("POST /api/agent/job-status payload=%s", payload)
         result = self._post_json_with_retries(
@@ -618,7 +624,7 @@ class WorkerAgent:
         log_path = logs_dir / f"{job_id}.log"
         log_path.touch(exist_ok=True)
 
-        # Keep files/directories accessible from backend/UI processes that may run
+        # Keep files/directories accessible from orchestrator/UI processes that may run
         # under a different uid than this worker container.
         self._chmod_best_effort(jobs_dir, 0o777)
         self._chmod_best_effort(job_dir, 0o777)
@@ -648,7 +654,7 @@ class WorkerAgent:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a job worker agent")
-    parser.add_argument("--server", default=os.environ.get("OPEVA_SERVER", "http://localhost:8000"))
+    parser.add_argument("--server", default=os.environ.get("OPEVA_SERVER", "http://localhost:8011"))
     parser.add_argument("--worker-id", default=os.environ.get("WORKER_ID"))
     parser.add_argument("--shared-dir", default=os.environ.get("OPEVA_SHARED_DIR", "/opt/opeva_shared_data"))
     parser.add_argument("--image", default=os.environ.get("WORKER_IMAGE", "calof/opeva_simulator:latest"))

@@ -5,6 +5,7 @@ on:
     branches: ["main"]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   tests:
@@ -46,4 +47,8 @@ jobs:
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             docker tag ${IMAGE}:${{ github.sha }} ${IMAGE}:latest
             docker push ${IMAGE}:latest
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            docker tag ${IMAGE}:${{ github.sha }} ${IMAGE}:${{ github.ref_name }}
+            docker push ${IMAGE}:${{ github.ref_name }}
           fi

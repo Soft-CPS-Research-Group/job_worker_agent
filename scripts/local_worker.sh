@@ -18,7 +18,7 @@ Environment overrides (export before running):
   NFS_EXPORT             Export path on the server (default: /opt/opeva_shared_data)
   MOUNT_POINT            Local mount point (default: /mnt/opeva_shared)
   NFS_MOUNT_OPTS         Options passed to mount -o (default: vers=4.1,proto=tcp,port=2049)
-  OPEVA_SERVER           Backend URL (default: http://localhost:8000)
+  OPEVA_SERVER           Job Orchestrator URL (default: http://localhost:8011)
   WORKER_ID              Worker identifier (default: <hostname>-local)
   WORKER_IMAGE           Worker container image (default: calof/job_worker_agent:latest)
   WORKER_EXECUTOR        Worker executor mode (default: docker)
@@ -49,7 +49,7 @@ WORKER_IMAGE="${WORKER_IMAGE:-calof/job_worker_agent:latest}"
 WORKER_EXECUTOR="${WORKER_EXECUTOR:-docker}"
 WORKER_ENABLE_GPU="${WORKER_ENABLE_GPU:-false}"
 WORKER_CONTAINER_NAME="${WORKER_CONTAINER_NAME:-job-worker-${WORKER_ID}}"
-OPEVA_SERVER="${OPEVA_SERVER:-http://localhost:8000}"
+OPEVA_SERVER="${OPEVA_SERVER:-http://localhost:8011}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 WORKER_HEARTBEAT_INTERVAL="${WORKER_HEARTBEAT_INTERVAL:-30}"
