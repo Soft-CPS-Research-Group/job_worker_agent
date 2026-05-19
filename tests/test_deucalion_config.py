@@ -157,3 +157,14 @@ def test_runtime_options_datasets_override_config_inference():
         },
     )
     assert cfg.datasets == ["datasets/custom_override"]
+
+
+def test_runtime_options_dataset_schema_path_syncs_dataset_root():
+    cfg = resolve_deucalion_job_config(
+        config=None,
+        env={},
+        runtime_options={
+            "datasets": ["datasets/citylearn_parquet_demo/schema.json"],
+        },
+    )
+    assert cfg.datasets == ["datasets/citylearn_parquet_demo"]

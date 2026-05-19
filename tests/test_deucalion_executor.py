@@ -903,7 +903,7 @@ def test_deucalion_executor_dataset_directory_uses_recursive_copy(tmp_path, monk
     session = DummySession()
 
     (shared_dir / "datasets" / "site_dir").mkdir(parents=True, exist_ok=True)
-    (shared_dir / "datasets" / "site_dir" / "nested.csv").write_text("x", encoding="utf-8")
+    (shared_dir / "datasets" / "site_dir" / "nested.parquet").write_text("x", encoding="utf-8")
 
     fake_ssh = FakeSSHClient(
         existing_paths={

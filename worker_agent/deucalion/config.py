@@ -89,6 +89,8 @@ def _validate_relative_dataset_path(path: str) -> str:
     normalized = str(pure)
     if not normalized.startswith("datasets/"):
         raise ValueError(f"Dataset path must start with 'datasets/': {raw!r}")
+    if pure.name == "schema.json" and len(pure.parts) >= 3:
+        normalized = str(PurePosixPath(*pure.parts[:-1]))
     return normalized
 
 
