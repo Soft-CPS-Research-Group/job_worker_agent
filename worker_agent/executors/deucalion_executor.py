@@ -873,8 +873,10 @@ class DeucalionExecutor(BaseExecutor):
                     "execution.deucalion.command_mode=exec requires an explicit executable in the command"
                 )
         pwd_opt = f"--pwd {shlex.quote(self.container_workdir)} " if self.container_workdir else ""
+        gpu_opt = "--nv " if cfg.profile.gpus > 0 else ""
         return (
             f"singularity {cfg.command_mode} "
+            f"{gpu_opt}"
             f"{pwd_opt}"
             f"--bind {shlex.quote(remote_data_dir)}:/data "
             f"{shlex.quote(cfg.sif_path)} "

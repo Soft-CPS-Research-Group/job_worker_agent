@@ -362,6 +362,50 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     assert f"{remote_data_job_dir}/progress" in copied_from
 
 
+def test_deucalion_executor_passes_nvidia_runtime_when_gpu_requested(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+        }
+    )
+
+    job_id = "job-gpu"
+    remote_job_dir = f"/projects/F202508843CPCAA0/tiagocalof/runs/{job_id}"
+    remote_data_job_dir = f"{remote_job_dir}/data/jobs/{job_id}"
+    fake_ssh.remote_files[f"{remote_job_dir}/slurm.out"] = "gpu-line\n"
+    fake_ssh.existing_paths.update({f"{remote_data_job_dir}/results", f"{remote_data_job_dir}/progress"})
+
+    _write_config(shared_dir, {"simulator": {"dataset_name": "demo"}})
+
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "gpu-12345")
+    states = iter([SlurmState(state="RUNNING"), SlurmState(state="COMPLETED", exit_code=0)])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    agent._run_job(
+        {
+            "job_id": job_id,
+            "config_path": "configs/demo.yaml",
+            "job_name": "GPU Demo",
+            "image": "calof/algorithms:sha-testgpu",
+            "deucalion_options": {
+                "gpus": 1,
+                "account": "f202508843cpcaa0g",
+                "partition": "normal-a100-80",
+                "datasets": [],
+            },
+        }
+    )
+
+    sbatch_remote = f"{remote_job_dir}/run.sbatch"
+    script = fake_ssh.remote_files[sbatch_remote]
+    assert "#SBATCH --gpus=1" in script
+    assert "singularity run --nv " in script
+
+
 def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeypatch):
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
