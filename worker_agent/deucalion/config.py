@@ -8,6 +8,19 @@ from typing import Any, Mapping
 
 DEFAULT_DEUCALION_REMOTE_ROOT = "/projects/F202508843CPCAA0/tiagocalof"
 
+DEUCALION_PARTITION_WALLTIME_LIMIT_SECONDS = {
+    "dev-arm": 4 * 60 * 60,
+    "normal-arm": 48 * 60 * 60,
+    "large-arm": 72 * 60 * 60,
+    "dev-x86": 4 * 60 * 60,
+    "normal-x86": 48 * 60 * 60,
+    "large-x86": 72 * 60 * 60,
+    "dev-a100-40": 4 * 60 * 60,
+    "normal-a100-40": 48 * 60 * 60,
+    "dev-a100-80": 4 * 60 * 60,
+    "normal-a100-80": 48 * 60 * 60,
+}
+
 
 @dataclass
 class SlurmProfile:
@@ -75,6 +88,74 @@ def _parse_command_mode(value: Any, default: str = "run") -> str:
     if mode not in {"run", "exec"}:
         raise ValueError(f"Invalid deucalion command_mode: {mode!r}. Expected 'run' or 'exec'")
     return mode
+
+
+def _format_walltime_limit(seconds: int) -> str:
+    hours = seconds // 3600
+    if seconds % 3600 == 0:
+        return f"{hours} hour" if hours == 1 else f"{hours} hours"
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _parse_slurm_time_limit_seconds(value: Any) -> int:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        raise ValueError("Slurm time limit must not be empty")
+
+    days = 0
+    time_part = text
+    has_day_prefix = "-" in text
+    if has_day_prefix:
+        day_part, time_part = text.split("-", 1)
+        if not day_part.isdigit() or not time_part:
+            raise ValueError(f"Invalid Slurm time limit: {text!r}")
+        days = int(day_part)
+
+    parts = time_part.split(":")
+    if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
+        raise ValueError(f"Invalid Slurm time limit: {text!r}")
+    values = [int(part) for part in parts]
+
+    if has_day_prefix:
+        hours = values[0]
+        minutes = values[1] if len(values) >= 2 else 0
+        seconds = values[2] if len(values) >= 3 else 0
+    elif len(values) == 1:
+        hours = 0
+        minutes = values[0]
+        seconds = 0
+    elif len(values) == 2:
+        hours = 0
+        minutes, seconds = values
+    else:
+        hours, minutes, seconds = values
+
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Invalid Slurm time limit: {text!r}")
+
+    total = days * 24 * 3600 + hours * 3600 + minutes * 60 + seconds
+    if total <= 0:
+        raise ValueError("Slurm time limit must be greater than zero")
+    return total
+
+
+def _validate_deucalion_walltime(profile: SlurmProfile) -> None:
+    partition = profile.partition.strip().lower()
+    max_seconds = DEUCALION_PARTITION_WALLTIME_LIMIT_SECONDS.get(partition)
+    if max_seconds is None:
+        allowed = ", ".join(DEUCALION_PARTITION_WALLTIME_LIMIT_SECONDS)
+        raise ValueError(f"Unknown Deucalion partition {profile.partition!r}. Allowed: {allowed}")
+
+    requested_seconds = _parse_slurm_time_limit_seconds(profile.time_limit)
+    if requested_seconds > max_seconds:
+        max_label = _format_walltime_limit(max_seconds)
+        raise ValueError(
+            f"Deucalion partition {partition!r} has a {max_label} walltime limit; "
+            f"requested {profile.time_limit!r}"
+        )
+    profile.partition = partition
 
 
 def _validate_relative_dataset_path(path: str) -> str:
@@ -190,6 +271,7 @@ def resolve_deucalion_job_config(
         gpus=max(0, gpus),
         modules=_as_list(_pick(source, "modules")) or _as_list(env.get("DEUCALION_MODULES")),
     )
+    _validate_deucalion_walltime(profile)
 
     remote_root = _as_str(
         env.get("DEUCALION_REMOTE_ROOT"),

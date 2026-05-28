@@ -44,6 +44,54 @@ def test_resolve_config_gpu_and_yaml_override():
     assert cfg.datasets == ["datasets/site_a/input.csv"]
 
 
+def test_resolve_config_rejects_walltime_above_partition_limit():
+    with pytest.raises(ValueError, match="48 hours"):
+        resolve_deucalion_job_config(
+            config={
+                "execution": {
+                    "deucalion": {
+                        "sif_path": "/remote/sim.sif",
+                        "partition": "normal-x86",
+                        "time": "49:00:00",
+                    }
+                }
+            },
+            env={},
+        )
+
+
+def test_resolve_config_allows_large_partition_walltime():
+    cfg = resolve_deucalion_job_config(
+        config={
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/remote/sim.sif",
+                    "partition": "large-x86",
+                    "time": "72:00:00",
+                }
+            }
+        },
+        env={},
+    )
+    assert cfg.profile.partition == "large-x86"
+    assert cfg.profile.time_limit == "72:00:00"
+
+
+def test_resolve_config_rejects_unknown_partition():
+    with pytest.raises(ValueError, match="Unknown Deucalion partition"):
+        resolve_deucalion_job_config(
+            config={
+                "execution": {
+                    "deucalion": {
+                        "sif_path": "/remote/sim.sif",
+                        "partition": "debug-x86",
+                    }
+                }
+            },
+            env={},
+        )
+
+
 def test_resolve_config_command_mode_env_default():
     cfg = resolve_deucalion_job_config(
         config={"execution": {"deucalion": {"sif_path": "/remote/sim.sif"}}},

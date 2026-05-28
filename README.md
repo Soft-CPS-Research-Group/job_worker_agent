@@ -66,6 +66,8 @@ Notes:
   `datasets/site_a/input.csv`).
 - The worker copies config + submits with `sbatch`, monitors with `squeue/sacct`,
   syncs logs incrementally, and reports final status back to the orchestrator.
+- Deucalion Slurm profiles are validated before `sbatch`: dev partitions are
+  capped at 4h, normal partitions at 48h, and large CPU/ARM partitions at 72h.
 - Artifact sync prioritizes the current simulator layout under
   `<remote_root>/runs/<job_id>/data/jobs/<job_id>/(results|progress)` and falls
   back to legacy `<remote_root>/runs/<job_id>/(results|progress)` if needed.
