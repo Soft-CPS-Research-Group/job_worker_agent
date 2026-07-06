@@ -1037,7 +1037,7 @@ def test_deucalion_executor_stops_when_backend_requeues(tmp_path, monkeypatch):
 
     assert cancel_called["value"] is True
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
-    assert status_calls == ["dispatched"]
+    assert status_calls == ["setup", "dispatched"]
 
 
 def test_deucalion_executor_stops_when_backend_marks_failed(tmp_path, monkeypatch):
@@ -1072,7 +1072,7 @@ def test_deucalion_executor_stops_when_backend_marks_failed(tmp_path, monkeypatc
 
     assert cancel_called["value"] is True
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
-    assert status_calls == ["dispatched"]
+    assert status_calls == ["setup", "dispatched"]
 
 
 def test_deucalion_executor_unknown_timeout(tmp_path, monkeypatch):

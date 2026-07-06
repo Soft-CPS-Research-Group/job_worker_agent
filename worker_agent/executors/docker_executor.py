@@ -241,7 +241,17 @@ class DockerExecutor(BaseExecutor):
                 "labels": labels,
                 "detach": True,
             }
+            self.runtime._post_status(
+                job_id,
+                "setup",
+                details={
+                    "executor_stage": "setup:image_pull",
+                    "image": run_kwargs["image"],
+                    "container_name": container_name,
+                },
+            )
             self._pull_image(client, run_kwargs["image"])
+            self.runtime._update_active_job(job_id, phase="setup:container_create")
             if device_requests:
                 run_kwargs["device_requests"] = device_requests
 

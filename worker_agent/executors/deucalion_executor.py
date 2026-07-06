@@ -1335,6 +1335,20 @@ class DeucalionExecutor(BaseExecutor):
             image_name = cfg.sif_image
             remote_root = self._remote_root(cfg)
             command_mode = cfg.command_mode
+            self.runtime._post_status(
+                job_id,
+                "setup",
+                details=self._build_status_details(
+                    slurm_job_id=None,
+                    command_mode=command_mode,
+                    datasets_synced=datasets_synced,
+                    datasets_skipped=datasets_skipped,
+                    image=image_name,
+                    slurm_state="PREPARING",
+                    executor_stage=preflight_stage,
+                ),
+                container_name=job_name,
+            )
 
             remote_job_dir = posixpath.join(remote_root, "runs", job_id)
             remote_data_dir = posixpath.join(remote_job_dir, "data")
@@ -1435,7 +1449,7 @@ class DeucalionExecutor(BaseExecutor):
             if (now - preflight_last_update) >= self.preflight_status_update_interval:
                 self.runtime._post_status(
                     job_id,
-                    "dispatched",
+                    "setup",
                     details=self._build_status_details(
                         slurm_job_id=None,
                         command_mode=command_mode,

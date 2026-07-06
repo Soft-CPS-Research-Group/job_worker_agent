@@ -156,7 +156,8 @@ def test_run_job_success(tmp_path):
     agent._run_job(job)
 
     status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
-    assert status_calls[0]["json"]["status"] == "running"
+    assert status_calls[0]["json"]["status"] == "setup"
+    assert status_calls[1]["json"]["status"] == "running"
     assert status_calls[-1]["json"]["status"] == "finished"
 
     log_path = shared_dir / "jobs" / "job1" / "logs" / "job1.log"
@@ -484,7 +485,8 @@ def test_run_job_stops_when_backend_requeued(tmp_path):
     assert container.stop_called is True
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls
-    assert all(status == "running" for status in status_calls)
+    assert status_calls[0] == "setup"
+    assert all(status == "running" for status in status_calls[1:])
 
 
 def test_run_job_stops_when_backend_failed(tmp_path):
@@ -523,7 +525,8 @@ def test_run_job_stops_when_backend_failed(tmp_path):
     assert container.stop_called is True
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls
-    assert all(status == "running" for status in status_calls)
+    assert status_calls[0] == "setup"
+    assert all(status == "running" for status in status_calls[1:])
 
 
 def test_heartbeat_retries_and_updates_timestamp_only_on_success(monkeypatch):
