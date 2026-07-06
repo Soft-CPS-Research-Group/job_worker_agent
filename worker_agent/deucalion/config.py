@@ -37,6 +37,7 @@ class SlurmProfile:
 class DeucalionJobConfig:
     remote_root: str
     sif_path: str
+    sif_path_explicit: bool
     sif_image: str | None
     sif_version: str | None
     command_mode: str
@@ -88,6 +89,13 @@ def _parse_command_mode(value: Any, default: str = "run") -> str:
     if mode not in {"run", "exec"}:
         raise ValueError(f"Invalid deucalion command_mode: {mode!r}. Expected 'run' or 'exec'")
     return mode
+
+
+def _is_gpu_partition(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return bool(normalized) and ("gpu" in normalized or "a100" in normalized or "h100" in normalized)
 
 
 def _format_walltime_limit(seconds: int) -> str:
@@ -244,7 +252,11 @@ def resolve_deucalion_job_config(
     source = options if options else deucalion
 
     env_gpus = _parse_int("DEUCALION_SLURM_GPUS", env.get("DEUCALION_SLURM_GPUS"), 0)
-    gpus = _parse_int("deucalion_options.gpus", _pick(source, "gpus"), env_gpus)
+    raw_gpus = _pick(source, "gpus")
+    raw_partition = _pick(source, "partition")
+    gpus = _parse_int("deucalion_options.gpus", raw_gpus, env_gpus)
+    if raw_gpus is None and gpus == 0 and _is_gpu_partition(raw_partition):
+        gpus = 1
 
     account_default = env.get("DEUCALION_SLURM_ACCOUNT_GPU") if gpus > 0 else env.get("DEUCALION_SLURM_ACCOUNT_CPU")
     if not account_default:
@@ -256,7 +268,7 @@ def resolve_deucalion_job_config(
 
     profile = SlurmProfile(
         account=_as_str(_pick(source, "account"), account_default),
-        partition=_as_str(_pick(source, "partition"), partition_default),
+        partition=_as_str(raw_partition, partition_default),
         time_limit=_as_str(_first_non_none(source, "time_limit", "time"), env.get("DEUCALION_SLURM_TIME", "04:00:00")),
         cpus_per_task=_parse_int(
             "deucalion_options.cpus_per_task",
@@ -271,15 +283,24 @@ def resolve_deucalion_job_config(
         gpus=max(0, gpus),
         modules=_as_list(_pick(source, "modules")) or _as_list(env.get("DEUCALION_MODULES")),
     )
+    if _is_gpu_partition(profile.partition) and profile.gpus <= 0:
+        raise ValueError(f"Deucalion GPU partition {profile.partition!r} requires gpus > 0")
+    if profile.gpus > 0 and not _is_gpu_partition(profile.partition):
+        raise ValueError(
+            f"Deucalion gpus={profile.gpus} requires a GPU partition, got {profile.partition!r}"
+        )
     _validate_deucalion_walltime(profile)
 
     remote_root = _as_str(
         env.get("DEUCALION_REMOTE_ROOT"),
         DEFAULT_DEUCALION_REMOTE_ROOT,
     ).rstrip("/")
+    sif_path_raw = _pick(source, "sif_path")
+    env_sif_path = env.get("DEUCALION_SIF_PATH")
+    sif_path_explicit = bool(sif_path_raw is not None or (env_sif_path and env_sif_path.strip()))
     sif_path = _as_str(
-        _pick(source, "sif_path"),
-        env.get("DEUCALION_SIF_PATH", posixpath.join(remote_root, "images", "cache", "simulator.sif")),
+        sif_path_raw,
+        env_sif_path or posixpath.join(remote_root, "images", "cache", "simulator.sif"),
     )
 
     sif_image = _as_str(
@@ -310,6 +331,7 @@ def resolve_deucalion_job_config(
     return DeucalionJobConfig(
         remote_root=remote_root,
         sif_path=sif_path,
+        sif_path_explicit=sif_path_explicit,
         sif_image=sif_image,
         sif_version=sif_version,
         command_mode=command_mode,

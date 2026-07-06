@@ -244,28 +244,40 @@ class DockerExecutor(BaseExecutor):
             self._pull_image(client, run_kwargs["image"])
             if device_requests:
                 run_kwargs["device_requests"] = device_requests
+
+            def _run_without_gpu_after_failure(exc: Exception):
+                if getattr(self.runtime, "_gpu_request_required", False):
+                    _LOGGER.error("GPU request failed and WORKER_REQUIRE_GPU is enabled: %s", exc)
+                    raise exc
+                _LOGGER.info("GPU request failed (%s); retrying without GPU", exc)
+                self._remove_stale_container(client, container_name)
+                run_kwargs.pop("device_requests", None)
+                try:
+                    return client.containers.run(**run_kwargs)
+                except Exception as retry_exc:
+                    if self._is_name_conflict_error(retry_exc):
+                        self._remove_stale_container(client, container_name)
+                        return client.containers.run(**run_kwargs)
+                    raise
+
             try:
                 container = client.containers.run(**run_kwargs)
             except Exception as exc:
-                if device_requests:
-                    _LOGGER.info("GPU request failed (%s); retrying without GPU", exc)
-                    self._remove_stale_container(client, container_name)
-                    run_kwargs.pop("device_requests", None)
-                    try:
-                        container = client.containers.run(**run_kwargs)
-                    except Exception as retry_exc:
-                        if self._is_name_conflict_error(retry_exc):
-                            self._remove_stale_container(client, container_name)
-                            container = client.containers.run(**run_kwargs)
-                        else:
-                            raise
-                elif self._is_name_conflict_error(exc):
+                if self._is_name_conflict_error(exc):
                     _LOGGER.warning(
                         "Container name conflict for '%s'; removing stale container and retrying once",
                         container_name,
                     )
                     self._remove_stale_container(client, container_name)
-                    container = client.containers.run(**run_kwargs)
+                    try:
+                        container = client.containers.run(**run_kwargs)
+                    except Exception as retry_exc:
+                        if device_requests:
+                            container = _run_without_gpu_after_failure(retry_exc)
+                        else:
+                            raise
+                elif device_requests:
+                    container = _run_without_gpu_after_failure(exc)
                 else:
                     raise
             container_id = getattr(container, "id", None)
@@ -318,6 +330,10 @@ class DockerExecutor(BaseExecutor):
                     log_file.flush()
 
             result = container.wait()
+            monitor_stop.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=1)
+                monitor_thread = None
             exit_code = None
             if isinstance(result, dict):
                 exit_code = result.get("StatusCode")

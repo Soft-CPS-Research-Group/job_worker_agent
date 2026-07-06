@@ -44,6 +44,42 @@ def test_resolve_config_gpu_and_yaml_override():
     assert cfg.datasets == ["datasets/site_a/input.csv"]
 
 
+def test_resolve_config_infers_gpu_from_gpu_partition():
+    cfg = resolve_deucalion_job_config(
+        config={
+            "execution": {
+                "deucalion": {
+                    "sif_path": "/remote/sim.sif",
+                    "partition": "normal-a100-80",
+                }
+            }
+        },
+        env={
+            "DEUCALION_SLURM_ACCOUNT_GPU": "f202508843cpcaa0g",
+            "DEUCALION_SLURM_PARTITION_GPU": "normal-a100-80",
+        },
+    )
+    assert cfg.profile.gpus == 1
+    assert cfg.profile.account == "f202508843cpcaa0g"
+    assert cfg.profile.partition == "normal-a100-80"
+
+
+def test_resolve_config_rejects_gpus_on_cpu_partition():
+    with pytest.raises(ValueError, match="requires a GPU partition"):
+        resolve_deucalion_job_config(
+            config={
+                "execution": {
+                    "deucalion": {
+                        "sif_path": "/remote/sim.sif",
+                        "partition": "normal-x86",
+                        "gpus": 1,
+                    }
+                }
+            },
+            env={},
+        )
+
+
 def test_resolve_config_rejects_walltime_above_partition_limit():
     with pytest.raises(ValueError, match="48 hours"):
         resolve_deucalion_job_config(
@@ -106,6 +142,19 @@ def test_resolve_config_defaults_sif_path_from_remote_root():
         env={"DEUCALION_REMOTE_ROOT": "/projects/demo/root"},
     )
     assert cfg.sif_path == "/projects/demo/root/images/cache/simulator.sif"
+    assert cfg.sif_path_explicit is False
+
+
+def test_resolve_config_marks_explicit_sif_path():
+    cfg = resolve_deucalion_job_config(
+        config={"execution": {"deucalion": {}}},
+        env={
+            "DEUCALION_REMOTE_ROOT": "/projects/demo/root",
+            "DEUCALION_SIF_PATH": "/projects/demo/root/images/simulator.sif",
+        },
+    )
+    assert cfg.sif_path == "/projects/demo/root/images/simulator.sif"
+    assert cfg.sif_path_explicit is True
 
 
 def test_resolve_config_sif_version_from_yaml_and_env():

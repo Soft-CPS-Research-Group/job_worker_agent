@@ -4,7 +4,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Optional
 
-from .ssh_client import SSHClient
+from .ssh_client import SSHClient, SSHCommandError
 
 
 ACTIVE_STATES = {
@@ -126,11 +126,14 @@ def query_state(ssh: SSHClient, slurm_job_id: str) -> SlurmState:
             partition = _clean_field(parts[1])
             pending_jobs: list[str] = []
             if state == "PENDING" and partition:
-                pending_raw = ssh.run(
-                    f"squeue -h -p {shlex.quote(partition)} -t PD -o %i",
-                    timeout=30,
-                    check=False,
-                )
+                try:
+                    pending_raw = ssh.run(
+                        f"squeue -h -p {shlex.quote(partition)} -t PD -o %i",
+                        timeout=10,
+                        check=False,
+                    )
+                except SSHCommandError:
+                    pending_raw = ""
                 pending_jobs = [item.strip() for item in pending_raw.splitlines() if item.strip()]
             queue_position = None
             jobs_ahead = None

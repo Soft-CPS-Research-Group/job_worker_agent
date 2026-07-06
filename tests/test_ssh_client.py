@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
-from worker_agent.deucalion.ssh_client import SSHClient, SSHSettings
+import pytest
+
+from worker_agent.deucalion.ssh_client import SSHClient, SSHCommandError, SSHSettings
 
 
 def _settings() -> SSHSettings:
@@ -46,3 +49,14 @@ def test_scp_uses_uppercase_p_for_port(monkeypatch):
     assert "-P" in captured["cmd"]
     assert "-p" not in captured["cmd"]
     assert "22" in captured["cmd"]
+
+
+def test_ssh_run_timeout_raises_ssh_command_error(monkeypatch):
+    def _fake_run(cmd, text, capture_output, timeout):  # noqa: ARG001
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+    monkeypatch.setattr("worker_agent.deucalion.ssh_client.subprocess.run", _fake_run)
+    client = SSHClient(_settings())
+
+    with pytest.raises(SSHCommandError, match="timed out after 30s"):
+        client.run("squeue -h -p normal-a100-80 -t PD -o %i", timeout=30, check=False)

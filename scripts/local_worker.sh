@@ -7,6 +7,7 @@ Usage: local_worker.sh <command>
 
 Commands:
   start     Mount the NFS share (if needed) and start the worker via docker compose
+  serve     Alias for start
   stop      Request a graceful shutdown, stop the compose stack, and unmount the share
             Use 'stop --force' to kill the worker/job containers immediately
   restart   Stop then start
@@ -18,11 +19,14 @@ Environment overrides (export before running):
   NFS_EXPORT             Export path on the server (default: /opt/opeva_shared_data)
   MOUNT_POINT            Local mount point (default: /mnt/opeva_shared)
   NFS_MOUNT_OPTS         Options passed to mount -o (default: vers=4.1,proto=tcp,port=2049)
+  LOCAL_WORKER_ENV_FILE  Optional env file (default: <repo>/.local-worker.env if present)
   OPEVA_SERVER           Job Orchestrator URL (default: http://localhost:8011)
   WORKER_ID              Worker identifier (default: <hostname>-local)
   WORKER_IMAGE           Worker container image (default: calof/job_worker_agent:latest)
   WORKER_EXECUTOR        Worker executor mode (default: docker)
   WORKER_ENABLE_GPU      Enable GPU requests for docker executor (default: false)
+  WORKER_REQUIRE_GPU     Fail the job if Docker cannot allocate GPU (default: false)
+  WORKER_REMAP_DATA_VOLUME Remap orchestrator /data bind to local OPEVA_SHARED_DIR (default: true)
   WORKER_CONTAINER_NAME  Container name (default: job-worker-<WORKER_ID>)
   LOG_LEVEL              Logging level (default: INFO)
   POLL_INTERVAL          Queue poll interval (default: 5)
@@ -39,6 +43,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.local.yml"
 SERVICE_NAME="worker_agent"
 
+LOCAL_WORKER_ENV_FILE="${LOCAL_WORKER_ENV_FILE:-${REPO_ROOT}/.local-worker.env}"
+if [[ -f "$LOCAL_WORKER_ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$LOCAL_WORKER_ENV_FILE"
+  set +a
+fi
+
 NFS_SERVER="${NFS_SERVER:-softcps}"
 NFS_EXPORT="${NFS_EXPORT:-/opt/opeva_shared_data}"
 MOUNT_POINT="${MOUNT_POINT:-/mnt/opeva_shared}"
@@ -48,6 +60,8 @@ WORKER_ID="${WORKER_ID:-$(hostname)-local}"
 WORKER_IMAGE="${WORKER_IMAGE:-calof/job_worker_agent:latest}"
 WORKER_EXECUTOR="${WORKER_EXECUTOR:-docker}"
 WORKER_ENABLE_GPU="${WORKER_ENABLE_GPU:-false}"
+WORKER_REQUIRE_GPU="${WORKER_REQUIRE_GPU:-false}"
+WORKER_REMAP_DATA_VOLUME="${WORKER_REMAP_DATA_VOLUME:-true}"
 WORKER_CONTAINER_NAME="${WORKER_CONTAINER_NAME:-job-worker-${WORKER_ID}}"
 OPEVA_SERVER="${OPEVA_SERVER:-http://localhost:8011}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
@@ -114,6 +128,8 @@ export_compose_env() {
 export WORKER_IMAGE
 export WORKER_EXECUTOR
 export WORKER_ENABLE_GPU
+export WORKER_REQUIRE_GPU
+export WORKER_REMAP_DATA_VOLUME
 export WORKER_CONTAINER_NAME
 export OPEVA_SERVER
 export WORKER_ID
@@ -196,9 +212,12 @@ stop_worker() {
       fi
     elif container_running; then
       echo "Requesting graceful shutdown (SIGUSR1)"
+      docker update --restart=no "${WORKER_CONTAINER_NAME}" >/dev/null 2>&1 || true
       docker kill --signal=USR1 "${WORKER_CONTAINER_NAME}" >/dev/null
       if ! wait_for_stop; then
-        echo "Forcing container stop"
+        echo "Graceful shutdown is still pending; leaving worker running."
+        echo "Re-run this command to keep waiting, increase SHUTDOWN_TIMEOUT, or use 'stop --force' to abort."
+        return 1
       fi
     else
       echo "Worker container already stopped"
@@ -238,7 +257,7 @@ main() {
     shift
   fi
   case "$cmd" in
-    start) start_worker ;;
+    start|serve) start_worker ;;
     stop)
       if [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]]; then
         FORCE_STOP=1

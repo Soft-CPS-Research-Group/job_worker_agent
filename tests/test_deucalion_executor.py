@@ -351,6 +351,7 @@ def test_deucalion_executor_happy_path_default_run_and_incremental_logs(tmp_path
     assert "--bind /projects/F202508843CPCAA0/tiagocalof/runs/job-1/data:/data " in fake_ssh.remote_files[sbatch_remote]
     assert "export OPEVA_BASE_DIR=/data" in fake_ssh.remote_files[sbatch_remote]
     assert "--base-dir /data" in fake_ssh.remote_files[sbatch_remote]
+    assert "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif" in fake_ssh.remote_files[sbatch_remote]
 
     # log sync is incremental: content appears once even with multiple sync loops
     log_path = shared_dir / "jobs" / job_id / "logs" / f"{job_id}.log"
@@ -425,13 +426,7 @@ def test_deucalion_executor_refreshes_sif_when_version_changes(tmp_path, monkeyp
 
     _write_config(
         shared_dir,
-        {
-            "execution": {
-                "deucalion": {
-                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
-                }
-            }
-        },
+        {"experiment": {"name": "Demo", "run_name": "VersionedSif"}},
     )
 
     monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "12345")
@@ -475,13 +470,7 @@ def test_deucalion_executor_rejects_untagged_image(tmp_path):
 
     _write_config(
         shared_dir,
-        {
-            "execution": {
-                "deucalion": {
-                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
-                }
-            }
-        },
+        {"experiment": {"name": "Demo", "run_name": "UntaggedImage"}},
     )
 
     agent = _build_agent(shared_dir, session, fake_ssh)
@@ -518,13 +507,7 @@ def test_deucalion_executor_uses_job_image_override(tmp_path, monkeypatch):
 
     _write_config(
         shared_dir,
-        {
-            "execution": {
-                "deucalion": {
-                    "sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
-                }
-            }
-        },
+        {"experiment": {"name": "Demo", "run_name": "ImageOverride"}},
     )
 
     monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "22345")

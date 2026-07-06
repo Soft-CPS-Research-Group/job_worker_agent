@@ -65,12 +65,20 @@ class SSHClient:
 
     def run(self, command: str, timeout: int = 60, check: bool = True) -> str:
         cmd = ["ssh", *self._ssh_base(), self._remote(), command]
-        completed = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
+        try:
+            completed = subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SSHCommandError(
+                f"SSH command timed out after {timeout}s: {command}",
+                returncode=None,
+                stdout=(exc.stdout or ""),
+                stderr=(exc.stderr or ""),
+            ) from exc
         # SSH transport/auth failures are reported with rc=255 and should always
         # be treated as connectivity errors, even when command check=False.
         if completed.returncode == 255:

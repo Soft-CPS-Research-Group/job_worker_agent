@@ -80,29 +80,56 @@ For ad-hoc workers on a notebook that needs to mount the shared NFS directory
 only while the agent runs, the `scripts/local_worker.sh` wrapper handles the
 full lifecycle:
 
+Quick command notes live in [`docs/laptop_worker_notes.md`](docs/laptop_worker_notes.md).
+
 ```bash
-# Export overrides once per session (or source a file with these values)
+# Export overrides once per session (or put them in .local-worker.env)
 export WORKER_ID=tiago-laptop
 export OPEVA_SERVER=http://193.136.62.78:8011    # orchestrator reachable via VPN/public IP
+export WORKER_ENABLE_GPU=true
+export WORKER_REQUIRE_GPU=true                  # fail instead of silently falling back to CPU
 export SHUTDOWN_TIMEOUT=900                     # allow 15 minutes for graceful stop
 
 # Mount the share (if needed) and start the worker container
-sudo scripts/local_worker.sh start
+sudo scripts/local_worker.sh serve
 
 # Request graceful shutdown, stop the compose stack, and unmount the share
 sudo WORKER_ID=tiago-laptop scripts/local_worker.sh stop
 ```
 
 Tune the behaviour by exporting variables (e.g. `NFS_SERVER`, `MOUNT_POINT`,
-`WORKER_ID`, `WORKER_IMAGE`, `OPEVA_SERVER`) before running the script. The
-compose definition lives in `docker-compose.local.yml`. The worker should point
-to the orchestrator using the address that is accessible from the laptop (typically
-the server's public/VPN-routed IP, e.g. `http://193.136.62.78:8011`).
+`WORKER_ID`, `WORKER_IMAGE`, `OPEVA_SERVER`) before running the script, or create
+an untracked `.local-worker.env` in this repo:
+
+```bash
+WORKER_ID=tiago-laptop
+OPEVA_SERVER=http://193.136.62.78:8011
+NFS_SERVER=softcps
+NFS_EXPORT=/opt/opeva_shared_data
+MOUNT_POINT=/mnt/opeva_shared
+WORKER_ENABLE_GPU=true
+WORKER_REQUIRE_GPU=true
+SHUTDOWN_TIMEOUT=900
+```
+
+Then the daily command is:
+
+```bash
+sudo scripts/local_worker.sh serve
+```
+
+The compose definition lives in `docker-compose.local.yml`. The worker should
+point to the orchestrator using the address that is accessible from the laptop
+(typically the server's public/VPN-routed IP, e.g. `http://193.136.62.78:8011`).
+The worker uses the shared NFS mount for configs, logs, progress and results.
+The local helper enables `WORKER_REMAP_DATA_VOLUME=true`, which remaps the
+orchestrator-provided `/data` bind to the laptop's local `OPEVA_SHARED_DIR`, so
+the laptop mount does not need to use the same absolute path as the server.
 
 If you prefer a one-liner without `export`, prefix the command:
 
 ```bash
-sudo WORKER_ID=tiago-laptop OPEVA_SERVER=http://193.136.62.78:8011 SHUTDOWN_TIMEOUT=900 scripts/local_worker.sh start
+sudo WORKER_ID=tiago-laptop OPEVA_SERVER=http://193.136.62.78:8011 WORKER_ENABLE_GPU=true WORKER_REQUIRE_GPU=true SHUTDOWN_TIMEOUT=900 scripts/local_worker.sh serve
 ```
 
 While the worker runs you can:
@@ -116,10 +143,18 @@ While the worker runs you can:
 Need to abort immediately? `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh stop --force`
 removes the worker and any job containers without waiting for the current job to finish,
 and posts a `failed` status with `error="force-stop"` for each running job.
+The normal `stop` command is controlled: it sends `SIGUSR1`, the worker stops
+accepting new jobs, finishes any current job, reports the final status, exits,
+and only then the wrapper brings the compose stack down and unmounts the share.
+The wrapper disables Docker's restart policy before the signal so a clean worker
+exit is not restarted by `restart: unless-stopped`.
+If `SHUTDOWN_TIMEOUT` expires, the wrapper leaves the worker running instead of
+forcing it; re-run `stop`, increase `SHUTDOWN_TIMEOUT`, or use `stop --force`.
 The worker always passes the job id as `--job_id <value>` to match the simulator
 entrypoint. GPU requests are controlled explicitly via `WORKER_ENABLE_GPU=true`
-(recommended only on GPU-capable hosts). If enabled, the worker falls back to CPU
-when Docker cannot satisfy GPU allocation.
+(recommended only on GPU-capable hosts). By default, if enabled, the worker falls
+back to CPU when Docker cannot satisfy GPU allocation. Set
+`WORKER_REQUIRE_GPU=true` on a GPU-serving laptop to fail fast instead.
 
 ## Manual setup
 
@@ -158,6 +193,9 @@ Environment variables:
 | `WORKER_EXECUTOR` | `docker` (default) or `deucalion`. |
 | `WORKER_VERSION` | Optional override for the version reported to the orchestrator; otherwise the installed package version is used. |
 | `OPEVA_SHARED_DIR` | Local path to the mounted NFS share. |
+| `WORKER_ENABLE_GPU` | Requests GPU access for Docker jobs. |
+| `WORKER_REQUIRE_GPU` | Fails jobs if Docker cannot satisfy the GPU request instead of falling back to CPU. |
+| `WORKER_REMAP_DATA_VOLUME` | Remaps orchestrator-provided `/data` volume binds to local `OPEVA_SHARED_DIR` (default `false`; local helper sets `true`). |
 | `POLL_INTERVAL` | Seconds between queue polls when idle. |
 | `WORKER_HEARTBEAT_INTERVAL` | Heartbeat interval in seconds. |
 | `STATUS_POLL_INTERVAL` | How often to check job status while running (seconds). |

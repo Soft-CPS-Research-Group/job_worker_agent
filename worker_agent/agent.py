@@ -33,8 +33,8 @@ _TERMINAL_JOB_STATUSES = {"finished", "failed", "stopped", "canceled"}
 _JOB_THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
+def _env_flag(name: str, default: bool = False, env: Mapping[str, str] | None = None) -> bool:
+    value = (env or os.environ).get(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -78,12 +78,14 @@ class WorkerAgent:
         self._job_threads: dict[str, threading.Thread] = {}
         self._last_job_id: Optional[str] = None
         self._last_terminal_status: Optional[str] = None
-        self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", False)
+        self._env = dict(env or os.environ)
+        self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", False, self._env)
+        self._gpu_request_required = _env_flag("WORKER_REQUIRE_GPU", False, self._env)
+        self._remap_data_volume = _env_flag("WORKER_REMAP_DATA_VOLUME", False, self._env)
         self._last_request_failure: Optional[str] = None
         self._has_processed_job = False
         self._pending_terminal_statuses: deque[dict[str, Any]] = deque()
         self._pending_terminal_statuses_lock = threading.Lock()
-        self._env = dict(env or os.environ)
 
         self.executor = (executor or self._env.get("WORKER_EXECUTOR", "docker")).strip().lower()
         if self.executor == "docker":
@@ -191,6 +193,8 @@ class WorkerAgent:
             "executor": self.executor,
             "worker_version": self._worker_version,
             "gpu_enabled": self._gpu_request_enabled,
+            "gpu_required": self._gpu_request_required,
+            "shared_dir": self.shared_dir,
             "max_active_jobs": self.max_active_jobs,
             "active_job_id": first_active.get("job_id") if first_active else None,
             "active_job_count": len(active_jobs),
@@ -580,6 +584,8 @@ class WorkerAgent:
                     container = v.get("container")
                     mode = v.get("mode", "rw")
                     if host and container:
+                        if self._remap_data_volume and os.path.normpath(str(container)) == "/data":
+                            host = self.shared_dir
                         out[host] = {"bind": container, "mode": mode}
                 except Exception:
                     continue

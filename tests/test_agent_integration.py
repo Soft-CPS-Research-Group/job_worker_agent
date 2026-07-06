@@ -16,13 +16,17 @@ class ScriptedJob:
     exit_code: int
     logs: List[bytes]
     status_sequence: List[str] = field(default_factory=list)
+    volumes: Optional[List[Dict[str, str]]] = None
 
-    def payload(self) -> Dict[str, str]:
-        return {
+    def payload(self) -> Dict[str, object]:
+        payload: Dict[str, object] = {
             "job_id": self.job_id,
             "config_path": self.config_path,
             "job_name": self.job_name,
         }
+        if self.volumes is not None:
+            payload["volumes"] = self.volumes
+        return payload
 
 
 class FakeResponse:
@@ -118,13 +122,19 @@ class ScriptedContainer:
 
 
 class ScriptedDockerClient:
-    def __init__(self, jobs: List[ScriptedJob], fail_on_gpu: bool = False):
+    def __init__(
+        self,
+        jobs: List[ScriptedJob],
+        fail_on_gpu: bool = False,
+        name_conflict_once: bool = False,
+    ):
         self._containers: Dict[str, ScriptedContainer] = {
             job.job_id: ScriptedContainer(job) for job in jobs
         }
         self.run_calls: List[Dict[str, object]] = []
         self.containers = self
         self.fail_on_gpu = fail_on_gpu
+        self.name_conflict_once = name_conflict_once
 
     def run(self, **kwargs):
         command = kwargs.get("command", "")
@@ -142,9 +152,18 @@ class ScriptedDockerClient:
                 "device_requests": device_requests,
             }
         )
+        if self.name_conflict_once:
+            self.name_conflict_once = False
+            raise RuntimeError(f'Conflict. The container name "{container.name}" is already in use')
         if self.fail_on_gpu and device_requests:
             raise RuntimeError("device requests not supported")
         return container
+
+    def get(self, name: str):
+        for container in self._containers.values():
+            if container.name == name or container.id == name:
+                return container
+        raise RuntimeError(f"container not found: {name}")
 
     def _extract_job_id(self, command: str) -> str:
         parts = command.split()
@@ -283,3 +302,173 @@ def test_worker_gpu_auto_fallback(tmp_path):
     assert len(docker_client.run_calls) >= 2
     assert docker_client.run_calls[0]["device_requests"], "first attempt should request GPU"
     assert docker_client.run_calls[-1]["device_requests"] is None, "fallback should omit GPU request"
+
+
+def test_worker_remaps_orchestrator_data_volume_to_local_shared_dir(tmp_path):
+    shared_dir = tmp_path / "laptop-share"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-volume",
+        config_path="cfg/volume.yaml",
+        job_name="Job Volume",
+        exit_code=0,
+        logs=[b"volume job\n"],
+        volumes=[
+            {
+                "host": "/opt/opeva_shared_data",
+                "container": "/data",
+                "mode": "rw",
+            }
+        ],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient([job])
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="tiago-laptop",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+        env={"WORKER_REMAP_DATA_VOLUME": "true"},
+    )
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    assert docker_client.run_calls[0]["volumes"] == {str(shared_dir): {"bind": "/data", "mode": "rw"}}
+
+
+def test_worker_preserves_orchestrator_data_volume_by_default(tmp_path):
+    shared_dir = tmp_path / "worker-share"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-volume-default",
+        config_path="cfg/volume.yaml",
+        job_name="Job Volume Default",
+        exit_code=0,
+        logs=[b"volume job\n"],
+        volumes=[
+            {
+                "host": "/opt/opeva_shared_data",
+                "container": "/data",
+                "mode": "rw",
+            }
+        ],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient([job])
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="server-worker",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+    )
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    assert docker_client.run_calls[0]["volumes"] == {"/opt/opeva_shared_data": {"bind": "/data", "mode": "rw"}}
+
+
+def test_worker_gpu_required_fails_without_cpu_fallback(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-gpu-required",
+        config_path="cfg/gpu.yaml",
+        job_name="Job GPU Required",
+        exit_code=0,
+        logs=[b"gpu job\n"],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient([job], fail_on_gpu=True)
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="worker-gpu-required",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+    )
+    agent._gpu_request_enabled = True  # type: ignore[attr-defined]
+    agent._gpu_request_required = True  # type: ignore[attr-defined]
+    agent._build_device_requests = lambda job=None: ["gpu-request"]  # type: ignore[assignment]
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    assert len(docker_client.run_calls) == 1
+    assert docker_client.run_calls[0]["device_requests"], "GPU should be requested"
+    final_status = backend.job_status_posts[-1]
+    assert final_status["status"] == "failed"
+    assert "device requests not supported" in str(final_status.get("error"))
+
+
+def test_worker_gpu_required_retries_stale_name_conflict_with_gpu_request(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-gpu-conflict",
+        config_path="cfg/gpu.yaml",
+        job_name="Job GPU Conflict",
+        exit_code=0,
+        logs=[b"gpu job\n"],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient([job], name_conflict_once=True)
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="worker-gpu-required",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+    )
+    agent._gpu_request_enabled = True  # type: ignore[attr-defined]
+    agent._gpu_request_required = True  # type: ignore[attr-defined]
+    agent._build_device_requests = lambda job=None: ["gpu-request"]  # type: ignore[assignment]
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    assert len(docker_client.run_calls) == 2
+    assert docker_client.run_calls[0]["device_requests"], "first attempt should request GPU"
+    assert docker_client.run_calls[1]["device_requests"], "stale-name retry should preserve GPU"
+    assert docker_client._containers[job.job_id].removed is True
+    final_status = backend.job_status_posts[-1]
+    assert final_status["status"] == "finished"

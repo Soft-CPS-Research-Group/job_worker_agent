@@ -855,7 +855,8 @@ class DeucalionExecutor(BaseExecutor):
         tag = self._sanitize_sif_tag(tag)
         cfg.sif_image = image_ref
         cfg.sif_version = tag
-        cfg.sif_path = self._remote_sif_path_for_tag(cfg, tag)
+        if not cfg.sif_path_explicit:
+            cfg.sif_path = self._remote_sif_path_for_tag(cfg, tag)
         return cfg
 
     def _build_singularity_command(self, cfg: DeucalionJobConfig, remote_data_dir: str, command: str) -> str:
