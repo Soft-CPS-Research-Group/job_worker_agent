@@ -109,6 +109,7 @@ check_prereqs() {
   command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }
   command -v mountpoint >/dev/null 2>&1 || { echo "mountpoint is required" >&2; exit 1; }
   command -v findmnt >/dev/null 2>&1 || { echo "findmnt is required" >&2; exit 1; }
+  command -v timeout >/dev/null 2>&1 || { echo "timeout is required" >&2; exit 1; }
   if ! docker compose version >/dev/null 2>&1; then
     echo "docker compose plugin is required" >&2
     exit 1
@@ -119,22 +120,48 @@ check_prereqs() {
   fi
 }
 
+MOUNTPOINT_RC=1
+
+mountpoint_state() {
+  set +e
+  timeout "$NFS_CHECK_TIMEOUT" mountpoint -q "$MOUNT_POINT"
+  MOUNTPOINT_RC=$?
+  set -e
+  return 0
+}
+
+mountpoint_is_mounted() {
+  mountpoint_state
+  [[ "$MOUNTPOINT_RC" -eq 0 ]]
+}
+
 mount_share() {
   mkdir -p "$MOUNT_POINT"
-  if mountpoint -q "$MOUNT_POINT"; then
+  mountpoint_state
+  if [[ "$MOUNTPOINT_RC" -eq 0 ]]; then
     echo "Mount point ${MOUNT_POINT} already mounted"
     return 0
+  fi
+  if [[ "$MOUNTPOINT_RC" -eq 124 ]]; then
+    echo "Mount point check timed out for ${MOUNT_POINT}; NFS may be stale" >&2
+    return 1
   fi
   echo "Mounting ${NFS_SERVER}:${NFS_EXPORT} -> ${MOUNT_POINT}"
   mount -t nfs4 -o "$NFS_MOUNT_OPTS" "${NFS_SERVER}:${NFS_EXPORT}" "$MOUNT_POINT"
 }
 
 findmnt_source() {
-  findmnt -rn -o SOURCE --target "$MOUNT_POINT" 2>/dev/null || true
+  timeout "$NFS_CHECK_TIMEOUT" findmnt -rn -o SOURCE --target "$MOUNT_POINT" 2>/dev/null || true
 }
 
 unmount_share() {
-  if ! mountpoint -q "$MOUNT_POINT"; then
+  mountpoint_state
+  if [[ "$MOUNTPOINT_RC" -ne 0 && "$MOUNTPOINT_RC" -ne 124 ]]; then
+    return 0
+  fi
+  if [[ "$MOUNTPOINT_RC" -eq 124 ]]; then
+    echo "Mount point check timed out for ${MOUNT_POINT}; attempting forced lazy unmount"
+    timeout 15 umount -fl "$MOUNT_POINT" >/dev/null 2>&1 || true
     return 0
   fi
   local current_source
@@ -144,7 +171,7 @@ unmount_share() {
     return 0
   fi
   echo "Unmounting ${MOUNT_POINT}"
-  umount "$MOUNT_POINT"
+  timeout 15 umount "$MOUNT_POINT" || timeout 15 umount -fl "$MOUNT_POINT" >/dev/null 2>&1 || true
 }
 
 container_running() {
@@ -212,7 +239,7 @@ route_to_target() {
 }
 
 nfs_access_ok() {
-  mountpoint -q "$MOUNT_POINT" || return 1
+  mountpoint_is_mounted || return 1
   timeout "$NFS_CHECK_TIMEOUT" stat "$MOUNT_POINT" >/dev/null 2>&1
 }
 
@@ -220,7 +247,7 @@ watchdog_running() {
   [[ -f "$WATCHDOG_PID_FILE" ]] || return 1
   local pid
   pid="$(cat "$WATCHDOG_PID_FILE" 2>/dev/null || true)"
-  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+  [[ -n "$pid" && -d "/proc/$pid" ]]
 }
 
 start_watchdog() {
@@ -242,7 +269,11 @@ stop_watchdog() {
   local pid
   pid="$(cat "$WATCHDOG_PID_FILE")"
   echo "Stopping VPN/NFS watchdog (pid ${pid})"
+  pkill -TERM -P "$pid" >/dev/null 2>&1 || true
   kill "$pid" >/dev/null 2>&1 || true
+  sleep 1
+  pkill -KILL -P "$pid" >/dev/null 2>&1 || true
+  kill -KILL "$pid" >/dev/null 2>&1 || true
   rm -f "$WATCHDOG_PID_FILE"
 }
 
@@ -254,11 +285,16 @@ watchdog_loop() {
     if ! ensure_vpn; then
       echo "[$(date --iso-8601=seconds)] VPN check failed"
     fi
-    if ! mountpoint -q "$MOUNT_POINT"; then
+    mountpoint_state
+    if [[ "$MOUNTPOINT_RC" -ne 0 && "$MOUNTPOINT_RC" -ne 124 ]]; then
       echo "[$(date --iso-8601=seconds)] NFS not mounted; attempting mount"
       mount_share || echo "[$(date --iso-8601=seconds)] NFS mount failed"
+    elif [[ "$MOUNTPOINT_RC" -eq 124 ]]; then
+      echo "[$(date --iso-8601=seconds)] NFS mount check timed out; route: $(route_to_target)"
+      recover_stale_mount_if_idle || true
     elif ! nfs_access_ok; then
       echo "[$(date --iso-8601=seconds)] NFS mounted but not responding; route: $(route_to_target)"
+      recover_stale_mount_if_idle || true
     fi
     sleep "$VPN_CHECK_INTERVAL"
   done
@@ -285,6 +321,18 @@ job_containers_for_worker() {
     docker ps -aq --filter "label=opeva.worker_id=${WORKER_ID}" 2>/dev/null || true
     docker ps -aq --filter "name=^job_${WORKER_ID}_" 2>/dev/null || true
   } | awk 'NF && !seen[$0]++'
+}
+
+recover_stale_mount_if_idle() {
+  local containers=()
+  mapfile -t containers < <(job_containers_for_worker)
+  if [[ ${#containers[@]} -gt 0 ]]; then
+    echo "[$(date --iso-8601=seconds)] Active job containers present; leaving stale NFS mount in place"
+    return 1
+  fi
+  echo "[$(date --iso-8601=seconds)] No active job containers; remounting NFS"
+  unmount_share
+  mount_share
 }
 
 force_remove_jobs() {
@@ -379,8 +427,12 @@ status_worker() {
   echo "Agent image: ${WORKER_AGENT_IMAGE}"
   echo "Default job image: ${WORKER_JOB_IMAGE}"
   echo "Mount point: ${MOUNT_POINT}"
-  if mountpoint -q "$MOUNT_POINT"; then
+  mountpoint_state
+  local mount_rc="$MOUNTPOINT_RC"
+  if [[ "$mount_rc" -eq 0 ]]; then
     echo "  mounted from $(findmnt_source)"
+  elif [[ "$mount_rc" -eq 124 ]]; then
+    echo "  mount check timed out; NFS may be stale"
   else
     echo "  not mounted"
   fi
@@ -397,7 +449,7 @@ status_worker() {
   else
     echo "VPN/NFS watchdog: stopped"
   fi
-  if mountpoint -q "$MOUNT_POINT"; then
+  if [[ "$mount_rc" -eq 0 ]]; then
     if nfs_access_ok; then
       echo "NFS access: ok"
     else
