@@ -1,8 +1,6 @@
-version: "3.9"
-
 services:
   worker_agent:
-    image: ${WORKER_IMAGE:-calof/job_worker_agent:latest}
+    image: ${WORKER_AGENT_IMAGE:-calof/job_worker_agent:latest}
     container_name: ${WORKER_CONTAINER_NAME:-worker-agent-local}
     environment:
       OPEVA_SERVER: ${OPEVA_SERVER:-http://localhost:8011}
@@ -11,6 +9,7 @@ services:
       WORKER_ENABLE_GPU: ${WORKER_ENABLE_GPU:-false}
       WORKER_REQUIRE_GPU: ${WORKER_REQUIRE_GPU:-false}
       WORKER_REMAP_DATA_VOLUME: ${WORKER_REMAP_DATA_VOLUME:-true}
+      WORKER_IMAGE: ${WORKER_JOB_IMAGE:-calof/opeva_simulator:latest}
       OPEVA_SHARED_DIR: ${OPEVA_SHARED_DIR:-/mnt/opeva_shared}
       POLL_INTERVAL: ${POLL_INTERVAL:-5}
       WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-30}

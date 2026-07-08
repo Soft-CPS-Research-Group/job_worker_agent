@@ -11,7 +11,13 @@ COPY worker_agent ./worker_agent
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-client curl ca-certificates tar \
     && ORAS_VERSION=1.2.3 \
-    && curl -sSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" -o /tmp/oras.tgz \
+    && arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+        amd64) oras_arch="amd64" ;; \
+        arm64) oras_arch="arm64" ;; \
+        *) echo "Unsupported ORAS architecture: $arch" >&2; exit 1 ;; \
+    esac \
+    && curl -sSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${oras_arch}.tar.gz" -o /tmp/oras.tgz \
     && tar -xzf /tmp/oras.tgz -C /tmp oras \
     && install -m 0755 /tmp/oras /usr/local/bin/oras \
     && rm -f /tmp/oras /tmp/oras.tgz \

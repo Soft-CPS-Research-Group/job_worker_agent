@@ -17,6 +17,7 @@ class ScriptedJob:
     logs: List[bytes]
     status_sequence: List[str] = field(default_factory=list)
     volumes: Optional[List[Dict[str, str]]] = None
+    image: Optional[str] = None
 
     def payload(self) -> Dict[str, object]:
         payload: Dict[str, object] = {
@@ -26,6 +27,8 @@ class ScriptedJob:
         }
         if self.volumes is not None:
             payload["volumes"] = self.volumes
+        if self.image is not None:
+            payload["image"] = self.image
         return payload
 
 
@@ -121,18 +124,51 @@ class ScriptedContainer:
         self.removed = True
 
 
+class ScriptedImage:
+    def __init__(self, tags: List[str]):
+        self.tags = tags
+        self.attrs = {"RepoTags": tags}
+
+
+class ScriptedImageApi:
+    def __init__(self, tags: Optional[List[str]] = None):
+        self.tags = list(tags or [])
+        self.pulled: List[str] = []
+        self.removed: List[str] = []
+
+    def list(self):
+        return [ScriptedImage([tag]) for tag in list(self.tags)]
+
+    def pull(self, image_ref: str):
+        self.pulled.append(image_ref)
+        if image_ref not in self.tags:
+            self.tags.append(image_ref)
+
+    def get(self, image_ref: str):
+        if image_ref not in self.tags:
+            raise RuntimeError(f"image not found: {image_ref}")
+        return ScriptedImage([image_ref])
+
+    def remove(self, image: str, force: bool = False, noprune: bool = False):
+        self.removed.append(image)
+        if image in self.tags:
+            self.tags.remove(image)
+
+
 class ScriptedDockerClient:
     def __init__(
         self,
         jobs: List[ScriptedJob],
         fail_on_gpu: bool = False,
         name_conflict_once: bool = False,
+        image_tags: Optional[List[str]] = None,
     ):
         self._containers: Dict[str, ScriptedContainer] = {
             job.job_id: ScriptedContainer(job) for job in jobs
         }
         self.run_calls: List[Dict[str, object]] = []
         self.containers = self
+        self.images = ScriptedImageApi(image_tags)
         self.fail_on_gpu = fail_on_gpu
         self.name_conflict_once = name_conflict_once
 
@@ -150,6 +186,8 @@ class ScriptedDockerClient:
                 "image": kwargs.get("image"),
                 "labels": kwargs.get("labels"),
                 "device_requests": device_requests,
+                "runtime": kwargs.get("runtime"),
+                "environment": kwargs.get("environment"),
             }
         )
         if self.name_conflict_once:
@@ -304,6 +342,97 @@ def test_worker_gpu_auto_fallback(tmp_path):
     assert len(docker_client.run_calls) >= 2
     assert docker_client.run_calls[0]["device_requests"], "first attempt should request GPU"
     assert docker_client.run_calls[-1]["device_requests"] is None, "fallback should omit GPU request"
+
+
+def test_worker_gpu_runtime_mode_uses_nvidia_runtime(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-jetson-gpu",
+        config_path="cfg/jetson.yaml",
+        job_name="Job Jetson GPU",
+        exit_code=0,
+        logs=[b"jetson gpu job\n"],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient([job])
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="jetson-xavier",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+        env={
+            "WORKER_ENABLE_GPU": "true",
+            "WORKER_REQUIRE_GPU": "true",
+            "WORKER_DOCKER_GPU_MODE": "runtime",
+            "WORKER_DOCKER_GPU_RUNTIME": "nvidia",
+        },
+    )
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    run_call = docker_client.run_calls[0]
+    assert run_call["device_requests"] is None
+    assert run_call["runtime"] == "nvidia"
+    assert run_call["environment"]["NVIDIA_VISIBLE_DEVICES"] == "all"  # type: ignore[index]
+    assert run_call["environment"]["NVIDIA_DRIVER_CAPABILITIES"] == "all"  # type: ignore[index]
+
+
+def test_worker_can_prune_old_job_images_before_pull(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKER_DOCKER_PRUNE_OLD_JOB_IMAGES", "true")
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+
+    job = ScriptedJob(
+        job_id="job-new-image",
+        config_path="cfg/new.yaml",
+        job_name="New Image Job",
+        image="calof/opeva_simulator:sha-B",
+        exit_code=0,
+        logs=[b"new image job\n"],
+    )
+
+    backend = ScriptedBackendSession([job])
+    docker_client = ScriptedDockerClient(
+        [job],
+        image_tags=[
+            "calof/opeva_simulator:sha-A",
+            "calof/opeva_simulator:sha-B",
+            "calof/other:old",
+        ],
+    )
+    agent = WorkerAgent(
+        server_url="http://backend",
+        worker_id="jetson-xavier",
+        shared_dir=str(shared_dir),
+        image="test-image",
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        status_poll_interval=0.02,
+        session=backend,
+        docker_client_factory=lambda: docker_client,
+    )
+
+    thread = threading.Thread(target=agent.run_forever, daemon=True)
+    thread.start()
+    assert backend.all_jobs_done.wait(timeout=2)
+    agent.stop()
+    thread.join(timeout=2)
+
+    assert docker_client.images.removed == ["calof/opeva_simulator:sha-A"]
+    assert docker_client.images.pulled == ["calof/opeva_simulator:sha-B"]
+    assert docker_client.run_calls[0]["image"] == "calof/opeva_simulator:sha-B"
 
 
 def test_worker_remaps_orchestrator_data_volume_to_local_shared_dir(tmp_path):

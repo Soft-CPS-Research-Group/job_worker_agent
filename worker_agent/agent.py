@@ -81,6 +81,10 @@ class WorkerAgent:
         self._env = dict(env or os.environ)
         self._gpu_request_enabled = _env_flag("WORKER_ENABLE_GPU", False, self._env)
         self._gpu_request_required = _env_flag("WORKER_REQUIRE_GPU", False, self._env)
+        self._gpu_request_mode = str(self._env.get("WORKER_DOCKER_GPU_MODE", "device_requests")).strip().lower()
+        if self._gpu_request_mode not in {"device_requests", "runtime"}:
+            self._gpu_request_mode = "device_requests"
+        self._gpu_runtime = str(self._env.get("WORKER_DOCKER_GPU_RUNTIME", "nvidia")).strip() or "nvidia"
         self._remap_data_volume = _env_flag("WORKER_REMAP_DATA_VOLUME", False, self._env)
         self._last_request_failure: Optional[str] = None
         self._has_processed_job = False
@@ -566,6 +570,8 @@ class WorkerAgent:
 
     def _build_device_requests(self, job: Optional[Dict[str, Any]] = None) -> Optional[list]:
         job = job or {}
+        if self._gpu_request_mode == "runtime" and not job.get("device_requests"):
+            return None
         if not self._gpu_request_enabled and not job.get("device_requests"):
             return None
         try:

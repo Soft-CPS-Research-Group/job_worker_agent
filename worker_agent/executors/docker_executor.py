@@ -45,6 +45,12 @@ class DockerExecutor(BaseExecutor):
             0.0,
             float(os.environ.get("WORKER_DOCKER_ORPHAN_CLEANUP_INTERVAL_SECONDS", "30")),
         )
+        self._prune_old_job_images_enabled = os.environ.get("WORKER_DOCKER_PRUNE_OLD_JOB_IMAGES", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._last_cleanup_ts = 0.0
 
     def _get_docker_client(self) -> "docker.DockerClient":
@@ -96,6 +102,72 @@ class DockerExecutor(BaseExecutor):
             _LOGGER.info("Pulled image %s before run (policy=%s)", image_ref, self.pull_policy)
         except Exception as exc:  # pragma: no cover - depends on daemon/network
             _LOGGER.warning("Failed to pull image %s (policy=%s): %s", image_ref, self.pull_policy, exc)
+
+    @staticmethod
+    def _image_repository(image_ref: str) -> str:
+        ref = str(image_ref or "").strip()
+        if not ref:
+            return ""
+        ref = ref.split("@", 1)[0]
+        last_slash = ref.rfind("/")
+        last_colon = ref.rfind(":")
+        if last_colon > last_slash:
+            return ref[:last_colon]
+        return ref
+
+    @staticmethod
+    def _image_ref_aliases(image_ref: str) -> set[str]:
+        ref = str(image_ref or "").strip()
+        if not ref:
+            return set()
+        aliases = {ref}
+        if "@" not in ref:
+            repo = DockerExecutor._image_repository(ref)
+            last_slash = ref.rfind("/")
+            last_colon = ref.rfind(":")
+            if repo and last_colon <= last_slash:
+                aliases.add(f"{repo}:latest")
+        return aliases
+
+    @staticmethod
+    def _image_tags(image: Any) -> list[str]:
+        tags = getattr(image, "tags", None)
+        if isinstance(tags, list):
+            return [str(tag) for tag in tags if str(tag)]
+        attrs = getattr(image, "attrs", None)
+        if isinstance(attrs, dict):
+            repo_tags = attrs.get("RepoTags")
+            if isinstance(repo_tags, list):
+                return [str(tag) for tag in repo_tags if str(tag)]
+        return []
+
+    def _prune_old_job_images(self, client: "docker.DockerClient", current_image_ref: str) -> None:
+        if not self._prune_old_job_images_enabled:
+            return
+        images_api = getattr(client, "images", None)
+        if images_api is None or not hasattr(images_api, "list") or not hasattr(images_api, "remove"):
+            return
+        current_repo = self._image_repository(current_image_ref)
+        if not current_repo:
+            return
+        keep_refs = self._image_ref_aliases(current_image_ref)
+        try:
+            images = images_api.list()
+        except Exception as exc:  # pragma: no cover - daemon dependent
+            _LOGGER.warning("Failed to list Docker images before job image pruning: %s", exc)
+            return
+
+        for image in images:
+            tags = self._image_tags(image)
+            matching_tags = [tag for tag in tags if self._image_repository(tag) == current_repo]
+            if not matching_tags or any(tag in keep_refs for tag in matching_tags):
+                continue
+            for tag in matching_tags:
+                try:
+                    images_api.remove(image=tag, force=False, noprune=False)
+                    _LOGGER.info("Removed old job image tag %s before pulling %s", tag, current_image_ref)
+                except Exception as exc:  # pragma: no cover - daemon dependent
+                    _LOGGER.warning("Failed to remove old job image tag %s: %s", tag, exc)
 
     @staticmethod
     def _container_labels(container: Any) -> Dict[str, str]:
@@ -250,10 +322,21 @@ class DockerExecutor(BaseExecutor):
                     "container_name": container_name,
                 },
             )
+            self._prune_old_job_images(client, run_kwargs["image"])
             self._pull_image(client, run_kwargs["image"])
             self.runtime._update_active_job(job_id, phase="setup:container_create")
+            gpu_runtime_requested = False
             if device_requests:
                 run_kwargs["device_requests"] = device_requests
+                gpu_runtime_requested = True
+            elif (
+                getattr(self.runtime, "_gpu_request_enabled", False)
+                and getattr(self.runtime, "_gpu_request_mode", "device_requests") == "runtime"
+            ):
+                run_kwargs["runtime"] = getattr(self.runtime, "_gpu_runtime", "nvidia")
+                env.setdefault("NVIDIA_VISIBLE_DEVICES", "all")
+                env.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
+                gpu_runtime_requested = True
 
             def _run_without_gpu_after_failure(exc: Exception):
                 if getattr(self.runtime, "_gpu_request_required", False):
@@ -262,6 +345,9 @@ class DockerExecutor(BaseExecutor):
                 _LOGGER.info("GPU request failed (%s); retrying without GPU", exc)
                 self._remove_stale_container(client, container_name)
                 run_kwargs.pop("device_requests", None)
+                run_kwargs.pop("runtime", None)
+                env.pop("NVIDIA_VISIBLE_DEVICES", None)
+                env.pop("NVIDIA_DRIVER_CAPABILITIES", None)
                 try:
                     return client.containers.run(**run_kwargs)
                 except Exception as retry_exc:
@@ -282,11 +368,11 @@ class DockerExecutor(BaseExecutor):
                     try:
                         container = client.containers.run(**run_kwargs)
                     except Exception as retry_exc:
-                        if device_requests:
+                        if gpu_runtime_requested:
                             container = _run_without_gpu_after_failure(retry_exc)
                         else:
                             raise
-                elif device_requests:
+                elif gpu_runtime_requested:
                     container = _run_without_gpu_after_failure(exc)
                 else:
                     raise

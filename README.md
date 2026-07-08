@@ -86,11 +86,12 @@ Quick command notes live in [`docs/laptop_worker_notes.md`](docs/laptop_worker_n
 # Export overrides once per session (or put them in .local-worker.env)
 export WORKER_ID=tiago-laptop
 export OPEVA_SERVER=http://193.136.62.78:8011    # orchestrator reachable via VPN/public IP
+export VPN_CONNECTION=deinet                    # NetworkManager VPN profile
 export WORKER_ENABLE_GPU=true
 export WORKER_REQUIRE_GPU=true                  # fail instead of silently falling back to CPU
 export SHUTDOWN_TIMEOUT=900                     # allow 15 minutes for graceful stop
 
-# Mount the share (if needed) and start the worker container
+# Bring up VPN if needed, mount the share, and start the worker container
 sudo scripts/local_worker.sh serve
 
 # Request graceful shutdown, stop the compose stack, and unmount the share
@@ -104,12 +105,19 @@ an untracked `.local-worker.env` in this repo:
 ```bash
 WORKER_ID=tiago-laptop
 OPEVA_SERVER=http://193.136.62.78:8011
-NFS_SERVER=softcps
+NFS_SERVER=193.136.62.78
 NFS_EXPORT=/opt/opeva_shared_data
 MOUNT_POINT=/mnt/opeva_shared
+VPN_CONNECTION=deinet
+VPN_REQUIRED=1
+VPN_WATCHDOG=1
+VPN_TARGET=193.136.62.78
+WORKER_AGENT_IMAGE=job_worker_agent:local
+WORKER_JOB_IMAGE=calof/opeva_simulator:latest
 WORKER_ENABLE_GPU=true
 WORKER_REQUIRE_GPU=true
 SHUTDOWN_TIMEOUT=900
+PULL_BEFORE_START=0
 ```
 
 Then the daily command is:
@@ -117,6 +125,12 @@ Then the daily command is:
 ```bash
 sudo scripts/local_worker.sh serve
 ```
+
+`serve` runs `nmcli connection up "$VPN_CONNECTION"` if the VPN is not already
+active, then mounts NFS and starts a lightweight VPN/NFS watchdog. The watchdog
+only attempts recovery checks; it does not stop jobs or force-unmount the share.
+For this to work without the graphical session, the VPN credentials must be
+usable by NetworkManager as a system/headless connection.
 
 The compose definition lives in `docker-compose.local.yml`. The worker should
 point to the orchestrator using the address that is accessible from the laptop
@@ -137,7 +151,9 @@ While the worker runs you can:
 - Inspect active job containers: `sudo docker ps --filter name=job_tiago-laptop`.
 - Watch job logs: `sudo tail -f /mnt/opeva_shared/jobs/<job_id>/logs/<job_id>.log`.
 - Check the worker state/mount: `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh status`.
-- logs `sudo docker logs -f job-worker-tiago-laptop`
+- Watch worker logs: `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh logs`.
+- Bring up the VPN only: `sudo scripts/local_worker.sh vpn`.
+- Mount/unmount only: `sudo scripts/local_worker.sh mount` / `sudo scripts/local_worker.sh umount`.
 - pull latest image `docker pull calof/job_worker_agent:latest`
 
 Need to abort immediately? `sudo WORKER_ID=tiago-laptop scripts/local_worker.sh stop --force`
@@ -196,6 +212,7 @@ Environment variables:
 | `WORKER_ENABLE_GPU` | Requests GPU access for Docker jobs. |
 | `WORKER_REQUIRE_GPU` | Fails jobs if Docker cannot satisfy the GPU request instead of falling back to CPU. |
 | `WORKER_REMAP_DATA_VOLUME` | Remaps orchestrator-provided `/data` volume binds to local `OPEVA_SHARED_DIR` (default `false`; local helper sets `true`). |
+| `WORKER_DOCKER_PRUNE_OLD_JOB_IMAGES` | When true, removes unused old tags from the same job image repository before pulling the next job image; useful for small disks. |
 | `POLL_INTERVAL` | Seconds between queue polls when idle. |
 | `WORKER_HEARTBEAT_INTERVAL` | Heartbeat interval in seconds. |
 | `STATUS_POLL_INTERVAL` | How often to check job status while running (seconds). |
