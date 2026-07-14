@@ -10,6 +10,7 @@ from worker_agent.agent import WorkerAgent
 from worker_agent.deucalion.slurm import SlurmState
 from worker_agent.deucalion.ssh_client import SSHCommandError
 from worker_agent.executors.deucalion_executor import DeucalionExecutor
+from worker_agent.executors.base import StaleJobAttemptError
 import worker_agent.executors.deucalion_executor as deucalion_executor_module
 
 
@@ -1071,6 +1072,53 @@ def test_deucalion_executor_stops_when_backend_marks_failed(tmp_path, monkeypatc
     agent._run_job({"job_id": "job-failed", "config_path": "configs/demo.yaml", "job_name": "Failed", "image": "calof/algorithms:latest"})
 
     assert cancel_called["value"] is True
+    status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls == ["setup", "dispatched"]
+
+
+def test_deucalion_executor_cancels_slurm_when_attempt_is_revoked(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    fake_ssh = FakeSSHClient(
+        existing_paths={
+            "/projects/F202508843CPCAA0/tiagocalof",
+            "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif",
+        }
+    )
+    _write_config(
+        shared_dir,
+        {"execution": {"deucalion": {"sif_path": "/projects/F202508843CPCAA0/tiagocalof/images/sim.sif"}}},
+    )
+    monkeypatch.setattr(deucalion_executor_module, "sbatch_submit", lambda *args, **kwargs: "558")
+    states = iter([SlurmState(state="RUNNING"), SlurmState(state="RUNNING")])
+    monkeypatch.setattr(deucalion_executor_module, "query_state", lambda *args, **kwargs: next(states))
+    canceled: list[str] = []
+    monkeypatch.setattr(
+        deucalion_executor_module,
+        "scancel_job",
+        lambda _ssh, slurm_job_id: canceled.append(slurm_job_id),
+    )
+
+    agent = _build_agent(shared_dir, session, fake_ssh)
+    original_post_status = agent._post_status
+
+    def _post_status(job_id, status, **extra):
+        if status == "running":
+            raise StaleJobAttemptError(job_id)
+        return original_post_status(job_id, status, **extra)
+
+    monkeypatch.setattr(agent, "_post_status", _post_status)
+    agent._run_job(
+        {
+            "job_id": "job-revoked",
+            "config_path": "configs/demo.yaml",
+            "job_name": "Revoked",
+            "image": "calof/algorithms:latest",
+        }
+    )
+
+    assert canceled == ["558"]
     status_calls = [call["json"]["status"] for call in session.calls if call["url"].endswith("/job-status")]
     assert status_calls == ["setup", "dispatched"]
 

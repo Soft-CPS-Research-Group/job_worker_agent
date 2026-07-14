@@ -7,6 +7,7 @@ import pytest
 import requests
 
 from worker_agent.agent import WorkerAgent
+from worker_agent.executors.base import StaleJobAttemptError
 
 
 class DummyResponse:
@@ -305,6 +306,129 @@ def test_poll_once_dispatches_job(monkeypatch):
     handled = agent.poll_once()
     assert handled is True
 
+    next_job_call = next(call for call in session.calls if call["url"].endswith("/next-job"))
+    assert "attempt_fencing_v1" in next_job_call["json"]["capabilities"]
+
+
+def test_status_updates_include_attempt_fence_from_dispatch(tmp_path, caplog):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    token = "attempt-secret-that-must-not-be-logged"
+    job_payload = {
+        "job_id": "job-fenced",
+        "config_path": "cfg.yaml",
+        "job_name": "Fenced",
+        "attempt_number": 4,
+        "attempt_token": token,
+    }
+    session.next_job_responses.append(DummyResponse(200, job_payload))
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+
+    with caplog.at_level("INFO"):
+        assert agent.poll_once() is True
+
+    status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
+    assert status_calls
+    assert all(call["json"]["attempt_number"] == 4 for call in status_calls)
+    assert all(call["json"]["attempt_token"] == token for call in status_calls)
+    assert token not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+def test_pending_terminal_statuses_are_deduplicated_per_attempt(monkeypatch):
+    session = DummySession()
+    session.job_status_post_responses = [DummyResponse(500, {})] * 6
+    monkeypatch.setattr("worker_agent.agent.time.sleep", lambda _seconds: None)
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+    first = {"job_id": "job-retry", "attempt_number": 1, "attempt_token": "first"}
+    second = {"job_id": "job-retry", "attempt_number": 2, "attempt_token": "second"}
+
+    agent._bind_job_attempt(first)
+    agent._post_status("job-retry", "finished")
+    agent._bind_job_attempt(second)
+    agent._post_status("job-retry", "finished")
+
+    assert len(agent._pending_terminal_statuses) == 2
+    attempts = [entry["payload"]["attempt_number"] for entry in agent._pending_terminal_statuses]
+    assert attempts == [1, 2]
+
+
+def test_stale_attempt_response_revokes_status_delivery():
+    session = DummySession()
+    session.job_status_post_responses = [
+        DummyResponse(409, {"detail": {"code": "stale_job_attempt"}}),
+    ]
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+    agent._bind_job_attempt({"job_id": "job-revoked", "attempt_number": 1, "attempt_token": "old"})
+
+    with pytest.raises(StaleJobAttemptError):
+        agent._post_status("job-revoked", "running")
+
+
+def test_docker_executor_removes_container_when_attempt_is_revoked(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+    session.job_status_post_responses = [
+        DummyResponse(200, {}),
+        DummyResponse(409, {"detail": {"code": "stale_job_attempt"}}),
+    ]
+    container = DummyContainer()
+    docker_client = DummyDockerClient(container)
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="img",
+        session=session,
+        docker_client_factory=lambda: docker_client,
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+    job = {
+        "job_id": "job-revoked-docker",
+        "job_name": "Revoked",
+        "config_path": "config.yaml",
+        "attempt_number": 2,
+        "attempt_token": "superseded-token",
+    }
+    agent._bind_job_attempt(job)
+
+    agent._executor.run_job(job)
+
+    assert docker_client.last_kwargs is not None
+    assert container.removed is True
+    status_calls = [call for call in session.calls if call["url"].endswith("/job-status")]
+    assert [call["json"]["status"] for call in status_calls] == ["setup", "running"]
+
 
 def test_exit_after_job_stops_worker(tmp_path):
     shared_dir = tmp_path / "shared"
@@ -351,6 +475,45 @@ def test_request_exit_after_current_job_when_idle(tmp_path):
     )
 
     agent.request_exit_after_current_job()
+    assert agent._stop_event.is_set() is True
+
+
+def test_request_exit_waits_for_executor_recovered_job(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    session = DummySession()
+
+    class NoopExecutor:
+        def run_job(self, job):
+            return None
+
+        def heartbeat_info(self):
+            return {}
+
+        def close(self):
+            return None
+
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="union-inesctec",
+        shared_dir=str(shared_dir),
+        image="img",
+        session=session,
+        executor="union",
+        union_executor_factory=lambda runtime: NoopExecutor(),
+        status_poll_interval=0.0,
+        heartbeat_interval=0,
+    )
+    agent._register_active_job("recovered-job")
+
+    agent.request_exit_after_current_job()
+    assert agent._stop_event.is_set() is False
+
+    agent.poll_once()
+    assert agent._stop_event.is_set() is False
+
+    agent._unregister_active_job("recovered-job")
+    agent.poll_once()
     assert agent._stop_event.is_set() is True
 
 

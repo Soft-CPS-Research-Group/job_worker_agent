@@ -1,8 +1,8 @@
 # Job Worker Agent
 
 Worker implementation for the OPEVA Job Orchestrator. Each agent polls the API for
-queued jobs, executes workloads via the configured executor (`docker` or
-`deucalion`), and streams status/log updates back to the server.
+queued jobs, executes workloads via the configured executor (`docker`,
+`deucalion` or `union`), and streams status/log updates back to the server.
 
 ## Features
 
@@ -13,12 +13,60 @@ queued jobs, executes workloads via the configured executor (`docker` or
 - Executor modes:
   - `docker`: runs jobs in Docker as before.
   - `deucalion`: submits jobs to Deucalion via SSH + Slurm + Singularity.
-- One job at a time per agent instance—run multiple containers for parallelism.
+  - `union`: submits GPU jobs to Union INESC TEC using a runner and Algorithms sidecar.
+- Configurable concurrent slots per worker, with one slot as the default.
 - Heartbeat and cooperative stop support (agent stops the container when status
   becomes `stop_requested` or `canceled`).
 - Periodic `job-status` updates while running to avoid stale-job handling.
+- Negotiates `attempt_fencing_v1` with compatible orchestrators and echoes the
+  opaque dispatch token on every status update. This prevents a late status
+  from an old execution changing a requeued job. A stale-attempt rejection also
+  terminates the superseded Docker container, Slurm job or Union Run. Tokens
+  are redacted from logs.
 
-Current package version: `0.4.1`. Release notes live in [`docs/releases.md`](docs/releases.md).
+Current package version: `0.5.0`. Release notes live in [`docs/releases.md`](docs/releases.md).
+
+## Union INESC TEC mode
+
+The Union bridge uses the dedicated `Dockerfile.union` image. It packages the
+resolved config and referenced datasets, uploads them to Union object storage,
+and launches a two-container task: the worker runner as primary and the
+selected Algorithms image as a one-GPU sidecar. Logs, progress and final
+artifacts are synchronized back into the existing shared job directory.
+
+Required configuration includes:
+
+```bash
+WORKER_ID=union-inesctec
+WORKER_EXECUTOR=union
+WORKER_MAX_ACTIVE_JOBS=10
+FLYTE_API_KEY_FILE=/run/secrets/union_api_key
+UNION_OBJECT_STORE_CA_FILE=/run/secrets/union_object_store_ca.pem
+UNION_ENDPOINT=dns:///inesctec.hosted.unionai.cloud
+UNION_ORG=inesctec
+UNION_PROJECT=humanise-energaize
+UNION_DOMAIN=development
+UNION_RUNNER_IMAGE=calof/job_worker_agent:union-latest
+UNION_GPU_COUNT=1
+UNION_UNREACHABLE_GRACE_SECONDS=900
+UNION_RETRY_MAX_BACKOFF_SECONDS=60
+```
+
+`UNION_OBJECT_STORE_CA_FILE` is used only for S3 artifact traffic. Set the
+separate optional `UNION_CONTROL_PLANE_CA_FILE` only if the Union API endpoint
+itself uses a private CA.
+
+Runtime state is persisted atomically at
+`jobs/<job_id>/.worker/union.json`. Restarting the bridge recovers an existing
+run by deterministic job/attempt ID, including a restart during upload or
+submission. Temporary Union control-plane failures use bounded exponential
+backoff and keep the job in `setup` or `running`; they do not create a second
+run. Result installation, remote cleanup and final orchestrator acknowledgment
+are persisted as separate idempotent steps.
+Union recovery state retains the dispatch attempt fields in its mode-`0600`
+state file so terminal delivery remains fenced after a bridge restart.
+The service key and object-store CA must be mounted read-only and must not be
+baked into either worker image.
 
 ## Quick start (recommended)
 
@@ -206,7 +254,7 @@ Environment variables:
 |----------|-------------|
 | `OPEVA_SERVER` | Job Orchestrator base URL (default `http://localhost:8011`). |
 | `WORKER_ID` | Worker identifier; defaults to container hostname. |
-| `WORKER_EXECUTOR` | `docker` (default) or `deucalion`. |
+| `WORKER_EXECUTOR` | `docker` (default), `deucalion` or `union`. |
 | `WORKER_VERSION` | Optional override for the version reported to the orchestrator; otherwise the installed package version is used. |
 | `OPEVA_SHARED_DIR` | Local path to the mounted NFS share. |
 | `WORKER_ENABLE_GPU` | Requests GPU access for Docker jobs. |

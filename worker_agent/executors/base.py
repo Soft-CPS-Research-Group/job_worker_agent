@@ -3,6 +3,14 @@ from __future__ import annotations
 from typing import Any, Dict, Protocol
 
 
+class StaleJobAttemptError(RuntimeError):
+    """Raised when the orchestrator revokes an execution attempt."""
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        super().__init__(f"Execution attempt for job {job_id} is no longer current")
+
+
 class WorkerRuntime(Protocol):
     """Runtime callbacks and properties exposed by WorkerAgent to executors."""
 
@@ -11,7 +19,10 @@ class WorkerRuntime(Protocol):
     status_poll_interval: float
     shared_dir: str
 
-    def _post_status(self, job_id: str, status: str, **extra: object) -> None:
+    def _post_status(self, job_id: str, status: str, **extra: object) -> bool:
+        ...
+
+    def _bind_job_attempt(self, job: Dict[str, Any]) -> None:
         ...
 
     def _fetch_status(self, job_id: str) -> str | None:

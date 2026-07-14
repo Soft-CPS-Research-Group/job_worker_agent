@@ -11,7 +11,7 @@ try:  # docker is optional at import time for tooling
 except ImportError:  # pragma: no cover - tests inject a fake client
     docker = None  # type: ignore
 
-from .base import BaseExecutor, WorkerRuntime
+from .base import BaseExecutor, StaleJobAttemptError, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _RUNNING_CONTAINER_STATES = {"running", "restarting"}
@@ -406,12 +406,22 @@ class DockerExecutor(BaseExecutor):
                             except Exception:  # pragma: no cover
                                 pass
                             break
-                        self.runtime._post_status(
-                            job_id,
-                            "running",
-                            container_id=container_id,
-                            container_name=container_name,
-                        )
+                        try:
+                            self.runtime._post_status(
+                                job_id,
+                                "running",
+                                container_id=container_id,
+                                container_name=container_name,
+                            )
+                        except StaleJobAttemptError:
+                            monitor_state["status"] = "stale_attempt"
+                            _LOGGER.warning("Stopping revoked execution attempt for job %s", job_id)
+                            try:
+                                if hasattr(container, "stop"):
+                                    container.stop()
+                            except Exception:  # pragma: no cover
+                                pass
+                            break
 
                 monitor_thread = threading.Thread(target=_monitor, name=f"monitor-{job_id}")
                 monitor_thread.daemon = True
@@ -454,6 +464,8 @@ class DockerExecutor(BaseExecutor):
                 status = "finished" if exit_code == 0 else "failed"
                 self.runtime._post_status(job_id, status, exit_code=exit_code)
                 _LOGGER.info("Job %s exited with status '%s' (exit code %s)", job_id, status, exit_code)
+        except StaleJobAttemptError:
+            _LOGGER.warning("Docker execution attempt for job %s was revoked by the orchestrator", job_id)
         except Exception as exc:
             _LOGGER.exception("Job %s failed: %s", job_id, exc)
             self._append_startup_error_log(job_id, exc)

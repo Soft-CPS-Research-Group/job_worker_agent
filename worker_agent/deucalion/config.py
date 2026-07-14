@@ -236,6 +236,11 @@ def _infer_datasets_from_config(config: dict[str, Any] | None) -> list[str]:
     return inferred
 
 
+def infer_datasets_from_config(config: dict[str, Any] | None) -> list[str]:
+    """Return validated dataset roots referenced by an experiment config."""
+    return _infer_datasets_from_config(config)
+
+
 def resolve_deucalion_job_config(
     config: dict[str, Any] | None,
     env: Mapping[str, str] | None = None,

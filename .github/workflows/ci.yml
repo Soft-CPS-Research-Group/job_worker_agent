@@ -51,6 +51,15 @@ jobs:
               echo "${IMAGE}:${{ github.ref_name }}"
             fi
             echo "EOF"
+            echo "UNION_TAGS<<EOF"
+            echo "${IMAGE}:union-${{ github.sha }}"
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "${IMAGE}:union-latest"
+            fi
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              echo "${IMAGE}:union-${{ github.ref_name }}"
+            fi
+            echo "EOF"
           } >> "$GITHUB_ENV"
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
@@ -59,3 +68,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.TAGS }}
+      - name: Build and push Union worker/runner image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.union
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.UNION_TAGS }}

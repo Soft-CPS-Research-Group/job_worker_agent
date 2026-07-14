@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY worker_agent ./worker_agent
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir '.[union]'
+
+# Compose uses this default. Union raw-container tasks replace CMD with the
+# runner command while preserving the image without a fixed ENTRYPOINT.
+CMD ["job-worker-agent"]

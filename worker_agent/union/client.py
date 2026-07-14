@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+from datetime import timedelta
+import logging
+from pathlib import Path
+import shlex
+import time
+from typing import Any, Iterator, Mapping
+
+import requests
+
+from .config import UnionConfig
+from .events import parse_event
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class UnionRunSnapshot:
+    name: str
+    phase: str
+    url: str | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.phase.upper() in {"SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT"}
+
+
+def derive_object_uris(input_uri: str) -> tuple[str, str]:
+    if "/" not in input_uri.rstrip("/"):
+        raise ValueError(f"Cannot derive result location from input URI: {input_uri!r}")
+    parent = input_uri.rsplit("/", 1)[0]
+    return f"{parent}/result.tar.gz", f"{parent}/cancel.request"
+
+
+def deterministic_run_name(job_id: str, attempt: int) -> str:
+    safe_id = "".join(ch for ch in job_id.lower() if ch.isalnum())[:40]
+    return f"opeva-{safe_id}-a{max(1, int(attempt))}"
+
+
+def _algorithms_wrapper(job_id: str, command: str, setup_timeout: int) -> str:
+    tokens = shlex.split(command)
+    if tokens and tokens[0] == "python":
+        algorithm_command = tokens
+    else:
+        algorithm_command = ["python", "run_experiment.py", *tokens]
+    command_text = " ".join(shlex.quote(token) for token in algorithm_command)
+    marker_root = "/data/.opeva"
+    log_path = f"/data/jobs/{job_id}/logs/{job_id}.log"
+    return f"""
+set +e
+mkdir -p {shlex.quote(marker_root)} {shlex.quote(str(Path(log_path).parent))}
+code=1
+child=""
+finish() {{
+  if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+    kill -TERM "$child" 2>/dev/null || true
+  fi
+  printf '%s\n' "$code" > {shlex.quote(marker_root + '/exit.code')}
+  touch {shlex.quote(marker_root + '/algorithm.done')}
+}}
+trap finish EXIT
+touch {shlex.quote(marker_root + '/sidecar.ready')}
+deadline=$(( $(date +%s) + {int(setup_timeout)} ))
+while [ ! -f {shlex.quote(marker_root + '/input.ready')} ]; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    code=124
+    exit 0
+  fi
+  sleep 1
+done
+{command_text} >> {shlex.quote(log_path)} 2>&1 &
+child=$!
+touch {shlex.quote(marker_root + '/algorithm.started')}
+while kill -0 "$child" 2>/dev/null; do
+  if [ -f {shlex.quote(marker_root + '/cancel')} ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$child" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "$child" 2>/dev/null || true
+  fi
+  sleep 2
+done
+wait "$child"
+code=$?
+child=""
+exit 0
+""".strip()
+
+
+class FlyteUnionClient:
+    def __init__(self, config: UnionConfig) -> None:
+        self.config = config
+        self._initialized = False
+
+    def initialize(self) -> None:
+        if self._initialized:
+            return
+        try:
+            import flyte
+        except ImportError as exc:  # pragma: no cover - image contract
+            raise RuntimeError("Union executor requires the worker 'union' dependency extra") from exc
+        ca_path = str(self.config.control_plane_ca_file) if self.config.control_plane_ca_file else None
+        flyte.init(
+            endpoint=self.config.endpoint,
+            api_key=self.config.read_api_key(),
+            org=self.config.org,
+            project=self.config.project,
+            domain=self.config.domain,
+            headless=True,
+            ca_cert_file_path=ca_path,
+            image_builder="remote",
+        )
+        self._initialized = True
+
+    def upload_input(self, path: Path, job_id: str, attempt: int) -> str:
+        self.initialize()
+        from flyte.remote import upload_file
+
+        _, uri = upload_file(path, fname=f"opeva-{job_id}-a{attempt}-input.tar.gz")
+        return str(uri)
+
+    def _ca_b64(self) -> str:
+        bundle = self.config.read_ca_bundle()
+        if not bundle:
+            return ""
+        return base64.b64encode(bundle.encode("utf-8")).decode("ascii")
+
+    def _pod_task(
+        self,
+        *,
+        job: Mapping[str, Any],
+        input_uri: str,
+        result_uri: str,
+        cancel_uri: str,
+    ):
+        import flyte
+        from flyte.extras import ContainerTask
+        from kubernetes.client import (
+            V1Container,
+            V1EmptyDirVolumeSource,
+            V1EnvVar,
+            V1PodSpec,
+            V1ResourceRequirements,
+            V1Volume,
+            V1VolumeMount,
+        )
+
+        job_id = str(job["job_id"])
+        job_image = str(job.get("image") or "").strip()
+        if not job_image:
+            raise ValueError("Union job payload is missing the Algorithms image")
+        command = str(job.get("command") or "").strip()
+        if not command:
+            command = f"--config /data/{str(job['config_path']).lstrip('/')} --job_id {job_id}"
+        ca_b64 = self._ca_b64()
+        runner_env = {
+            "OPEVA_JOB_ID": job_id,
+            "OPEVA_INPUT_URI": input_uri,
+            "OPEVA_RESULT_URI": result_uri,
+            "OPEVA_CANCEL_URI": cancel_uri,
+            "OPEVA_SETUP_TIMEOUT_SECONDS": str(self.config.setup_timeout_seconds),
+            "OPEVA_RUN_TIMEOUT_SECONDS": str(self.config.run_timeout_seconds),
+            "OPEVA_ARTIFACT_URL_TTL_SECONDS": str(self.config.artifact_url_ttl_seconds),
+            "OPEVA_OBJECT_STORE_CA_B64": ca_b64,
+            "PYTHONUNBUFFERED": "1",
+        }
+        algorithm_env = {
+            **{str(key): str(value) for key, value in dict(job.get("env") or {}).items()},
+            "PYTHONUNBUFFERED": "1",
+        }
+        volume_mount = V1VolumeMount(name="opeva-data", mount_path="/data")
+        gpu_resource = str(self.config.gpu_count)
+        pod = V1PodSpec(
+            restart_policy="Never",
+            containers=[
+                V1Container(
+                    name="primary",
+                    image=self.config.runner_image,
+                    image_pull_policy="Always",
+                    env=[V1EnvVar(name=key, value=value) for key, value in runner_env.items()],
+                    volume_mounts=[volume_mount],
+                ),
+                V1Container(
+                    name="algorithms",
+                    image=job_image,
+                    image_pull_policy="Always",
+                    command=["bash", "-lc"],
+                    args=[_algorithms_wrapper(job_id, command, self.config.setup_timeout_seconds)],
+                    env=[V1EnvVar(name=key, value=value) for key, value in algorithm_env.items()],
+                    volume_mounts=[volume_mount],
+                    resources=V1ResourceRequirements(
+                        requests={
+                            "cpu": self.config.job_cpu,
+                            "memory": self.config.job_memory,
+                            "nvidia.com/gpu": gpu_resource,
+                        },
+                        limits={
+                            "cpu": self.config.job_cpu,
+                            "memory": self.config.job_memory,
+                            "nvidia.com/gpu": gpu_resource,
+                        },
+                    ),
+                ),
+            ],
+            volumes=[V1Volume(name="opeva-data", empty_dir=V1EmptyDirVolumeSource())],
+        )
+        pod_template = flyte.PodTemplate.from_spec(
+            pod,
+            primary_container_name="primary",
+            labels={"opeva-job-id": job_id, "opeva-worker": "union-inesctec"},
+        )
+        task = ContainerTask(
+            name=f"opeva-union-{job_id.replace('-', '')[:20]}",
+            image=self.config.runner_image,
+            command=["python", "-m", "worker_agent.union.runner", "run"],
+            resources=flyte.Resources(cpu=self.config.runner_cpu, memory=self.config.runner_memory),
+            timeout=timedelta(seconds=self.config.setup_timeout_seconds + self.config.run_timeout_seconds + 300),
+            pod_template=pod_template,
+        )
+        flyte.TaskEnvironment.from_task(f"opeva-union-{job_id.replace('-', '')[:20]}", task)
+        return task
+
+    def submit_job(
+        self,
+        *,
+        job: Mapping[str, Any],
+        run_name: str,
+        input_uri: str,
+        result_uri: str,
+        cancel_uri: str,
+    ) -> UnionRunSnapshot:
+        self.initialize()
+        import flyte
+
+        task = self._pod_task(
+            job=job,
+            input_uri=input_uri,
+            result_uri=result_uri,
+            cancel_uri=cancel_uri,
+        )
+        try:
+            run = flyte.with_runcontext(
+                name=run_name,
+                labels={"opeva-job-id": str(job["job_id"]), "opeva-worker": "union-inesctec"},
+            ).run(task)
+        except Exception as exc:
+            if "already exists" not in str(exc).lower():
+                raise
+            return self.get_run(run_name)
+        return UnionRunSnapshot(name=run.name, phase=str(run.phase), url=str(run.url))
+
+    def get_run(self, run_name: str) -> UnionRunSnapshot:
+        self.initialize()
+        from flyte.remote import Run
+
+        run = Run.get(name=run_name)
+        return UnionRunSnapshot(name=run.name, phase=str(run.phase), url=str(run.url))
+
+    def stream_logs(self, run_name: str) -> Iterator[str]:
+        self.initialize()
+        from flyte.remote import Run
+
+        run = Run.get(name=run_name)
+        yield from run.get_logs(filter_system=True, show_ts=False)
+
+    def abort(self, run_name: str, reason: str) -> None:
+        self.initialize()
+        from flyte.remote import Run
+
+        Run.get(name=run_name).abort(reason=reason)
+
+    def request_graceful_cancel(self, put_url: str) -> None:
+        response = requests.put(put_url, data=b"cancel\n", timeout=30)
+        response.raise_for_status()
+
+    def download_artifact(self, get_url: str, destination: Path) -> None:
+        verify: str | bool = str(self.config.object_store_ca_file) if self.config.object_store_ca_file else True
+        with requests.get(get_url, stream=True, timeout=(30, 300), verify=verify) as response:
+            response.raise_for_status()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+
+    def delete_artifact(self, delete_url: str) -> None:
+        verify: str | bool = str(self.config.object_store_ca_file) if self.config.object_store_ca_file else True
+        response = requests.delete(delete_url, timeout=30, verify=verify)
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+
+    def refresh_artifact(self, result_uri: str, job_id: str) -> dict[str, Any]:
+        self.initialize()
+        import flyte
+        from flyte.extras import ContainerTask
+        from kubernetes.client import V1Container, V1EnvVar, V1PodSpec
+
+        env = {
+            "OPEVA_RESULT_URI": result_uri,
+            "OPEVA_ARTIFACT_URL_TTL_SECONDS": str(self.config.artifact_url_ttl_seconds),
+            "OPEVA_OBJECT_STORE_CA_B64": self._ca_b64(),
+        }
+        pod = V1PodSpec(
+            restart_policy="Never",
+            containers=[
+                V1Container(
+                    name="primary",
+                    image=self.config.runner_image,
+                    image_pull_policy="Always",
+                    env=[V1EnvVar(name=key, value=value) for key, value in env.items()],
+                )
+            ],
+        )
+        task = ContainerTask(
+            name=f"opeva-sign-{job_id.replace('-', '')[:20]}",
+            image=self.config.runner_image,
+            command=["python", "-m", "worker_agent.union.runner", "sign"],
+            resources=flyte.Resources(cpu="1", memory="1Gi"),
+            timeout=timedelta(minutes=10),
+            pod_template=flyte.PodTemplate.from_spec(pod, primary_container_name="primary"),
+        )
+        flyte.TaskEnvironment.from_task(f"opeva-sign-{job_id.replace('-', '')[:20]}", task)
+        run_name = f"opeva-sign-{job_id.replace('-', '')[:24]}-{int(time.time())}"
+        run = flyte.with_runcontext(name=run_name).run(task)
+        run.wait(quiet=True)
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                for line in run.get_logs(filter_system=True, show_ts=False):
+                    event = parse_event(line)
+                    if event and event.get("kind") == "artifact" and isinstance(event.get("artifact"), dict):
+                        return dict(event["artifact"])
+            except Exception as exc:  # pragma: no cover - remote timing dependent
+                last_error = exc
+                time.sleep(2)
+        raise RuntimeError(f"Union signer task did not return artifact URLs: {last_error or run_name}")

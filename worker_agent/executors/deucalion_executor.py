@@ -21,7 +21,7 @@ from worker_agent.deucalion.config import DeucalionJobConfig, resolve_deucalion_
 from worker_agent.deucalion.slurm import ACTIVE_STATES, SlurmState, query_state, sbatch_submit, scancel_job
 from worker_agent.deucalion.ssh_client import SSHClient, SSHCommandError, SSHSettings
 
-from .base import BaseExecutor, WorkerRuntime
+from .base import BaseExecutor, StaleJobAttemptError, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _ARTIFACT_SYNC_RETRY_MAX_BACKOFF_SECONDS = 5.0
@@ -1323,6 +1323,14 @@ class DeucalionExecutor(BaseExecutor):
         preflight_last_update = self.now_fn()
         preflight_last_probe = preflight_last_update
 
+        def _cancel_revoked_attempt() -> None:
+            if slurm_job_id:
+                try:
+                    scancel_job(self.ssh, slurm_job_id)
+                except Exception as exc:  # pragma: no cover - best effort during revocation
+                    _LOGGER.warning("Unable to cancel revoked Slurm job %s: %s", slurm_job_id, exc)
+            self._append_local_log(local_log_path, "Execution attempt revoked by the orchestrator")
+
         try:
             self.runtime._register_active_job(job_id, job_name)
             self.runtime._update_active_job(job_id, phase="preflight:init", status="dispatched")
@@ -1653,6 +1661,10 @@ class DeucalionExecutor(BaseExecutor):
                         )
                         return
                     self.sleep_fn(self.poll_interval)
+                except StaleJobAttemptError:
+                    _LOGGER.warning("Deucalion execution attempt for job %s was revoked", job_id)
+                    _cancel_revoked_attempt()
+                    return
                 except PreflightInterrupted as exc:
                     stop_reason = exc.status
                     details = self._build_status_details(
@@ -1690,6 +1702,9 @@ class DeucalionExecutor(BaseExecutor):
                         ),
                     )
                     return
+        except StaleJobAttemptError:
+            _LOGGER.warning("Deucalion execution attempt for job %s was revoked", job_id)
+            _cancel_revoked_attempt()
         except PreflightInterrupted as exc:
             stop_reason = exc.status
             details = self._build_status_details(
@@ -1714,20 +1729,23 @@ class DeucalionExecutor(BaseExecutor):
             traceback_text = traceback.format_exc()
             self._append_local_log(local_log_path, f"Submission/preflight failure during {preflight_stage}: {exc}")
             self._append_local_log(local_log_path, traceback_text)
-            self.runtime._post_status(
-                job_id,
-                "failed",
-                error=str(exc),
-                details=self._build_status_details(
-                    slurm_job_id=slurm_job_id,
-                    command_mode=command_mode,
-                    datasets_synced=datasets_synced,
-                    datasets_skipped=datasets_skipped,
-                    image=image_name,
-                    slurm_state="PREPARING",
-                    executor_stage=preflight_stage,
-                ),
-            )
+            try:
+                self.runtime._post_status(
+                    job_id,
+                    "failed",
+                    error=str(exc),
+                    details=self._build_status_details(
+                        slurm_job_id=slurm_job_id,
+                        command_mode=command_mode,
+                        datasets_synced=datasets_synced,
+                        datasets_skipped=datasets_skipped,
+                        image=image_name,
+                        slurm_state="PREPARING",
+                        executor_stage=preflight_stage,
+                    ),
+                )
+            except StaleJobAttemptError:
+                _cancel_revoked_attempt()
         finally:
             self.runtime._unregister_active_job(job_id)
             self.runtime._send_heartbeat(force=True)

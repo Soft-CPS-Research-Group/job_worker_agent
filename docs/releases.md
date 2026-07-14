@@ -29,6 +29,41 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.0 - 2026-07-14
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Adds the Union INESC TEC GPU executor while preserving the existing Docker,
+Deucalion and Jetson execution paths.
+
+### Changed
+
+- Added a recoverable `union` executor with deterministic run IDs, live logs,
+  progress events, controlled cancellation and validated artifact installation.
+- Added the dedicated amd64 `Dockerfile.union` image and `union-*` CI tags.
+- Added input packaging for the resolved config and referenced datasets only.
+- Added durable Union run state and restart recovery across setup and execution.
+- Added capability-negotiated attempt fencing so stale workers cannot publish
+  status into a requeued execution. Superseded Docker, Slurm and Union
+  executions are actively terminated; legacy orchestrators and workers remain
+  usable during rolling upgrades.
+- Worker version is now reported as `0.5.0`.
+
+### Compatibility
+
+- Existing worker images still use the original `Dockerfile` and dependencies.
+- The Union dependencies are isolated in the optional `union` extra and the
+  dedicated image.
+- The orchestrator must include `union-inesctec` in `AVAILABLE_HOSTS`.
+
+### Validation
+
+- `.venv/bin/pytest`: pass (`105 passed`).
+- Real Union GPU smoke with `calof/opeva_simulator:sha-91811d4`: pass.
+- Two generic Union GPU tasks: confirmed parallel start on separate GPUs.
+
 ## v0.4.1 - 2026-05-16
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

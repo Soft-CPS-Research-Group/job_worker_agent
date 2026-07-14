@@ -17,9 +17,10 @@ try:  # docker is optional at import time for tooling
 except ImportError:  # pragma: no cover - older docker SDK or missing package
     DeviceRequest = None  # type: ignore
 
-from .executors.base import BaseExecutor
+from .executors.base import BaseExecutor, StaleJobAttemptError
 from .executors.deucalion_executor import DeucalionExecutor
 from .executors.docker_executor import DockerExecutor
+from .executors.union_executor import UnionExecutor
 from .version import __version__
 
 
@@ -31,6 +32,8 @@ _RETRY_MAX_BACKOFF_SECONDS = 5.0
 _TERMINAL_QUEUE_MAX_BACKOFF_SECONDS = 30.0
 _TERMINAL_JOB_STATUSES = {"finished", "failed", "stopped", "canceled"}
 _JOB_THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+_ATTEMPT_FENCING_CAPABILITY = "attempt_fencing_v1"
+_WORKER_CAPABILITIES = (_ATTEMPT_FENCING_CAPABILITY,)
 
 
 def _env_flag(name: str, default: bool = False, env: Mapping[str, str] | None = None) -> bool:
@@ -58,6 +61,7 @@ class WorkerAgent:
         executor: str | None = None,
         env: Mapping[str, str] | None = None,
         deucalion_executor_factory: Optional[Callable[["WorkerAgent"], BaseExecutor]] = None,
+        union_executor_factory: Optional[Callable[["WorkerAgent"], BaseExecutor]] = None,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id
@@ -75,6 +79,7 @@ class WorkerAgent:
         self._state_lock = threading.Lock()
         self._session_lock = threading.Lock()
         self._active_jobs: dict[str, dict[str, Any]] = {}
+        self._job_attempts: dict[str, dict[str, Any]] = {}
         self._job_threads: dict[str, threading.Thread] = {}
         self._last_job_id: Optional[str] = None
         self._last_terminal_status: Optional[str] = None
@@ -99,8 +104,13 @@ class WorkerAgent:
                 self._executor = deucalion_executor_factory(self)
             else:
                 self._executor = DeucalionExecutor(self, env=self._env)
+        elif self.executor == "union":
+            if union_executor_factory is not None:
+                self._executor = union_executor_factory(self)
+            else:
+                self._executor = UnionExecutor(self, env=self._env)
         else:
-            raise ValueError(f"Unknown executor '{self.executor}'. Allowed: docker, deucalion")
+            raise ValueError(f"Unknown executor '{self.executor}'. Allowed: docker, deucalion, union")
         self.max_active_jobs = self._resolve_max_active_jobs()
         self._worker_version = self._resolve_worker_version()
 
@@ -145,9 +155,25 @@ class WorkerAgent:
                 "updated_at": now,
             }
 
+    def _bind_job_attempt(self, job: Dict[str, Any]) -> None:
+        job_id = str(job.get("job_id") or "").strip()
+        if not job_id:
+            return
+        token = job.get("attempt_token")
+        attempt_number = job.get("attempt_number")
+        with self._state_lock:
+            if isinstance(token, str) and token and isinstance(attempt_number, int) and not isinstance(attempt_number, bool):
+                self._job_attempts[job_id] = {
+                    "attempt_token": token,
+                    "attempt_number": attempt_number,
+                }
+            else:
+                self._job_attempts.pop(job_id, None)
+
     def _unregister_active_job(self, job_id: str) -> None:
         with self._state_lock:
             self._active_jobs.pop(job_id, None)
+            self._job_attempts.pop(job_id, None)
 
     def _update_active_job(self, job_id: str, **fields: object) -> None:
         with self._state_lock:
@@ -176,7 +202,8 @@ class WorkerAgent:
             return len(self._job_threads)
 
     def _available_slots(self) -> int:
-        return max(0, self.max_active_jobs - self._running_thread_count())
+        occupied = max(self._running_thread_count(), self._active_job_count())
+        return max(0, self.max_active_jobs - occupied)
 
     def _resolve_worker_version(self) -> str:
         if self._env.get("WORKER_VERSION"):
@@ -196,6 +223,7 @@ class WorkerAgent:
         info: Dict[str, Any] = {
             "executor": self.executor,
             "worker_version": self._worker_version,
+            "capabilities": list(_WORKER_CAPABILITIES),
             "gpu_enabled": self._gpu_request_enabled,
             "gpu_required": self._gpu_request_required,
             "shared_dir": self.shared_dir,
@@ -231,6 +259,9 @@ class WorkerAgent:
         try:
             self._executor.on_startup()
         except Exception as exc:  # pragma: no cover - defensive
+            if self.executor == "union":
+                _LOGGER.error("Union executor startup failed: %s", exc)
+                raise
             _LOGGER.warning("Executor startup hook failed: %s", exc)
         self._start_heartbeat_loop()
         try:
@@ -270,12 +301,18 @@ class WorkerAgent:
                 break
 
         self._flush_pending_terminal_statuses(force=True)
-        if self._exit_after_job and self._has_processed_job and self._running_thread_count() == 0:
+        if (
+            self._exit_after_job
+            and self._has_processed_job
+            and self._running_thread_count() == 0
+            and self._active_job_count() == 0
+        ):
             _LOGGER.info("Exit-after-job flag set; stopping worker once current job completes")
             self.stop()
         return handled
 
     def _run_job(self, job: Dict[str, Any]) -> None:
+        self._bind_job_attempt(job)
         self._executor.run_job(job)
 
     def _start_job_thread(self, job: Dict[str, Any]) -> None:
@@ -362,6 +399,15 @@ class WorkerAgent:
             except requests.RequestException as exc:
                 retryable = self._is_retryable_exception(exc)
                 if not retryable:
+                    response = getattr(exc, "response", None)
+                    stale_attempt = False
+                    if getattr(response, "status_code", None) == 409:
+                        try:
+                            body = response.json()
+                        except (TypeError, ValueError):
+                            body = None
+                        detail = body.get("detail") if isinstance(body, dict) else None
+                        stale_attempt = isinstance(detail, dict) and detail.get("code") == "stale_job_attempt"
                     is_repeat = self._last_request_failure == context
                     log_func = _LOGGER.warning if warning and not is_repeat else (
                         _LOGGER.debug if is_repeat else _LOGGER.error
@@ -374,7 +420,7 @@ class WorkerAgent:
                         exc,
                     )
                     self._last_request_failure = context
-                    return {"ok": False, "retryable": False}
+                    return {"ok": False, "retryable": False, "stale_attempt": stale_attempt}
 
                 last_retryable_exc = exc
                 self._handle_request_exception(context, exc, warning=warning)
@@ -400,7 +446,11 @@ class WorkerAgent:
         with self._pending_terminal_statuses_lock:
             for pending in self._pending_terminal_statuses:
                 existing = pending.get("payload", {})
-                if existing.get("job_id") == job_id and existing.get("status") == status:
+                if (
+                    existing.get("job_id") == job_id
+                    and existing.get("status") == status
+                    and existing.get("attempt_number") == payload.get("attempt_number")
+                ):
                     return
             self._pending_terminal_statuses.append(
                 {
@@ -476,12 +526,16 @@ class WorkerAgent:
             self._last_heartbeat = now
 
     def _request_next_job(self) -> Optional[Dict[str, Any]]:
-        _LOGGER.info("POST /api/agent/next-job payload=%s", {"worker_id": self.worker_id})
+        request_payload = {
+            "worker_id": self.worker_id,
+            "capabilities": list(_WORKER_CAPABILITIES),
+        }
+        _LOGGER.info("POST /api/agent/next-job payload=%s", request_payload)
         try:
             with self._session_lock:
                 response = self._session.post(
                     f"{self.server_url}/api/agent/next-job",
-                    json={"worker_id": self.worker_id},
+                    json=request_payload,
                     timeout=30,
                 )
             self._last_request_failure = None
@@ -525,11 +579,12 @@ class WorkerAgent:
         }
         self._update_active_job(job_id, **updated_fields)
 
-    def _post_status(self, job_id: str, status: str, **extra: object) -> None:
+    def _post_status(self, job_id: str, status: str, **extra: object) -> bool:
         with self._state_lock:
             self._last_job_id = job_id
             if status in _TERMINAL_JOB_STATUSES:
                 self._last_terminal_status = status
+            attempt = dict(self._job_attempts.get(job_id, {}))
         self._update_active_job_from_status(job_id, status, dict(extra))
         payload = {
             "job_id": job_id,
@@ -537,8 +592,12 @@ class WorkerAgent:
             "worker_id": self.worker_id,
             "worker_version": self._worker_version,
         }
+        payload.update(attempt)
         payload.update({k: v for k, v in extra.items() if v is not None})
-        _LOGGER.info("POST /api/agent/job-status payload=%s", payload)
+        log_payload = dict(payload)
+        if "attempt_token" in log_payload:
+            log_payload["attempt_token"] = "<redacted>"
+        _LOGGER.info("POST /api/agent/job-status payload=%s", log_payload)
         result = self._post_json_with_retries(
             "/api/agent/job-status",
             payload,
@@ -546,8 +605,11 @@ class WorkerAgent:
             timeout=10,
             warning=True,
         )
+        if result.get("stale_attempt"):
+            raise StaleJobAttemptError(job_id)
         if not result["ok"] and result["retryable"] and status in _TERMINAL_JOB_STATUSES:
             self._enqueue_pending_terminal_status(payload)
+        return bool(result["ok"])
 
     def _fetch_status(self, job_id: str) -> Optional[str]:
         _LOGGER.info("GET /status/%s", job_id)
@@ -647,9 +709,12 @@ class WorkerAgent:
     def request_exit_after_current_job(self) -> None:
         """Ensure the worker stops after the currently running job."""
         self._exit_after_job = True
-        if self._running_thread_count() == 0:
+        if self._running_thread_count() == 0 and self._active_job_count() == 0:
             _LOGGER.info("Exit-after-job requested while idle; stopping worker immediately")
             self.stop()
+        else:
+            # Recovery threads register active jobs without creating a poll-loop job thread.
+            self._has_processed_job = True
 
     def _start_heartbeat_loop(self) -> None:
         if self.heartbeat_interval <= 0:
@@ -670,7 +735,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-id", default=os.environ.get("WORKER_ID"))
     parser.add_argument("--shared-dir", default=os.environ.get("OPEVA_SHARED_DIR", "/opt/opeva_shared_data"))
     parser.add_argument("--image", default=os.environ.get("WORKER_IMAGE", "calof/opeva_simulator:latest"))
-    parser.add_argument("--executor", choices=("docker", "deucalion"), default=os.environ.get("WORKER_EXECUTOR", "docker"))
+    parser.add_argument(
+        "--executor",
+        choices=("docker", "deucalion", "union"),
+        default=os.environ.get("WORKER_EXECUTOR", "docker"),
+    )
     parser.add_argument("--poll-interval", type=float, default=float(os.environ.get("POLL_INTERVAL", "5")))
     parser.add_argument(
         "--heartbeat-interval",
