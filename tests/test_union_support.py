@@ -178,9 +178,10 @@ def test_union_run_helpers_are_deterministic() -> None:
         "s3://bucket/path/result.tar.gz",
         "s3://bucket/path/cancel.request",
     )
-    assert deterministic_run_name("D520A2AB-97DC-48BD-BD35-123456789012", 2) == (
-        "opeva-d520a2ab97dc48bdbd35123456789012-a2"
-    )
+    run_name = deterministic_run_name("D520A2AB-97DC-48BD-BD35-123456789012", 2)
+    assert run_name == deterministic_run_name("D520A2AB-97DC-48BD-BD35-123456789012", 2)
+    assert run_name != deterministic_run_name("D520A2AB-97DC-48BD-BD35-123456789012", 3)
+    assert len(run_name) == 30
 
 
 def test_algorithms_wrapper_marks_process_started_after_launch() -> None:
@@ -437,14 +438,15 @@ def test_union_executor_recovers_restart_between_upload_and_submit(tmp_path: Pat
         env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
         client_factory=factory,
     )
+    legacy_run_name = f"opeva-{job_id.replace('-', '')}-a2"
     run_name = deterministic_run_name(job_id, 2)
     state = {
         "schema_version": 1,
         "job_id": job_id,
         "job_name": "recover-submit",
         "attempt": 2,
-        "run_name": run_name,
-        "union_run_id": run_name,
+        "run_name": legacy_run_name,
+        "union_run_id": legacy_run_name,
         "input_uri": "s3://bucket/run/input.tar.gz",
         "result_uri": "s3://bucket/run/result.tar.gz",
         "cancel_uri": "s3://bucket/run/cancel.request",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from datetime import timedelta
+import hashlib
 import logging
 from pathlib import Path
 import shlex
@@ -76,8 +77,8 @@ def derive_object_uris(input_uri: str) -> tuple[str, str]:
 
 
 def deterministic_run_name(job_id: str, attempt: int) -> str:
-    safe_id = "".join(ch for ch in job_id.lower() if ch.isalnum())[:40]
-    return f"opeva-{safe_id}-a{max(1, int(attempt))}"
+    identity = f"{job_id.strip().lower()}:{max(1, int(attempt))}"
+    return f"opeva-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
 
 def _algorithms_wrapper(job_id: str, command: str, setup_timeout: int) -> str:

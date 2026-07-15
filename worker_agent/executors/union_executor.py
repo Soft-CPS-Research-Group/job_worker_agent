@@ -371,6 +371,13 @@ class UnionExecutor(BaseExecutor):
         if state.get("terminal") is True:
             self._replay_terminal_status(state)
             return
+        if state.get("submitted") is not True and len(str(state.get("run_name") or "")) > 30:
+            state["run_name"] = deterministic_run_name(
+                str(state["job_id"]),
+                max(1, int(state.get("attempt") or 1)),
+            )
+            state["union_run_id"] = state["run_name"]
+            self._save_state(state)
         self._ensure_input_uploaded(state)
         if state.get("submitted") is not True:
             job = state.get("job_payload")
