@@ -216,6 +216,10 @@ class WorkerAgent:
     def _build_heartbeat_info(self) -> Dict[str, Any]:
         active_jobs = self._active_jobs_snapshot()
         active_job_ids = [str(entry.get("job_id")) for entry in active_jobs if entry.get("job_id")]
+        running_job_count = sum(entry.get("status") == "running" for entry in active_jobs)
+        provisioning_job_count = sum(
+            entry.get("phase") == "union:provisioning" for entry in active_jobs
+        )
         first_active = active_jobs[0] if active_jobs else None
         with self._state_lock:
             last_job_id = self._last_job_id
@@ -230,6 +234,8 @@ class WorkerAgent:
             "max_active_jobs": self.max_active_jobs,
             "active_job_id": first_active.get("job_id") if first_active else None,
             "active_job_count": len(active_jobs),
+            "running_job_count": running_job_count,
+            "provisioning_job_count": provisioning_job_count,
             "active_job_ids": active_job_ids,
             "active_jobs": active_jobs,
             "last_job_id": last_job_id,

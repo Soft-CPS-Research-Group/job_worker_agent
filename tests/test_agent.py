@@ -957,9 +957,40 @@ def test_heartbeat_payload_includes_multiple_active_jobs_details():
     info = heartbeat_calls[-1]["json"]["info"]
 
     assert info["active_job_count"] == 2
+    assert info["running_job_count"] == 1
+    assert info["provisioning_job_count"] == 0
     assert set(info["active_job_ids"]) == {"job-a", "job-b"}
     rows = {row["job_id"]: row for row in info["active_jobs"]}
     assert rows["job-a"]["slurm_state"] == "PENDING"
     assert rows["job-a"]["queue_pos"] == 9
     assert rows["job-a"]["ahead"] == 8
     assert rows["job-b"]["slurm_state"] == "RUNNING"
+
+
+def test_heartbeat_payload_counts_union_provisioning_separately_from_running():
+    session = DummySession()
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="union-inesctec",
+        shared_dir="/tmp",
+        image="img",
+        session=session,
+        executor="union",
+        union_executor_factory=lambda runtime: type(
+            "NoopExecutor",
+            (),
+            {"run_job": lambda self, job: None, "heartbeat_info": lambda self: {}, "close": lambda self: None},
+        )(),
+        heartbeat_interval=0,
+        status_poll_interval=0.0,
+    )
+    agent._register_active_job("job-a")
+    agent._update_active_job("job-a", status="setup", phase="union:provisioning")
+    agent._register_active_job("job-b")
+    agent._update_active_job("job-b", status="running", phase="union:running")
+
+    info = agent._build_heartbeat_info()
+
+    assert info["active_job_count"] == 2
+    assert info["running_job_count"] == 1
+    assert info["provisioning_job_count"] == 1
