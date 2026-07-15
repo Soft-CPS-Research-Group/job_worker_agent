@@ -74,7 +74,11 @@ def test_union_executor_blocks_new_jobs_until_device_authentication(tmp_path: Pa
     assert executor.ready_for_new_jobs() is True
 
 
-def test_device_auth_state_reopens_and_recovers_during_active_calls() -> None:
+def test_device_auth_state_reopens_and_recovers_during_active_calls(monkeypatch) -> None:
+    # The base test extra intentionally excludes the optional Flyte SDK. Hook
+    # installation is covered by the Union image smoke test; this unit test only
+    # exercises the worker's auth state transitions.
+    monkeypatch.setattr("worker_agent.union.client._install_device_auth_hooks", lambda _client: None)
     client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
 
     class DeviceResponse:
