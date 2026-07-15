@@ -65,8 +65,13 @@ class UnionRunSnapshot:
     url: str | None = None
 
     @property
+    def normalized_phase(self) -> str:
+        """Return the SDK phase name without its enum/class prefix."""
+        return self.phase.rsplit(".", 1)[-1].upper()
+
+    @property
     def terminal(self) -> bool:
-        return self.phase.upper() in {"SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT"}
+        return self.normalized_phase in {"SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT"}
 
 
 def derive_object_uris(input_uri: str) -> tuple[str, str]:

@@ -300,6 +300,29 @@ class FakeUnionClient:
         self.aborted_runs.append(run_name)
 
 
+@pytest.mark.parametrize(
+    ("phase", "normalized", "terminal"),
+    [
+        ("QUEUED", "QUEUED", False),
+        ("ActionPhase.RUNNING", "RUNNING", False),
+        ("SUCCEEDED", "SUCCEEDED", True),
+        ("ActionPhase.SUCCEEDED", "SUCCEEDED", True),
+        ("ActionPhase.FAILED", "FAILED", True),
+        ("ActionPhase.ABORTED", "ABORTED", True),
+        ("ActionPhase.TIMED_OUT", "TIMED_OUT", True),
+    ],
+)
+def test_union_run_snapshot_normalizes_sdk_enum_phases(
+    phase: str,
+    normalized: str,
+    terminal: bool,
+) -> None:
+    snapshot = UnionRunSnapshot(name="run", phase=phase)
+
+    assert snapshot.normalized_phase == normalized
+    assert snapshot.terminal is terminal
+
+
 def _make_result_archive(root: Path, job_id: str) -> Path:
     payload = root / "result-payload" / "jobs" / job_id
     (payload / "logs").mkdir(parents=True)

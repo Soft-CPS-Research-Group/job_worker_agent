@@ -726,7 +726,7 @@ class UnionExecutor(BaseExecutor):
 
         runner_status = str(state.get("runner_terminal_status") or "")
         success = (
-            remote.phase.upper() == "SUCCEEDED"
+            remote.normalized_phase == "SUCCEEDED"
             and runner_status in {"", "finished"}
             and state.get("artifact_installed") is True
             and state.get("artifact_deleted") is True
