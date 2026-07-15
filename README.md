@@ -40,7 +40,7 @@ Required configuration includes:
 WORKER_ID=union-inesctec
 WORKER_EXECUTOR=union
 WORKER_MAX_ACTIVE_JOBS=10
-FLYTE_API_KEY_FILE=/run/secrets/union_api_key
+UNION_AUTH_MODE=device_flow
 UNION_OBJECT_STORE_CA_FILE=/run/secrets/union_object_store_ca.pem
 UNION_ENDPOINT=dns:///inesctec.hosted.unionai.cloud
 UNION_ORG=inesctec
@@ -65,8 +65,14 @@ run. Result installation, remote cleanup and final orchestrator acknowledgment
 are persisted as separate idempotent steps.
 Union recovery state retains the dispatch attempt fields in its mode-`0600`
 state file so terminal delivery remains fenced after a bridge restart.
-The service key and object-store CA must be mounted read-only and must not be
-baked into either worker image.
+In `device_flow` mode the Flyte keyring must be mounted from a persistent Docker
+volume. The worker refreshes stored credentials automatically and advertises a
+browser URL/code in heartbeat telemetry only when user authentication is needed.
+The same hook covers refresh failure during run monitoring: the remote run is
+left intact, UI authentication is requested, and the blocked reconciliation
+call resumes after login.
+API-key mode remains available by setting `UNION_AUTH_MODE=api_key` and mounting
+`FLYTE_API_KEY_FILE`. Secrets and CA files must not be baked into either image.
 
 ## Quick start (recommended)
 

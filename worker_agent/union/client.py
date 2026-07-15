@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 import shlex
 import time
+import threading
+import weakref
 from typing import Any, Iterator, Mapping
 
 import requests
@@ -16,6 +18,43 @@ from .events import parse_event
 
 
 _LOGGER = logging.getLogger(__name__)
+_DEVICE_AUTH_HOOK_LOCK = threading.Lock()
+_DEVICE_AUTH_OBSERVERS: weakref.WeakSet["FlyteUnionClient"] = weakref.WeakSet()
+_DEVICE_AUTH_HOOKS_INSTALLED = False
+
+
+def _install_device_auth_hooks(client: "FlyteUnionClient") -> None:
+    """Observe every SDK Device Flow, including refresh failures during active runs."""
+    global _DEVICE_AUTH_HOOKS_INSTALLED
+    from flyte.remote._client.auth._authenticators import device_code
+
+    with _DEVICE_AUTH_HOOK_LOCK:
+        _DEVICE_AUTH_OBSERVERS.add(client)
+        if _DEVICE_AUTH_HOOKS_INSTALLED:
+            return
+        original_get_device_code = device_code.token_client.get_device_code
+        original_poll_token_endpoint = device_code.token_client.poll_token_endpoint
+
+        async def observed_get_device_code(*args: Any, **kwargs: Any):
+            response = await original_get_device_code(*args, **kwargs)
+            for observer in list(_DEVICE_AUTH_OBSERVERS):
+                observer._device_authorization_required(response)
+            return response
+
+        async def observed_poll_token_endpoint(*args: Any, **kwargs: Any):
+            try:
+                result = await original_poll_token_endpoint(*args, **kwargs)
+            except Exception as exc:
+                for observer in list(_DEVICE_AUTH_OBSERVERS):
+                    observer._device_authorization_failed(exc)
+                raise
+            for observer in list(_DEVICE_AUTH_OBSERVERS):
+                observer._device_authorization_completed()
+            return result
+
+        device_code.token_client.get_device_code = observed_get_device_code
+        device_code.token_client.poll_token_endpoint = observed_poll_token_endpoint
+        _DEVICE_AUTH_HOOKS_INSTALLED = True
 
 
 @dataclass(frozen=True)
@@ -97,6 +136,93 @@ class FlyteUnionClient:
     def __init__(self, config: UnionConfig) -> None:
         self.config = config
         self._initialized = False
+        self._auth_lock = threading.RLock()
+        self._auth_thread: threading.Thread | None = None
+        self._auth_state: dict[str, Any] = {
+            "status": "authenticated" if config.auth_mode == "api_key" else "checking",
+            "updated_at": time.time(),
+        }
+        if config.auth_mode == "device_flow":
+            _install_device_auth_hooks(self)
+
+    def auth_state(self) -> dict[str, Any]:
+        with self._auth_lock:
+            return dict(self._auth_state)
+
+    def _set_auth_state(self, status: str, **extra: Any) -> None:
+        with self._auth_lock:
+            self._auth_state = {"status": status, "updated_at": time.time(), **extra}
+
+    def _device_authorization_required(self, response: Any) -> None:
+        verification_url = str(response.verification_uri)
+        separator = "&" if "?" in verification_url else "?"
+        self._set_auth_state(
+            "authentication_required",
+            verification_url=verification_url,
+            verification_url_complete=f"{verification_url}{separator}user_code={response.user_code}",
+            user_code=str(response.user_code),
+            expires_at=time.time() + int(response.expires_in),
+        )
+
+    def _device_authorization_completed(self) -> None:
+        self._set_auth_state("authenticated")
+
+    def _device_authorization_failed(self, exc: Exception) -> None:
+        previous = self.auth_state()
+        self._set_auth_state(
+            "authentication_required",
+            error=str(exc),
+            **{
+                key: previous[key]
+                for key in ("verification_url", "verification_url_complete", "user_code", "expires_at")
+                if key in previous
+            },
+        )
+
+    def start_device_authentication(self, request_id: str | None = None) -> bool:
+        if self.config.auth_mode != "device_flow":
+            return False
+        with self._auth_lock:
+            if self._auth_thread and self._auth_thread.is_alive():
+                return False
+            self._auth_state = {
+                "status": "checking",
+                "request_id": request_id,
+                "updated_at": time.time(),
+            }
+            self._auth_thread = threading.Thread(
+                target=self._run_device_authentication,
+                name="union-device-auth",
+                daemon=True,
+            )
+            self._auth_thread.start()
+        return True
+
+    def _run_device_authentication(self) -> None:
+        try:
+            import flyte
+            from flyte.remote import Run
+
+            flyte.init(
+                endpoint=self.config.endpoint,
+                org=self.config.org,
+                project=self.config.project,
+                domain=self.config.domain,
+                headless=True,
+                auth_type="DeviceFlow",
+                ca_cert_file_path=(
+                    str(self.config.control_plane_ca_file) if self.config.control_plane_ca_file else None
+                ),
+                image_builder="remote",
+            )
+            # Force an authenticated control-plane call; flyte.init itself is lazy.
+            next(iter(Run.listall(limit=1)), None)
+            self._initialized = True
+            self._set_auth_state("authenticated")
+        except Exception as exc:
+            _LOGGER.warning("Union device authentication did not complete: %s", exc)
+            self._initialized = False
+            self._set_auth_state("authentication_required", error=str(exc))
 
     def initialize(self) -> None:
         if self._initialized:
@@ -105,6 +231,11 @@ class FlyteUnionClient:
             import flyte
         except ImportError as exc:  # pragma: no cover - image contract
             raise RuntimeError("Union executor requires the worker 'union' dependency extra") from exc
+        if self.config.auth_mode == "device_flow":
+            if not self._initialized:
+                self.start_device_authentication()
+                raise RuntimeError("Union authentication is required before jobs can be submitted")
+            return
         ca_path = str(self.config.control_plane_ca_file) if self.config.control_plane_ca_file else None
         flyte.init(
             endpoint=self.config.endpoint,

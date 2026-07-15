@@ -59,14 +59,27 @@ class UnionExecutor(BaseExecutor):
         self.wait_fn = wait_fn or self._closing.wait
 
     def heartbeat_info(self) -> Dict[str, Any]:
-        return {
+        info = {
             "gpu_enabled": True,
             "gpu_required": True,
             "union_endpoint": self.config.endpoint,
             "union_project": self.config.project,
             "union_domain": self.config.domain,
             "union_gpu_count": self.config.gpu_count,
+            "union_auth_mode": self.config.auth_mode,
         }
+        if self.config.auth_mode == "device_flow":
+            info["union_auth"] = self.client.auth_state()
+        return info
+
+    def ready_for_new_jobs(self) -> bool:
+        if self.config.auth_mode != "device_flow":
+            return True
+        return self.client.auth_state().get("status") == "authenticated"
+
+    def handle_command(self, command: Dict[str, Any]) -> None:
+        if command.get("action") == "union_authenticate":
+            self.client.start_device_authentication(str(command.get("request_id") or ""))
 
     def _job_dir(self, job_id: str) -> Path:
         return Path(self.runtime.shared_dir) / "jobs" / job_id
@@ -256,6 +269,8 @@ class UnionExecutor(BaseExecutor):
             pass
 
     def on_startup(self) -> None:
+        if self.config.auth_mode == "device_flow":
+            self.client.start_device_authentication()
         jobs_root = Path(self.runtime.shared_dir) / "jobs"
         if not jobs_root.is_dir():
             return

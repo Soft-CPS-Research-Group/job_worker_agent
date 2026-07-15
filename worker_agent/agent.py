@@ -283,10 +283,15 @@ class WorkerAgent:
         self._reap_finished_job_threads()
         self._flush_pending_terminal_statuses()
         self._send_heartbeat()
+        self._poll_worker_command()
         self._flush_pending_terminal_statuses()
         handled = False
 
-        while not self._stop_event.is_set() and self._available_slots() > 0:
+        while (
+            not self._stop_event.is_set()
+            and self._available_slots() > 0
+            and getattr(self._executor, "ready_for_new_jobs", lambda: True)()
+        ):
             job = self._request_next_job()
             if not job:
                 break
@@ -310,6 +315,23 @@ class WorkerAgent:
             _LOGGER.info("Exit-after-job flag set; stopping worker once current job completes")
             self.stop()
         return handled
+
+    def _poll_worker_command(self) -> None:
+        try:
+            with self._session_lock:
+                response = self._session.post(
+                    f"{self.server_url}/api/agent/worker-command",
+                    json={"worker_id": self.worker_id},
+                    timeout=10,
+                )
+            response.raise_for_status()
+            command = response.json()
+            if isinstance(command, dict) and command.get("action"):
+                handler = getattr(self._executor, "handle_command", None)
+                if callable(handler):
+                    handler(command)
+        except (requests.RequestException, TypeError, ValueError) as exc:
+            _LOGGER.debug("Unable to poll worker command: %s", exc)
 
     def _run_job(self, job: Dict[str, Any]) -> None:
         self._bind_job_attempt(job)

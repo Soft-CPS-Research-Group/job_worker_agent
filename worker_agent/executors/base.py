@@ -69,5 +69,11 @@ class BaseExecutor:
     def heartbeat_info(self) -> Dict[str, Any]:
         return {}
 
+    def ready_for_new_jobs(self) -> bool:
+        return True
+
+    def handle_command(self, command: Dict[str, Any]) -> None:
+        return None
+
     def close(self) -> None:
         return None

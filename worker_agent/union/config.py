@@ -25,11 +25,12 @@ def _required(env: Mapping[str, str], name: str, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class UnionConfig:
+    auth_mode: str
     endpoint: str
     org: str
     project: str
     domain: str
-    api_key_file: Path
+    api_key_file: Path | None
     runner_image: str
     object_store_ca_file: Path | None
     control_plane_ca_file: Path | None
@@ -51,12 +52,17 @@ class UnionConfig:
     def from_env(cls, env: Mapping[str, str]) -> "UnionConfig":
         ca_raw = str(env.get("UNION_OBJECT_STORE_CA_FILE", "")).strip()
         control_plane_ca_raw = str(env.get("UNION_CONTROL_PLANE_CA_FILE", "")).strip()
+        auth_mode = str(env.get("UNION_AUTH_MODE", "api_key")).strip().lower().replace("-", "_")
+        if auth_mode not in {"api_key", "device_flow"}:
+            raise ValueError("UNION_AUTH_MODE must be 'api_key' or 'device_flow'")
+        api_key_raw = str(env.get("FLYTE_API_KEY_FILE", "/run/secrets/union_api_key")).strip()
         return cls(
+            auth_mode=auth_mode,
             endpoint=_required(env, "UNION_ENDPOINT", "dns:///inesctec.hosted.unionai.cloud"),
             org=_required(env, "UNION_ORG", "inesctec"),
             project=_required(env, "UNION_PROJECT", "humanise-energaize"),
             domain=_required(env, "UNION_DOMAIN", "development"),
-            api_key_file=Path(_required(env, "FLYTE_API_KEY_FILE", "/run/secrets/union_api_key")),
+            api_key_file=Path(api_key_raw) if auth_mode == "api_key" else None,
             runner_image=_required(env, "UNION_RUNNER_IMAGE", "calof/job_worker_agent:union-latest"),
             object_store_ca_file=Path(ca_raw) if ca_raw else None,
             control_plane_ca_file=Path(control_plane_ca_raw) if control_plane_ca_raw else None,
@@ -79,6 +85,8 @@ class UnionConfig:
         )
 
     def read_api_key(self) -> str:
+        if self.api_key_file is None:
+            raise RuntimeError("Union API key is unavailable in device-flow mode")
         try:
             value = self.api_key_file.read_text(encoding="utf-8").strip()
         except OSError as exc:

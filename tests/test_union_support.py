@@ -11,6 +11,7 @@ import pytest
 from worker_agent.executors.union_executor import UnionExecutor
 from worker_agent.union.archive import collect_input_paths, safe_extract
 from worker_agent.union.client import (
+    FlyteUnionClient,
     UnionRunSnapshot,
     _algorithms_wrapper,
     derive_object_uris,
@@ -33,6 +34,64 @@ def test_union_config_reads_headless_defaults(tmp_path: Path) -> None:
     assert config.retry_max_backoff_seconds == 60
     assert config.control_plane_ca_file is None
     assert config.read_api_key() == "secret-key"
+
+
+def test_union_config_supports_device_flow_without_api_key() -> None:
+    config = UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"})
+
+    assert config.auth_mode == "device_flow"
+    assert config.api_key_file is None
+    with pytest.raises(RuntimeError, match="device-flow"):
+        config.read_api_key()
+
+
+def test_union_executor_blocks_new_jobs_until_device_authentication(tmp_path: Path) -> None:
+    runtime = FakeRuntime(tmp_path)
+
+    class AuthClient:
+        def __init__(self, _config):
+            self.state = {"status": "authentication_required", "user_code": "ABCD"}
+            self.started = 0
+
+        def auth_state(self):
+            return dict(self.state)
+
+        def start_device_authentication(self, _request_id=None):
+            self.started += 1
+            return True
+
+    executor = UnionExecutor(
+        runtime,
+        env={"UNION_AUTH_MODE": "device_flow"},
+        client_factory=AuthClient,
+    )
+
+    assert executor.ready_for_new_jobs() is False
+    assert executor.heartbeat_info()["union_auth"]["user_code"] == "ABCD"
+    executor.handle_command({"action": "union_authenticate", "request_id": "request-1"})
+    assert executor.client.started == 1
+    executor.client.state = {"status": "authenticated"}
+    assert executor.ready_for_new_jobs() is True
+
+
+def test_device_auth_state_reopens_and_recovers_during_active_calls() -> None:
+    client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
+
+    class DeviceResponse:
+        verification_uri = "https://signin.example/activate"
+        user_code = "ABCD-EFGH"
+        expires_in = 600
+
+    client._initialized = True
+    client._set_auth_state("authenticated")
+    client._device_authorization_required(DeviceResponse())
+
+    required = client.auth_state()
+    assert required["status"] == "authentication_required"
+    assert required["verification_url_complete"].endswith("user_code=ABCD-EFGH")
+
+    client._device_authorization_completed()
+    assert client.auth_state()["status"] == "authenticated"
 
 
 def test_union_event_round_trip_ignores_invalid_lines() -> None:
