@@ -4,7 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sys
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +98,38 @@ def test_device_auth_state_reopens_and_recovers_during_active_calls(monkeypatch)
 
     client._device_authorization_completed()
     assert client.auth_state()["status"] == "authenticated"
+
+
+def test_union_container_task_runs_without_rebundling_baked_image(monkeypatch) -> None:
+    monkeypatch.setattr("worker_agent.union.client._install_device_auth_hooks", lambda _client: None)
+    client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
+    client._initialized = True
+    task = object()
+    monkeypatch.setattr(client, "_pod_task", lambda **_kwargs: task)
+    captured: dict[str, object] = {}
+
+    class RunContext:
+        def run(self, submitted_task):
+            assert submitted_task is task
+            return SimpleNamespace(name="run-1", phase="queued", url="https://union/run-1")
+
+    def with_runcontext(**kwargs):
+        captured.update(kwargs)
+        return RunContext()
+
+    monkeypatch.setitem(sys.modules, "flyte", SimpleNamespace(with_runcontext=with_runcontext))
+
+    snapshot = client.submit_job(
+        job={"job_id": "job-1"},
+        run_name="run-1",
+        input_uri="s3://bucket/input",
+        result_uri="s3://bucket/result",
+        cancel_uri="s3://bucket/cancel",
+    )
+
+    assert captured["copy_style"] == "none"
+    assert captured["version"] == "run-1"
+    assert snapshot.name == "run-1"
 
 
 def test_union_event_round_trip_ignores_invalid_lines() -> None:

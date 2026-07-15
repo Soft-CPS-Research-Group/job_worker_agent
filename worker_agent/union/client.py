@@ -378,6 +378,8 @@ class FlyteUnionClient:
         try:
             run = flyte.with_runcontext(
                 name=run_name,
+                version=run_name,
+                copy_style="none",
                 labels={"opeva-job-id": str(job["job_id"]), "opeva-worker": "union-inesctec"},
             ).run(task)
         except Exception as exc:
@@ -459,7 +461,7 @@ class FlyteUnionClient:
         )
         flyte.TaskEnvironment.from_task(f"opeva-sign-{job_id.replace('-', '')[:20]}", task)
         run_name = f"opeva-sign-{job_id.replace('-', '')[:24]}-{int(time.time())}"
-        run = flyte.with_runcontext(name=run_name).run(task)
+        run = flyte.with_runcontext(name=run_name, version=run_name, copy_style="none").run(task)
         run.wait(quiet=True)
         last_error: Exception | None = None
         for _ in range(3):
