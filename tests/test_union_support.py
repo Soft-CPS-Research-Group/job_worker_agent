@@ -999,6 +999,63 @@ def test_union_executor_aborts_remote_run_if_backend_is_already_stopped(tmp_path
 
     assert holder["client"].aborted_runs == [state["run_name"]]
     assert state["terminal_status"] == "stopped"
+    assert state["requested_terminal_status"] == "stopped"
+
+
+def test_union_executor_requested_stop_never_downloads_partial_artifact(tmp_path: Path) -> None:
+    job_id = "d8308808-2e2c-464c-8445-46632548ae44"
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+    runtime.backend_status = "stop_requested"
+
+    class AbortedClient(FakeUnionClient):
+        def __init__(self, config: UnionConfig, archive: Path) -> None:
+            super().__init__(config, archive)
+            self.download_calls = 0
+
+        def get_run(self, run_name: str) -> UnionRunSnapshot:
+            return UnionRunSnapshot(name=run_name, phase="ActionPhase.ABORTED", url="https://union/run")
+
+        def stream_logs(self, run_name: str):
+            return iter(())
+
+        def download_artifact(self, get_url: str, destination: Path) -> None:
+            self.download_calls += 1
+            raise AssertionError("stopped Union jobs must not download result artifacts")
+
+    holder: dict[str, AbortedClient] = {}
+
+    def factory(config: UnionConfig) -> AbortedClient:
+        client = AbortedClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused"), "UNION_POLL_INTERVAL_SECONDS": "1"},
+        client_factory=factory,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "run_url": "https://union/run",
+        "result_uri": "s3://bucket/run/result.tar.gz",
+        "submitted": True,
+        "terminal": False,
+        "artifact": dict(holder["client"].artifact),
+        "log_line_count": 0,
+        "last_event_sequence": 0,
+    }
+
+    executor._monitor(state)
+
+    assert state["terminal_status"] == "stopped"
+    assert state["requested_terminal_status"] == "stopped"
+    assert holder["client"].download_calls == 0
+    assert state.get("artifact_installed") is not True
+    assert state["artifact_deleted"] is True
+    assert holder["client"].deleted is True
+    assert runtime.statuses[-1][1] == "stopped"
 
 
 def test_union_executor_retries_transient_control_plane_failure(tmp_path: Path) -> None:

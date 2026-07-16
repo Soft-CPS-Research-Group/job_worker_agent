@@ -32,6 +32,7 @@ from .base import BaseExecutor, StaleJobAttemptError, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _TERMINAL_BACKEND_STATUSES = {"finished", "failed", "stopped", "canceled"}
+_STOP_BACKEND_STATUSES = {"stop_requested", "stopped", "canceled"}
 _GPU_MODEL_LOG_MARKER = "CUDA device selected:"
 _GPU_MODEL_LOG_SCAN_BYTES = 512 * 1024
 
@@ -734,7 +735,10 @@ class UnionExecutor(BaseExecutor):
         run_name = str(state["run_name"])
         log_thread, log_result, log_stop = self._start_log_pump(state, log_path)
         last_status_update = 0.0
-        cancel_requested_at: float | None = None
+        persisted_cancel_at = state.get("cancel_requested_at")
+        cancel_requested_at = (
+            float(persisted_cancel_at) if isinstance(persisted_cancel_at, (int, float)) else None
+        )
         remote: UnionRunSnapshot | None = None
 
         while not self._closing.is_set():
@@ -747,13 +751,19 @@ class UnionExecutor(BaseExecutor):
             state["run_url"] = remote.url
             now = self.now_fn()
             backend_status = self.runtime._fetch_status(job_id)
-            if backend_status in {"stop_requested", "canceled", "stopped"}:
+            if backend_status in _STOP_BACKEND_STATUSES:
+                requested_terminal_status = "canceled" if backend_status == "canceled" else "stopped"
+                state["requested_terminal_status"] = requested_terminal_status
                 if cancel_requested_at is None:
                     cancel_requested_at = now
+                    state["cancel_requested_at"] = cancel_requested_at
+                    self._save_state(state)
                     put_url = str(state.get("cancel_put_url") or "")
                     if put_url and backend_status == "stop_requested":
                         try:
                             self.client.request_graceful_cancel(put_url)
+                            state["cancel_signal_sent"] = True
+                            self._save_state(state)
                             self._append_log(log_path, "[union-worker] Graceful cancellation requested")
                         except Exception as exc:
                             _LOGGER.warning("Graceful Union cancellation failed: %s", exc)
@@ -772,7 +782,8 @@ class UnionExecutor(BaseExecutor):
                         lambda: self.client.abort(run_name, reason="OPEVA graceful cancellation timeout"),
                     )
 
-            if now - last_status_update >= self.config.status_update_interval_seconds:
+            stop_intent = str(state.get("requested_terminal_status") or "") in {"stopped", "canceled"}
+            if not stop_intent and now - last_status_update >= self.config.status_update_interval_seconds:
                 status = "running" if state.get("started_at") else "setup"
                 self.runtime._post_status(
                     job_id,
@@ -808,16 +819,25 @@ class UnionExecutor(BaseExecutor):
             raise RuntimeError(f"No Union state was returned for run {run_name}")
 
         backend_status = self.runtime._fetch_status(job_id)
-        requested_stop = backend_status in {"stop_requested", "canceled", "stopped"}
+        if backend_status in _STOP_BACKEND_STATUSES:
+            state["requested_terminal_status"] = "canceled" if backend_status == "canceled" else "stopped"
+        requested_terminal_status = str(state.get("requested_terminal_status") or "")
+        requested_stop = requested_terminal_status in {"stopped", "canceled"}
         artifact = state.get("artifact") if isinstance(state.get("artifact"), dict) else None
+
+        if requested_stop:
+            self._delete_stopped_artifact_best_effort(state, artifact, log_path)
+            state["union_phase"] = remote.phase
+            self._finalize_terminal(state, requested_terminal_status)
+            return
+
         if artifact is None and state.get("result_uri"):
             try:
                 artifact = self._refresh_artifact(state)
                 state["artifact"] = artifact
                 self._save_state(state)
             except Exception as exc:
-                if not requested_stop:
-                    raise RuntimeError(f"Union result artifact is unavailable: {exc}") from exc
+                raise RuntimeError(f"Union result artifact is unavailable: {exc}") from exc
 
         if artifact is not None:
             self._install_artifact(state, artifact, log_path)
@@ -829,12 +849,40 @@ class UnionExecutor(BaseExecutor):
             and state.get("artifact_installed") is True
             and state.get("artifact_deleted") is True
         )
-        if requested_stop:
-            final_status = "canceled" if backend_status == "canceled" else "stopped"
-        else:
-            final_status = "finished" if success else "failed"
+        final_status = "finished" if success else "failed"
         state["union_phase"] = remote.phase
         self._finalize_terminal(state, final_status)
+
+    def _delete_stopped_artifact_best_effort(
+        self,
+        state: dict[str, Any],
+        artifact: dict[str, Any] | None,
+        log_path: Path,
+    ) -> None:
+        if state.get("artifact_deleted") is True:
+            return
+        try:
+            if artifact is None:
+                if not state.get("result_uri"):
+                    return
+                refreshed = self.client.refresh_artifact(str(state["result_uri"]), str(state["job_id"]))
+                state["artifact"] = refreshed
+                artifact = refreshed
+            try:
+                self.client.delete_artifact(str(artifact["delete_url"]))
+            except Exception:
+                refreshed = self.client.refresh_artifact(str(state["result_uri"]), str(state["job_id"]))
+                state["artifact"] = refreshed
+                self.client.delete_artifact(str(refreshed["delete_url"]))
+            state["artifact_deleted"] = True
+            state.pop("stopped_artifact_cleanup_error", None)
+        except Exception as exc:
+            state["stopped_artifact_cleanup_error"] = str(exc)
+            self._append_log(
+                log_path,
+                f"[union-worker] Result artifact cleanup deferred after requested stop: {exc}",
+            )
+        self._save_state(state)
 
     def _refresh_artifact(self, state: dict[str, Any]) -> dict[str, Any]:
         job_id = str(state["job_id"])

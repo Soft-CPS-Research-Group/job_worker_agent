@@ -29,6 +29,31 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.2 - 2026-07-16
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Preserves intentional Union stop/cancel outcomes without downloading result
+artifacts from an aborted Run.
+
+### Changed
+
+- Persists cancellation intent and timestamp in Union recovery state so bridge
+  restarts cannot lose the requested terminal outcome.
+- Stops publishing active status updates after cancellation begins.
+- Skips result download and installation entirely after an explicit stop or
+  cancellation, while retaining strict size and checksum validation for
+  completed Runs.
+- Attempts only best-effort remote cleanup of any stopped Run artifact without
+  converting a successful stop into a failed job.
+- Worker version is now reported as `0.5.2`.
+
+### Validation
+
+- `.venv/bin/pytest`: pass (`135 passed`).
+
 ## v0.5.1 - 2026-07-16
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

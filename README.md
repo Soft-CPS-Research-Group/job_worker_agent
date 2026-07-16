@@ -24,7 +24,7 @@ queued jobs, executes workloads via the configured executor (`docker`,
   terminates the superseded Docker container, Slurm job or Union Run. Tokens
   are redacted from logs.
 
-Current package version: `0.5.1`. Release notes live in [`docs/releases.md`](docs/releases.md).
+Current package version: `0.5.2`. Release notes live in [`docs/releases.md`](docs/releases.md).
 
 ## Union INESC TEC mode
 
