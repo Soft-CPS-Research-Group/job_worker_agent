@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -31,6 +32,27 @@ from .base import BaseExecutor, StaleJobAttemptError, WorkerRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _TERMINAL_BACKEND_STATUSES = {"finished", "failed", "stopped", "canceled"}
+_GPU_MODEL_LOG_MARKER = "CUDA device selected:"
+_GPU_MODEL_LOG_SCAN_BYTES = 512 * 1024
+
+
+def _normalize_gpu_model(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())[:160]
+    return normalized or None
+
+
+def _gpu_model_from_log(path: Path) -> str | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            content = handle.read(_GPU_MODEL_LOG_SCAN_BYTES)
+    except OSError:
+        return None
+    for line in content.splitlines():
+        if _GPU_MODEL_LOG_MARKER in line:
+            return _normalize_gpu_model(line.rsplit(_GPU_MODEL_LOG_MARKER, 1)[1])
+    return None
 
 
 class _RecoveryInterrupted(RuntimeError):
@@ -146,21 +168,42 @@ class UnionExecutor(BaseExecutor):
         return {
             "executor_stage": stage,
             "started_at": state.get("started_at"),
+            "gpu_model": state.get("gpu_model"),
             "union_run_id": state.get("run_name"),
             "union_run_url": state.get("run_url"),
             "union_phase": state.get("union_phase"),
             **extra,
         }
 
-    @staticmethod
-    def _is_retryable_control_plane_error(exc: Exception) -> bool:
+    def _is_retryable_control_plane_error(self, exc: Exception, *, stage: str = "") -> bool:
         if isinstance(exc, (ValueError, TypeError, KeyError, FileNotFoundError)):
+            return False
+        if isinstance(exc, OSError) and exc.errno in {
+            errno.EACCES,
+            errno.EDQUOT,
+            errno.ENOSPC,
+            errno.EROFS,
+        }:
             return False
         response = getattr(exc, "response", None)
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int) and 400 <= status_code < 500:
+            if self.config.auth_mode == "device_flow" and status_code == 401:
+                return True
             return status_code in {408, 409, 425, 429}
         message = str(exc).lower()
+        authentication_markers = (
+            "unauthenticated",
+            "authentication failed",
+            "token expired",
+            "authorization pending",
+        )
+        if self.config.auth_mode == "device_flow" and any(marker in message for marker in authentication_markers):
+            return True
+        if stage in {"polling_run", "refreshing_artifact"} and "not found" in message:
+            # Runs and freshly uploaded result objects can briefly be absent
+            # from the corresponding read path.
+            return True
         permanent_markers = (
             "permission denied",
             "unauthenticated",
@@ -188,8 +231,12 @@ class UnionExecutor(BaseExecutor):
             try:
                 result = operation()
             except Exception as exc:
-                if not self._is_retryable_control_plane_error(exc):
+                if not self._is_retryable_control_plane_error(exc, stage=stage):
                     raise
+                if self.config.auth_mode == "device_flow":
+                    auth_state = self.client.auth_state()
+                    if auth_state.get("status") != "authenticated":
+                        self.client.start_device_authentication()
                 now = self.now_fn()
                 if unreachable_since is None:
                     unreachable_since = now
@@ -296,8 +343,17 @@ class UnionExecutor(BaseExecutor):
             job_payload = state.get("job_payload")
             if isinstance(job_payload, dict):
                 self.runtime._bind_job_attempt(job_payload)
+            if not state.get("gpu_model"):
+                state["gpu_model"] = _gpu_model_from_log(self.runtime._prepare_log_file(job_id))
+                if state["gpu_model"]:
+                    self._save_state(state)
             self.runtime._register_active_job(job_id, job_name)
-            self.runtime._update_active_job(job_id, phase="union:recovering", status="setup")
+            self.runtime._update_active_job(
+                job_id,
+                phase="union:recovering",
+                status="setup",
+                gpu_model=state.get("gpu_model"),
+            )
             thread = threading.Thread(
                 target=self._recover,
                 args=(state,),
@@ -496,6 +552,7 @@ class UnionExecutor(BaseExecutor):
     def _terminal_details(self, state: dict[str, Any], status: str, stage: str) -> dict[str, Any]:
         return {
             "executor_stage": stage,
+            "gpu_model": state.get("gpu_model"),
             "union_run_id": state.get("run_name"),
             "union_run_url": state.get("run_url"),
             "union_phase": state.get("union_phase"),
@@ -565,6 +622,7 @@ class UnionExecutor(BaseExecutor):
         self._replay_terminal_status(state)
 
     def _handle_log_line(self, state: dict[str, Any], log_path: Path, line: str) -> None:
+        job_id = str(state["job_id"])
         state["log_line_count"] = int(state.get("log_line_count", 0)) + 1
         event = parse_event(line)
         if event is None:
@@ -575,6 +633,12 @@ class UnionExecutor(BaseExecutor):
                 state["algorithm_lines_relayed"] = int(state.get("algorithm_lines_relayed", 0)) + 1
             if cleaned:
                 self._append_log(log_path, cleaned)
+                if not state.get("gpu_model") and _GPU_MODEL_LOG_MARKER in cleaned:
+                    gpu_model = _normalize_gpu_model(cleaned.rsplit(_GPU_MODEL_LOG_MARKER, 1)[1])
+                    if gpu_model:
+                        state["gpu_model"] = gpu_model
+                        self.runtime._update_active_job(job_id, gpu_model=gpu_model)
+                        self.runtime._send_heartbeat(force=True)
             if int(state["log_line_count"]) % 25 == 0:
                 self._save_state(state)
             return
@@ -584,7 +648,6 @@ class UnionExecutor(BaseExecutor):
             return
         state["last_event_sequence"] = sequence
         kind = str(event.get("kind"))
-        job_id = str(state["job_id"])
         if kind == "setup":
             if isinstance(event.get("cancel_put_url"), str):
                 state["cancel_put_url"] = event["cancel_put_url"]
@@ -593,17 +656,23 @@ class UnionExecutor(BaseExecutor):
             self.runtime._update_active_job(job_id, phase=f"union:{phase}", status="setup")
         elif kind == "started":
             started_at = float(event.get("started_at") or event.get("timestamp") or self.now_fn())
+            gpu_model = _normalize_gpu_model(event.get("gpu_model"))
             state["started_at"] = started_at
-            self.runtime._post_status(
+            if gpu_model:
+                state["gpu_model"] = gpu_model
+            delivered = self.runtime._post_status(
                 job_id,
                 "running",
                 details={
                     "executor_stage": "union:running",
                     "started_at": started_at,
+                    "gpu_model": gpu_model,
                     "union_run_id": state.get("run_name"),
                     "union_run_url": state.get("run_url"),
                 },
             )
+            if delivered:
+                self.runtime._send_heartbeat(force=True)
         elif kind == "progress" and isinstance(event.get("progress"), dict):
             self._write_progress(job_id, dict(event["progress"]))
         elif kind == "artifact" and isinstance(event.get("artifact"), dict):
@@ -613,29 +682,57 @@ class UnionExecutor(BaseExecutor):
             state["runner_exit_code"] = event.get("exit_code")
         self._save_state(state)
 
-    def _start_log_pump(self, state: dict[str, Any], log_path: Path) -> tuple[threading.Thread, dict[str, Any]]:
-        result: dict[str, Any] = {"error": None}
-        skip_lines = int(state.get("log_line_count", 0))
+    def _start_log_pump(
+        self,
+        state: dict[str, Any],
+        log_path: Path,
+    ) -> tuple[threading.Thread, dict[str, Any], threading.Event]:
+        result: dict[str, Any] = {"error": None, "reconnects": 0}
+        stop_event = threading.Event()
 
         def _pump() -> None:
-            try:
-                for index, line in enumerate(self.client.stream_logs(str(state["run_name"]))):
-                    if index < skip_lines:
-                        continue
-                    self._handle_log_line(state, log_path, str(line))
-            except Exception as exc:  # remote logs are best effort; artifacts remain authoritative
-                result["error"] = exc
-                _LOGGER.warning("Union log stream ended for %s: %s", state["job_id"], exc)
+            delay = max(1, int(self.config.poll_interval_seconds))
+            max_delay = max(delay, int(self.config.retry_max_backoff_seconds))
+            while not self._closing.is_set() and not stop_event.is_set():
+                skip_lines = int(state.get("log_line_count", 0))
+                received_new_line = False
+                result["error"] = None
+                try:
+                    for index, line in enumerate(self.client.stream_logs(str(state["run_name"]))):
+                        if self._closing.is_set() or stop_event.is_set():
+                            return
+                        if index < skip_lines:
+                            continue
+                        received_new_line = True
+                        self._handle_log_line(state, log_path, str(line))
+                except Exception as exc:  # remote logs are best effort; artifacts remain authoritative
+                    result["error"] = exc
+                    _LOGGER.warning(
+                        "Union log stream interrupted for %s; reconnecting: %s",
+                        state["job_id"],
+                        exc,
+                    )
+
+                if self._closing.is_set() or stop_event.is_set():
+                    return
+                if state.get("runner_terminal_status"):
+                    return
+                result["reconnects"] = int(result["reconnects"]) + 1
+                if received_new_line:
+                    delay = max(1, int(self.config.poll_interval_seconds))
+                if stop_event.wait(delay):
+                    return
+                delay = min(delay * 2, max_delay)
 
         thread = threading.Thread(target=_pump, name=f"union-logs-{str(state['job_id'])[:8]}", daemon=True)
         thread.start()
-        return thread, result
+        return thread, result, stop_event
 
     def _monitor(self, state: dict[str, Any]) -> None:
         job_id = str(state["job_id"])
         log_path = self.runtime._prepare_log_file(job_id)
         run_name = str(state["run_name"])
-        log_thread, log_result = self._start_log_pump(state, log_path)
+        log_thread, log_result, log_stop = self._start_log_pump(state, log_path)
         last_status_update = 0.0
         cancel_requested_at: float | None = None
         remote: UnionRunSnapshot | None = None
@@ -650,7 +747,7 @@ class UnionExecutor(BaseExecutor):
             state["run_url"] = remote.url
             now = self.now_fn()
             backend_status = self.runtime._fetch_status(job_id)
-            if backend_status in {"stop_requested", "canceled"}:
+            if backend_status in {"stop_requested", "canceled", "stopped"}:
                 if cancel_requested_at is None:
                     cancel_requested_at = now
                     put_url = str(state.get("cancel_put_url") or "")
@@ -666,7 +763,9 @@ class UnionExecutor(BaseExecutor):
                             "aborting_run",
                             lambda: self.client.abort(run_name, reason=f"OPEVA job {backend_status}"),
                         )
-                elif backend_status == "canceled" or (now - cancel_requested_at) >= self.config.graceful_stop_timeout_seconds:
+                elif backend_status in {"canceled", "stopped"} or (
+                    now - cancel_requested_at
+                ) >= self.config.graceful_stop_timeout_seconds:
                     self._retry_control_plane(
                         state,
                         "aborting_run",
@@ -681,6 +780,7 @@ class UnionExecutor(BaseExecutor):
                     details={
                         "executor_stage": "union:running" if status == "running" else "union:provisioning",
                         "started_at": state.get("started_at"),
+                        "gpu_model": state.get("gpu_model"),
                         "union_run_id": run_name,
                         "union_run_url": remote.url,
                         "union_phase": remote.phase,
@@ -695,7 +795,10 @@ class UnionExecutor(BaseExecutor):
                 break
             self._closing.wait(self.config.poll_interval_seconds)
 
-        log_thread.join(timeout=15)
+        if remote is not None and remote.terminal:
+            log_thread.join(timeout=15)
+        log_stop.set()
+        log_thread.join(timeout=1)
         if log_result.get("error"):
             self._append_log(log_path, f"[union-worker] Live logs unavailable: {log_result['error']}")
         if self._closing.is_set() and (remote is None or not remote.terminal):
@@ -709,12 +812,7 @@ class UnionExecutor(BaseExecutor):
         artifact = state.get("artifact") if isinstance(state.get("artifact"), dict) else None
         if artifact is None and state.get("result_uri"):
             try:
-                artifact = self._retry_control_plane(
-                    state,
-                    "refreshing_artifact",
-                    lambda: self.client.refresh_artifact(str(state["result_uri"]), job_id),
-                    keep_retrying_after_grace=False,
-                )
+                artifact = self._refresh_artifact(state)
                 state["artifact"] = artifact
                 self._save_state(state)
             except Exception as exc:
@@ -737,6 +835,45 @@ class UnionExecutor(BaseExecutor):
             final_status = "finished" if success else "failed"
         state["union_phase"] = remote.phase
         self._finalize_terminal(state, final_status)
+
+    def _refresh_artifact(self, state: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(state["job_id"])
+        result_uri = str(state["result_uri"])
+        delay = max(1, int(self.config.poll_interval_seconds))
+        max_delay = max(delay, int(self.config.retry_max_backoff_seconds))
+        attempts = max(1, int(self.config.artifact_refresh_attempts))
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            if self._closing.is_set():
+                raise _RecoveryInterrupted("Union recovery interrupted while waiting for the result artifact")
+            try:
+                return dict(self.client.refresh_artifact(result_uri, job_id))
+            except Exception as exc:
+                last_error = exc
+                if not self._is_retryable_control_plane_error(exc, stage="refreshing_artifact"):
+                    raise
+                if self.config.auth_mode == "device_flow":
+                    auth_state = self.client.auth_state()
+                    if auth_state.get("status") != "authenticated":
+                        self.client.start_device_authentication()
+                if attempt >= attempts:
+                    break
+                self._append_log(
+                    self.runtime._prepare_log_file(job_id),
+                    f"[union-worker] Result artifact not available yet; retrying ({attempt}/{attempts}): {exc}",
+                )
+                self.runtime._post_status(
+                    job_id,
+                    self._active_status(state),
+                    details=self._active_details(state, stage="union:waiting_for_artifact"),
+                )
+                self.wait_fn(delay)
+                delay = min(delay * 2, max_delay)
+
+        raise RuntimeError(
+            f"Union result artifact remained unavailable after {attempts} attempts: {last_error}"
+        ) from last_error
 
     @staticmethod
     def _file_sha256(path: Path) -> str:

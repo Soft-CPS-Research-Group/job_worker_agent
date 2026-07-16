@@ -86,6 +86,11 @@ def deterministic_run_name(job_id: str, attempt: int) -> str:
     return f"opeva-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
 
+def artifact_signer_run_name(job_id: str, nonce: int | None = None) -> str:
+    identity = f"{job_id.strip().lower()}:{nonce if nonce is not None else time.time_ns()}"
+    return f"opeva-sign-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:19]}"
+
+
 def _algorithms_wrapper(job_id: str, command: str, setup_timeout: int) -> str:
     tokens = shlex.split(command)
     if tokens and tokens[0] == "python":
@@ -94,6 +99,7 @@ def _algorithms_wrapper(job_id: str, command: str, setup_timeout: int) -> str:
         algorithm_command = ["python", "run_experiment.py", *tokens]
     command_text = " ".join(shlex.quote(token) for token in algorithm_command)
     marker_root = "/data/.opeva"
+    gpu_model_path = marker_root + "/gpu.model"
     log_path = f"/data/jobs/{job_id}/logs/{job_id}.log"
     return f"""
 set +e
@@ -117,6 +123,17 @@ while [ ! -f {shlex.quote(marker_root + '/input.ready')} ]; do
   fi
   sleep 1
 done
+gpu_model=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  gpu_model="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '\r')"
+fi
+if [ -z "$gpu_model" ]; then
+  gpu_model="$(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")' 2>/dev/null)"
+fi
+if [ -n "$gpu_model" ]; then
+  printf '%s\n' "$gpu_model" > {shlex.quote(gpu_model_path + '.tmp')}
+  mv {shlex.quote(gpu_model_path + '.tmp')} {shlex.quote(gpu_model_path)}
+fi
 {command_text} >> {shlex.quote(log_path)} 2>&1 &
 child=$!
 touch {shlex.quote(marker_root + '/algorithm.started')}
@@ -389,9 +406,13 @@ class FlyteUnionClient:
                 labels={"opeva-job-id": str(job["job_id"]), "opeva-worker": "union-inesctec"},
             ).run(task)
         except Exception as exc:
-            if "already exists" not in str(exc).lower():
-                raise
-            return self.get_run(run_name)
+            # Submission may have reached Union even if the response was lost.
+            # The deterministic run name lets recovery adopt that execution for
+            # any submission error, without relying on SDK-specific wording.
+            try:
+                return self.get_run(run_name)
+            except Exception:
+                raise exc
         return UnionRunSnapshot(name=run.name, phase=str(run.phase), url=str(run.url))
 
     def get_run(self, run_name: str) -> UnionRunSnapshot:
@@ -466,7 +487,7 @@ class FlyteUnionClient:
             pod_template=flyte.PodTemplate.from_spec(pod, primary_container_name="primary"),
         )
         flyte.TaskEnvironment.from_task(f"opeva-sign-{job_id.replace('-', '')[:20]}", task)
-        run_name = f"opeva-sign-{job_id.replace('-', '')[:24]}-{int(time.time())}"
+        run_name = artifact_signer_run_name(job_id)
         run = flyte.with_runcontext(name=run_name, version=run_name, copy_style="none").run(task)
         run.wait(quiet=True)
         last_error: Exception | None = None

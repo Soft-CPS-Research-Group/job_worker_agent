@@ -24,7 +24,7 @@ queued jobs, executes workloads via the configured executor (`docker`,
   terminates the superseded Docker container, Slurm job or Union Run. Tokens
   are redacted from logs.
 
-Current package version: `0.5.0`. Release notes live in [`docs/releases.md`](docs/releases.md).
+Current package version: `0.5.1`. Release notes live in [`docs/releases.md`](docs/releases.md).
 
 ## Union INESC TEC mode
 
@@ -33,6 +33,8 @@ resolved config and referenced datasets, uploads them to Union object storage,
 and launches a two-container task: the worker runner as primary and the
 selected Algorithms image as a one-GPU sidecar. Logs, progress and final
 artifacts are synchronized back into the existing shared job directory.
+When the Algorithms process starts, the sidecar records the assigned GPU model
+once and includes it in active-job heartbeats for the host details UI.
 
 Required configuration includes:
 
@@ -48,6 +50,8 @@ UNION_PROJECT=humanise-energaize
 UNION_DOMAIN=development
 UNION_RUNNER_IMAGE=calof/job_worker_agent:union-latest
 UNION_GPU_COUNT=1
+UNION_RUN_TIMEOUT_SECONDS=2592000
+UNION_ARTIFACT_REFRESH_ATTEMPTS=6
 UNION_UNREACHABLE_GRACE_SECONDS=900
 UNION_RETRY_MAX_BACKOFF_SECONDS=60
 ```
@@ -62,7 +66,9 @@ run by deterministic job/attempt ID, including a restart during upload or
 submission. Temporary Union control-plane failures use bounded exponential
 backoff and keep the job in `setup` or `running`; they do not create a second
 run. Result installation, remote cleanup and final orchestrator acknowledgment
-are persisted as separate idempotent steps.
+are persisted as separate idempotent steps. Result metadata is retried with
+bounded backoff after a remote Run reaches terminal state, and final log merging
+streams large logs without loading them entirely into bridge memory.
 Union recovery state retains the dispatch attempt fields in its mode-`0600`
 state file so terminal delivery remains fenced after a bridge restart.
 In `device_flow` mode the Flyte keyring must be mounted from a persistent Docker

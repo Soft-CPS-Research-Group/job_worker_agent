@@ -1,26 +1,31 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import sys
 import tarfile
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from worker_agent.executors.union_executor import UnionExecutor
-from worker_agent.union.archive import collect_input_paths, safe_extract
+from worker_agent.executors.union_executor import UnionExecutor, _gpu_model_from_log
+from worker_agent.union.archive import append_missing_algorithm_logs, collect_input_paths, safe_extract
 from worker_agent.union.client import (
     FlyteUnionClient,
     UnionRunSnapshot,
     _algorithms_wrapper,
+    artifact_signer_run_name,
     derive_object_uris,
     deterministic_run_name,
 )
 from worker_agent.union.config import UnionConfig
 from worker_agent.union.events import encode_event, parse_event
+from worker_agent.union.runner import _cancel_object_exists, _read_gpu_model, _retry_store_operation
 
 
 def test_union_config_reads_headless_defaults(tmp_path: Path) -> None:
@@ -132,6 +137,35 @@ def test_union_container_task_runs_without_rebundling_baked_image(monkeypatch) -
     assert snapshot.name == "run-1"
 
 
+def test_union_submission_adopts_run_after_response_is_lost(monkeypatch) -> None:
+    monkeypatch.setattr("worker_agent.union.client._install_device_auth_hooks", lambda _client: None)
+    client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
+    client._initialized = True
+    monkeypatch.setattr(client, "_pod_task", lambda **_kwargs: object())
+    recovered = UnionRunSnapshot(name="run-1", phase="RUNNING", url="https://union/run-1")
+    monkeypatch.setattr(client, "get_run", lambda _name: recovered)
+
+    class LostResponseContext:
+        def run(self, _task):
+            raise RuntimeError("connection reset after Union accepted the run")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flyte",
+        SimpleNamespace(with_runcontext=lambda **_kwargs: LostResponseContext()),
+    )
+
+    snapshot = client.submit_job(
+        job={"job_id": "job-1"},
+        run_name="run-1",
+        input_uri="s3://bucket/input",
+        result_uri="s3://bucket/result",
+        cancel_uri="s3://bucket/cancel",
+    )
+
+    assert snapshot is recovered
+
+
 def test_union_event_round_trip_ignores_invalid_lines() -> None:
     line = encode_event("progress", 3, {"progress": {"step_current": 5, "step_total": 10}})
     parsed = parse_event(f"prefix {line}")
@@ -183,11 +217,81 @@ def test_union_run_helpers_are_deterministic() -> None:
     assert run_name != deterministic_run_name("D520A2AB-97DC-48BD-BD35-123456789012", 3)
     assert len(run_name) == 30
 
+    signer_name = artifact_signer_run_name("D520A2AB-97DC-48BD-BD35-123456789012", nonce=1)
+    assert signer_name != artifact_signer_run_name("D520A2AB-97DC-48BD-BD35-123456789012", nonce=2)
+    assert len(signer_name) == 30
+
 
 def test_algorithms_wrapper_marks_process_started_after_launch() -> None:
     wrapper = _algorithms_wrapper("job-1", "--config /data/config.yaml --job_id job-1", 60)
 
+    assert "nvidia-smi --query-gpu=name" in wrapper
+    assert wrapper.index("gpu.model") < wrapper.index("child=$!")
     assert wrapper.index("child=$!") < wrapper.index("algorithm.started")
+
+
+def test_read_gpu_model_normalizes_the_once_per_job_marker(tmp_path: Path) -> None:
+    marker = tmp_path / "gpu.model"
+    marker.write_text("  NVIDIA RTX PRO 6000 Blackwell\nServer Edition  \n", encoding="utf-8")
+
+    assert _read_gpu_model(marker) == "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    assert _read_gpu_model(tmp_path / "missing") is None
+
+
+def test_gpu_model_can_be_recovered_from_existing_algorithm_logs(tmp_path: Path) -> None:
+    log_path = tmp_path / "job.log"
+    log_path.write_text(
+        "startup\nCUDA device selected: NVIDIA H200\ntraining\n",
+        encoding="utf-8",
+    )
+
+    assert _gpu_model_from_log(log_path) == "NVIDIA H200"
+
+
+def test_append_missing_algorithm_logs_streams_only_the_unrelayed_tail(tmp_path: Path) -> None:
+    job_id = "job-long-log"
+    remote_log = tmp_path / "extracted" / "jobs" / job_id / "logs" / f"{job_id}.log"
+    remote_log.parent.mkdir(parents=True)
+    remote_log.write_text("".join(f"line-{index}\n" for index in range(50_000)), encoding="utf-8")
+    local_log = tmp_path / "local.log"
+    local_log.write_text("existing\n", encoding="utf-8")
+
+    total = append_missing_algorithm_logs(local_log, tmp_path / "extracted", job_id, 49_995)
+
+    assert total == 50_000
+    assert local_log.read_text(encoding="utf-8").splitlines() == [
+        "existing",
+        "line-49995",
+        "line-49996",
+        "line-49997",
+        "line-49998",
+        "line-49999",
+    ]
+
+
+def test_runner_retries_critical_object_store_operations() -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("temporary object store outage")
+        return "ok"
+
+    assert _retry_store_operation("test", operation, attempts=4, sleep_fn=sleeps.append) == "ok"
+    assert calls == 3
+    assert sleeps == [1, 2]
+
+
+def test_runner_cancel_probe_failure_does_not_fail_training(capsys) -> None:
+    class UnreachableStore:
+        def exists(self, _uri: str) -> bool:
+            raise RuntimeError("temporary object store outage")
+
+    assert _cancel_object_exists(UnreachableStore(), "s3://bucket/cancel") is False
+    assert "training continues" in capsys.readouterr().err
 
 
 class FakeRuntime:
@@ -278,7 +382,7 @@ class FakeUnionClient:
 
     def stream_logs(self, run_name: str):
         yield encode_event("setup", 1, {"phase": "downloading_input", "cancel_put_url": "https://cancel"})
-        yield encode_event("started", 2, {"started_at": 1000.0})
+        yield encode_event("started", 2, {"started_at": 1000.0, "gpu_model": "NVIDIA H200"})
         yield "[algorithms] training line\n"
         yield encode_event("progress", 3, {"progress": {"step_current": 10, "step_total": 10, "progress_pct": 100}})
         yield encode_event("artifact", 4, {"artifact": self.artifact})
@@ -298,6 +402,57 @@ class FakeUnionClient:
 
     def abort(self, run_name: str, reason: str) -> None:
         self.aborted_runs.append(run_name)
+
+
+def test_union_log_pump_reconnects_and_resumes_from_persisted_cursor(tmp_path: Path) -> None:
+    job_id = "79246b8e-375d-4ca4-b863-2e18ba6339aa"
+    runtime = FakeRuntime(tmp_path)
+
+    class ReconnectingClient:
+        def __init__(self, _config: UnionConfig) -> None:
+            self.calls = 0
+
+        def stream_logs(self, _run_name: str):
+            self.calls += 1
+            yield encode_event("started", 1, {"started_at": 1000.0})
+            if self.calls == 1:
+                raise RuntimeError("incomplete envelope: unexpected EOF")
+            yield encode_event(
+                "progress",
+                2,
+                {"progress": {"step_current": 5, "step_total": 10, "progress_pct": 50}},
+            )
+
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "FLYTE_API_KEY_FILE": str(tmp_path / "unused"),
+            "UNION_POLL_INTERVAL_SECONDS": "1",
+            "UNION_RETRY_MAX_BACKOFF_SECONDS": "2",
+        },
+        client_factory=ReconnectingClient,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "last_event_sequence": 0,
+        "log_line_count": 0,
+    }
+    log_path = runtime._prepare_log_file(job_id)
+
+    thread, result, stop_event = executor._start_log_pump(state, log_path)
+    progress_path = tmp_path / "jobs" / job_id / "progress" / "progress.json"
+    deadline = time.monotonic() + 4
+    while not progress_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    stop_event.set()
+    thread.join(timeout=2)
+
+    assert executor.client.calls >= 2
+    assert result["reconnects"] >= 1
+    assert state["last_event_sequence"] == 2
+    assert state["log_line_count"] == 2
+    assert json.loads(progress_path.read_text(encoding="utf-8"))["progress_pct"] == 50
 
 
 @pytest.mark.parametrize(
@@ -383,6 +538,8 @@ def test_union_executor_completes_fake_remote_run_and_installs_results(tmp_path:
     assert [status for _, status, _ in runtime.statuses][-1] == "finished"
     running = next(extra for _, status, extra in runtime.statuses if status == "running")
     assert running["details"]["started_at"] == 1000.0
+    assert running["details"]["gpu_model"] == "NVIDIA H200"
+    assert state["gpu_model"] == "NVIDIA H200"
 
 
 def test_union_executor_aborts_superseded_attempt_before_starting_next(tmp_path: Path) -> None:
@@ -541,6 +698,84 @@ def test_union_executor_recovers_submitted_run_without_duplicate_submission(tmp_
     assert persisted["terminal_status"] == "finished"
 
 
+def test_union_executor_restart_during_running_recovers_without_duplicate_submission(tmp_path: Path) -> None:
+    job_id = "46e427ea-c634-42c9-845d-16a7c1829801"
+    job_dir = tmp_path / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+    polled = threading.Event()
+
+    class StillRunningClient(FakeUnionClient):
+        def get_run(self, run_name: str) -> UnionRunSnapshot:
+            polled.set()
+            return UnionRunSnapshot(name=run_name, phase="RUNNING", url="https://union/run")
+
+        def stream_logs(self, run_name: str):
+            yield encode_event("started", 1, {"started_at": 1000.0})
+            yield encode_event(
+                "progress",
+                2,
+                {"progress": {"step_current": 5, "step_total": 10, "progress_pct": 50}},
+            )
+
+    first_holder: dict[str, StillRunningClient] = {}
+
+    def first_factory(config: UnionConfig) -> StillRunningClient:
+        client = StillRunningClient(config, result_archive)
+        first_holder["client"] = client
+        return client
+
+    state = {
+        "schema_version": 2,
+        "job_id": job_id,
+        "job_name": "restart-running",
+        "attempt": 1,
+        "run_name": deterministic_run_name(job_id, 1),
+        "input_uri": "s3://bucket/run/input.tar.gz",
+        "result_uri": "s3://bucket/run/result.tar.gz",
+        "cancel_uri": "s3://bucket/run/cancel.request",
+        "terminal": False,
+        "submitted": True,
+        "last_event_sequence": 0,
+        "log_line_count": 0,
+        "algorithm_lines_relayed": 0,
+    }
+    first = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused"), "UNION_POLL_INTERVAL_SECONDS": "1"},
+        client_factory=first_factory,
+    )
+    monitor = threading.Thread(target=first._resume_state, args=(state,))
+    monitor.start()
+    assert polled.wait(timeout=2)
+    first.close()
+    monitor.join(timeout=3)
+
+    assert not monitor.is_alive()
+    assert state.get("terminal") is False
+    assert first_holder["client"].submit_calls == 0
+
+    second_holder: dict[str, FakeUnionClient] = {}
+
+    def second_factory(config: UnionConfig) -> FakeUnionClient:
+        client = FakeUnionClient(config, result_archive)
+        second_holder["client"] = client
+        return client
+
+    recovered_state = json.loads((job_dir / ".worker" / "union.json").read_text(encoding="utf-8"))
+    second = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=second_factory,
+    )
+    second._resume_state(recovered_state)
+
+    assert second_holder["client"].submit_calls == 0
+    assert recovered_state["terminal_status"] == "finished"
+    assert (job_dir / "results" / "result.json").is_file()
+
+
 def test_union_executor_refreshes_expired_artifact_urls(tmp_path: Path) -> None:
     job_id = "b875d391-0876-4747-8830-3aa4b9d69a12"
     job_dir = tmp_path / "jobs" / job_id
@@ -602,6 +837,170 @@ def test_union_executor_refreshes_expired_artifact_urls(tmp_path: Path) -> None:
     assert json.loads((job_dir / "results" / "result.json").read_text())["status"] == "completed"
 
 
+def test_union_executor_waits_for_delayed_result_artifact(tmp_path: Path) -> None:
+    job_id = "64d8a1cb-c0d2-404a-888f-c1f4ce161f47"
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+
+    class DelayedArtifactClient(FakeUnionClient):
+        def __init__(self, config: UnionConfig, archive: Path) -> None:
+            super().__init__(config, archive)
+            self.refresh_calls = 0
+
+        def refresh_artifact(self, result_uri: str, job_id: str) -> dict:
+            self.refresh_calls += 1
+            if self.refresh_calls < 3:
+                raise RuntimeError("result object not found yet")
+            return super().refresh_artifact(result_uri, job_id)
+
+    holder: dict[str, DelayedArtifactClient] = {}
+
+    def factory(config: UnionConfig) -> DelayedArtifactClient:
+        client = DelayedArtifactClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "FLYTE_API_KEY_FILE": str(tmp_path / "unused"),
+            "UNION_POLL_INTERVAL_SECONDS": "1",
+            "UNION_ARTIFACT_REFRESH_ATTEMPTS": "4",
+        },
+        client_factory=factory,
+        wait_fn=lambda _seconds: False,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "result_uri": "s3://bucket/run/result.tar.gz",
+    }
+
+    artifact = executor._refresh_artifact(state)
+
+    assert artifact["sha256"] == holder["client"].artifact["sha256"]
+    assert holder["client"].refresh_calls == 3
+    assert any(
+        extra.get("details", {}).get("executor_stage") == "union:waiting_for_artifact"
+        for _, _, extra in runtime.statuses
+    )
+
+
+def test_union_executor_reauthenticates_while_refreshing_artifact(tmp_path: Path) -> None:
+    job_id = "754e4dd5-b3f5-4b65-ae90-cda187b85d68"
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+
+    class ReauthArtifactClient(FakeUnionClient):
+        def __init__(self, config: UnionConfig, archive: Path) -> None:
+            super().__init__(config, archive)
+            self.refresh_calls = 0
+            self.auth_starts = 0
+            self.state = {"status": "authentication_required"}
+
+        def auth_state(self) -> dict:
+            return dict(self.state)
+
+        def start_device_authentication(self, _request_id=None) -> bool:
+            self.auth_starts += 1
+            self.state = {"status": "authenticated"}
+            return True
+
+        def refresh_artifact(self, result_uri: str, job_id: str) -> dict:
+            self.refresh_calls += 1
+            if self.refresh_calls == 1:
+                raise RuntimeError("rpc error: unauthenticated: token expired")
+            return super().refresh_artifact(result_uri, job_id)
+
+    holder: dict[str, ReauthArtifactClient] = {}
+
+    def factory(config: UnionConfig) -> ReauthArtifactClient:
+        client = ReauthArtifactClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "UNION_AUTH_MODE": "device_flow",
+            "UNION_POLL_INTERVAL_SECONDS": "1",
+            "UNION_ARTIFACT_REFRESH_ATTEMPTS": "3",
+        },
+        client_factory=factory,
+        wait_fn=lambda _seconds: False,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "result_uri": "s3://bucket/run/result.tar.gz",
+    }
+
+    artifact = executor._refresh_artifact(state)
+
+    assert artifact["sha256"] == holder["client"].artifact["sha256"]
+    assert holder["client"].refresh_calls == 2
+    assert holder["client"].auth_starts == 1
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EDQUOT, errno.ENOSPC, errno.EROFS])
+def test_union_executor_does_not_retry_permanent_local_io_errors(
+    tmp_path: Path,
+    error_number: int,
+) -> None:
+    runtime = FakeRuntime(tmp_path)
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=lambda _config: object(),
+    )
+
+    assert executor._is_retryable_control_plane_error(OSError(error_number, "local failure")) is False
+
+
+def test_union_executor_aborts_remote_run_if_backend_is_already_stopped(tmp_path: Path) -> None:
+    job_id = "54ad46cf-c869-4ef5-a1fc-3299185a4fe1"
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+    runtime.backend_status = "stopped"
+
+    class RunningClient(FakeUnionClient):
+        def get_run(self, run_name: str) -> UnionRunSnapshot:
+            return UnionRunSnapshot(name=run_name, phase="RUNNING", url="https://union/run")
+
+        def stream_logs(self, run_name: str):
+            return iter(())
+
+        def refresh_artifact(self, result_uri: str, job_id: str) -> dict:
+            raise FileNotFoundError("no artifact after abort")
+
+    holder: dict[str, RunningClient] = {}
+
+    def factory(config: UnionConfig) -> RunningClient:
+        client = RunningClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused"), "UNION_POLL_INTERVAL_SECONDS": "1"},
+        client_factory=factory,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "result_uri": "s3://bucket/run/result.tar.gz",
+        "submitted": True,
+        "terminal": False,
+        "log_line_count": 0,
+        "last_event_sequence": 0,
+    }
+
+    executor._monitor(state)
+
+    assert holder["client"].aborted_runs == [state["run_name"]]
+    assert state["terminal_status"] == "stopped"
+
+
 def test_union_executor_retries_transient_control_plane_failure(tmp_path: Path) -> None:
     job_id = "1dc2ffaf-268d-4102-8e60-69ff249f020f"
     job_dir = tmp_path / "jobs" / job_id
@@ -660,6 +1059,75 @@ def test_union_executor_retries_transient_control_plane_failure(tmp_path: Path) 
         extra.get("details", {}).get("connectivity") == "degraded"
         for _, _, extra in runtime.statuses
     )
+
+
+def test_union_executor_keeps_active_run_recoverable_during_device_reauthentication(tmp_path: Path) -> None:
+    runtime = FakeRuntime(tmp_path)
+
+    class ReauthClient:
+        def __init__(self, _config: UnionConfig) -> None:
+            self.calls = 0
+            self.auth_starts = 0
+            self.state = {"status": "authentication_required"}
+
+        def auth_state(self) -> dict:
+            return dict(self.state)
+
+        def start_device_authentication(self, _request_id=None) -> bool:
+            self.auth_starts += 1
+            self.state = {"status": "authenticated"}
+            return True
+
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "UNION_AUTH_MODE": "device_flow",
+            "UNION_POLL_INTERVAL_SECONDS": "1",
+            "UNION_RETRY_MAX_BACKOFF_SECONDS": "2",
+        },
+        client_factory=ReauthClient,
+        wait_fn=lambda _seconds: False,
+    )
+    state = {"job_id": "job-reauth", "run_name": "run-reauth", "started_at": 1000.0}
+
+    def operation() -> str:
+        executor.client.calls += 1
+        if executor.client.calls == 1:
+            raise RuntimeError("rpc error: unauthenticated: token expired")
+        return "recovered"
+
+    assert executor._retry_control_plane(state, "polling_run", operation) == "recovered"
+    assert executor.client.auth_starts == 1
+    assert "control_plane_unreachable_since" not in state
+    assert not any(status == "failed" for _, status, _ in runtime.statuses)
+
+
+def test_union_executor_retries_eventually_consistent_run_lookup(tmp_path: Path) -> None:
+    runtime = FakeRuntime(tmp_path)
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "FLYTE_API_KEY_FILE": str(tmp_path / "unused"),
+            "UNION_POLL_INTERVAL_SECONDS": "1",
+        },
+        client_factory=lambda _config: object(),
+        wait_fn=lambda _seconds: False,
+    )
+    calls = 0
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("Union Run not found")
+        return "visible"
+
+    assert executor._retry_control_plane(
+        {"job_id": "job-eventual", "run_name": "run-eventual"},
+        "polling_run",
+        operation,
+    ) == "visible"
+    assert calls == 2
 
 
 def test_union_executor_replays_unacknowledged_terminal_state_on_startup(tmp_path: Path) -> None:

@@ -43,6 +43,7 @@ class UnionConfig:
     run_timeout_seconds: int
     graceful_stop_timeout_seconds: int
     artifact_url_ttl_seconds: int
+    artifact_refresh_attempts: int
     poll_interval_seconds: int
     status_update_interval_seconds: int
     unreachable_grace_seconds: int
@@ -72,12 +73,13 @@ class UnionConfig:
             job_memory=_required(env, "UNION_JOB_MEMORY", "16Gi"),
             gpu_count=_positive_int(env, "UNION_GPU_COUNT", 1),
             setup_timeout_seconds=_positive_int(env, "UNION_SETUP_TIMEOUT_SECONDS", 3600),
-            run_timeout_seconds=_positive_int(env, "UNION_RUN_TIMEOUT_SECONDS", 604800),
+            run_timeout_seconds=_positive_int(env, "UNION_RUN_TIMEOUT_SECONDS", 2592000),
             graceful_stop_timeout_seconds=_positive_int(env, "UNION_GRACEFUL_STOP_TIMEOUT_SECONDS", 120),
             artifact_url_ttl_seconds=min(
                 604800,
                 _positive_int(env, "UNION_ARTIFACT_URL_TTL_SECONDS", 3600),
             ),
+            artifact_refresh_attempts=_positive_int(env, "UNION_ARTIFACT_REFRESH_ATTEMPTS", 6),
             poll_interval_seconds=_positive_int(env, "UNION_POLL_INTERVAL_SECONDS", 10),
             status_update_interval_seconds=_positive_int(env, "UNION_STATUS_UPDATE_INTERVAL_SECONDS", 30),
             unreachable_grace_seconds=_positive_int(env, "UNION_UNREACHABLE_GRACE_SECONDS", 900),

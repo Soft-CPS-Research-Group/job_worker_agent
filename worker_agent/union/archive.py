@@ -124,12 +124,16 @@ def append_missing_algorithm_logs(local_log: Path, extracted_root: Path, job_id:
     remote_log = extracted_root / "jobs" / job_id / "logs" / f"{job_id}.log"
     if not remote_log.is_file():
         return relayed_lines
-    lines = remote_log.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    missing = lines[max(0, relayed_lines) :]
-    if missing:
-        with local_log.open("a", encoding="utf-8") as handle:
-            handle.writelines(missing)
-    return len(lines)
+    total_lines = 0
+    skip_lines = max(0, relayed_lines)
+    with remote_log.open("r", encoding="utf-8", errors="replace") as source, local_log.open(
+        "a",
+        encoding="utf-8",
+    ) as destination:
+        for total_lines, line in enumerate(source, start=1):
+            if total_lines > skip_lines:
+                destination.write(line)
+    return total_lines
 
 
 def paths_as_strings(paths: Iterable[Path]) -> list[str]:

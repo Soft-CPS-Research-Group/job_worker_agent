@@ -10,11 +10,14 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
 
 from .archive import safe_extract
 from .events import encode_event
+
+
+_T = TypeVar("_T")
 
 
 class EventEmitter:
@@ -50,7 +53,14 @@ class S3Store:
             aws_session_token=session_token,
             region_name=region,
             verify=ca_path or True,
-            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                retries={"max_attempts": 10, "mode": "standard"},
+                connect_timeout=15,
+                read_timeout=120,
+                tcp_keepalive=True,
+            ),
         )
 
     @staticmethod
@@ -158,6 +168,47 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _retry_store_operation(
+    description: str,
+    operation: Callable[[], _T],
+    *,
+    attempts: int = 8,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> _T:
+    delay = 1
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            print(
+                f"[union-runner] {description} failed; retrying ({attempt}/{attempts}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep_fn(delay)
+            delay = min(delay * 2, 30)
+    assert last_error is not None
+    raise last_error
+
+
+def _cancel_object_exists(store: S3Store, cancel_uri: str) -> bool:
+    try:
+        return store.exists(cancel_uri)
+    except Exception as exc:
+        # Cancellation has a control-plane abort fallback. A transient object
+        # store probe must never terminate an otherwise healthy long run.
+        print(
+            f"[union-runner] Unable to check cancellation marker; training continues: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
 def _archive_job(data_root: Path, job_id: str, output: Path) -> None:
     job_dir = data_root / "jobs" / job_id
     if not job_dir.is_dir():
@@ -191,6 +242,14 @@ def _read_progress(path: Path) -> tuple[str | None, dict[str, Any] | None]:
     return fingerprint, value
 
 
+def _read_gpu_model(path: Path) -> str | None:
+    try:
+        value = " ".join(path.read_text(encoding="utf-8").split())
+    except OSError:
+        return None
+    return value[:160] or None
+
+
 def _wait_for(path: Path, timeout: int, description: str) -> None:
     deadline = time.monotonic() + timeout
     while not path.exists():
@@ -208,13 +267,14 @@ def run_job() -> int:
     cancel_uri = _required("OPEVA_CANCEL_URI")
     data_root = Path(os.environ.get("OPEVA_DATA_ROOT", "/data"))
     setup_timeout = _positive_int("OPEVA_SETUP_TIMEOUT_SECONDS", 3600)
-    run_timeout = _positive_int("OPEVA_RUN_TIMEOUT_SECONDS", 604800)
+    run_timeout = _positive_int("OPEVA_RUN_TIMEOUT_SECONDS", 2592000)
     artifact_ttl = min(604800, _positive_int("OPEVA_ARTIFACT_URL_TTL_SECONDS", 3600))
     marker_dir = data_root / ".opeva"
     marker_dir.mkdir(parents=True, exist_ok=True)
     sidecar_ready = marker_dir / "sidecar.ready"
     input_ready = marker_dir / "input.ready"
     started_marker = marker_dir / "algorithm.started"
+    gpu_model_path = marker_dir / "gpu.model"
     done_marker = marker_dir / "algorithm.done"
     cancel_marker = marker_dir / "cancel"
     exit_path = marker_dir / "exit.code"
@@ -233,18 +293,23 @@ def run_job() -> int:
     try:
         _wait_for(sidecar_ready, setup_timeout, "Algorithms sidecar readiness")
         emitter.emit("setup", phase="downloading_input")
-        store.download(input_uri, input_archive)
+        _retry_store_operation("input download", lambda: store.download(input_uri, input_archive))
         safe_extract(input_archive, data_root)
-        store.delete(input_uri)
+        try:
+            _retry_store_operation("input cleanup", lambda: store.delete(input_uri), attempts=3)
+        except Exception as exc:
+            print(f"[union-runner] Input cleanup deferred: {exc}", file=sys.stderr, flush=True)
         input_archive.unlink(missing_ok=True)
 
         input_ready.touch()
         emitter.emit("setup", phase="waiting_for_algorithms_start")
         _wait_for(started_marker, setup_timeout, "Algorithms process start")
         started_at = started_marker.stat().st_mtime
-        emitter.emit("started", started_at=started_at)
+        gpu_model = _read_gpu_model(gpu_model_path)
+        emitter.emit("started", started_at=started_at, **({"gpu_model": gpu_model} if gpu_model else {}))
 
         deadline = time.monotonic() + run_timeout
+        next_cancel_probe = 0.0
         log_offset = 0
         progress_fingerprint: str | None = None
         while not done_marker.exists():
@@ -253,12 +318,21 @@ def run_job() -> int:
             if fingerprint and fingerprint != progress_fingerprint and progress is not None:
                 progress_fingerprint = fingerprint
                 emitter.emit("progress", progress=progress)
-            if not canceled and store.exists(cancel_uri):
+            now = time.monotonic()
+            if not canceled and now >= next_cancel_probe and _cancel_object_exists(store, cancel_uri):
                 canceled = True
                 cancel_marker.touch()
-                store.delete(cancel_uri)
+                try:
+                    store.delete(cancel_uri)
+                except Exception as exc:
+                    print(
+                        f"[union-runner] Cancellation marker cleanup deferred: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 emitter.emit("setup", phase="cancel_requested")
-            if time.monotonic() >= deadline:
+            next_cancel_probe = now + 5
+            if now >= deadline:
                 canceled = True
                 cancel_marker.touch()
                 emitter.emit("setup", phase="run_timeout")
@@ -282,8 +356,15 @@ def run_job() -> int:
             if (data_root / "jobs" / job_id).is_dir():
                 _archive_job(data_root, job_id, result_archive)
                 digest = _sha256(result_archive)
-                store.upload(result_archive, result_uri, digest)
-                emitter.emit("artifact", artifact=store.artifact(result_uri, artifact_ttl))
+                _retry_store_operation(
+                    "result upload",
+                    lambda: store.upload(result_archive, result_uri, digest),
+                )
+                artifact = _retry_store_operation(
+                    "result metadata lookup",
+                    lambda: store.artifact(result_uri, artifact_ttl),
+                )
+                emitter.emit("artifact", artifact=artifact)
         except Exception as exc:
             print(f"[union-runner] Failed to publish result artifact: {exc}", file=sys.stderr, flush=True)
             if exit_code == 0:
@@ -311,7 +392,11 @@ def sign_artifact() -> int:
     result_uri = _required("OPEVA_RESULT_URI")
     artifact_ttl = min(604800, _positive_int("OPEVA_ARTIFACT_URL_TTL_SECONDS", 3600))
     try:
-        emitter.emit("artifact", artifact=store.artifact(result_uri, artifact_ttl))
+        artifact = _retry_store_operation(
+            "result metadata lookup",
+            lambda: store.artifact(result_uri, artifact_ttl),
+        )
+        emitter.emit("artifact", artifact=artifact)
         emitter.emit("terminal", status="finished", exit_code=0)
         return 0
     except Exception as exc:

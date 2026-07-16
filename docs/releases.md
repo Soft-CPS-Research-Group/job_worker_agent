@@ -29,6 +29,41 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.1 - 2026-07-16
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Hardens long-running Union jobs against interrupted live logs, temporary Union
+control-plane/object-store failures, bridge restarts and delayed result
+metadata.
+
+### Changed
+
+- Reconnects interrupted Union log streams with bounded backoff and resumes
+  from the persisted line/event cursor, keeping UI logs and progress current.
+- Limits temporary artifact-signer Run names to Union's 30-character maximum.
+- Drains terminal events before closing the log stream for short Runs.
+- Adopts the deterministic existing Run when submission succeeded remotely but
+  the client lost the response, preventing duplicate Algorithms executions.
+- Retries temporary input/result object-store operations and treats cancel
+  marker checks and remote cleanup as best effort.
+- Retries delayed result metadata before failing a completed Run and streams
+  large final logs without loading the entire file into bridge memory.
+- Re-authenticates Device Flow sessions without discarding active remote Runs,
+  and tolerates eventual consistency when a newly submitted Run is queried.
+- Aborts remote work when the orchestrator already reports the job as stopped.
+- Extends the default Algorithms timeout from 7 to 30 days.
+- Reports the GPU model assigned by Union once per running job so host details
+  can distinguish resources such as H200 and RTX PRO 6000 without polling.
+- Worker version is now reported as `0.5.1`.
+
+### Validation
+
+- `.venv/bin/pytest`: pass (`134 passed`).
+- Dedicated Union image build and import smoke: pass.
+
 ## v0.5.0 - 2026-07-14
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

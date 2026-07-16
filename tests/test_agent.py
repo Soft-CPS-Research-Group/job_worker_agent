@@ -987,10 +987,16 @@ def test_heartbeat_payload_counts_union_provisioning_separately_from_running():
     agent._register_active_job("job-a")
     agent._update_active_job("job-a", status="setup", phase="union:provisioning")
     agent._register_active_job("job-b")
-    agent._update_active_job("job-b", status="running", phase="union:running")
+    agent._post_status(
+        "job-b",
+        "running",
+        details={"executor_stage": "union:running", "gpu_model": "NVIDIA H200"},
+    )
 
     info = agent._build_heartbeat_info()
 
     assert info["active_job_count"] == 2
     assert info["running_job_count"] == 1
     assert info["provisioning_job_count"] == 1
+    running = next(row for row in info["active_jobs"] if row["job_id"] == "job-b")
+    assert running["gpu_model"] == "NVIDIA H200"

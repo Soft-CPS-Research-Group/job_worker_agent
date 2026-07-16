@@ -591,6 +591,7 @@ class WorkerAgent:
         slurm_nodes = detail_map.get("slurm_nodes")
         slurm_cpus = detail_map.get("slurm_cpus")
         slurm_gpus = detail_map.get("slurm_gpus")
+        gpu_model = detail_map.get("gpu_model") if isinstance(detail_map.get("gpu_model"), str) else None
         queue_pos = detail_map.get("slurm_queue_position")
         ahead = detail_map.get("slurm_jobs_ahead")
         updated_fields: dict[str, object] = {
@@ -602,6 +603,7 @@ class WorkerAgent:
             "slurm_nodes": slurm_nodes,
             "slurm_cpus": slurm_cpus,
             "slurm_gpus": slurm_gpus,
+            "gpu_model": gpu_model,
             "queue_pos": queue_pos,
             "ahead": ahead,
         }
