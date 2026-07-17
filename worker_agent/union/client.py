@@ -460,11 +460,13 @@ class FlyteUnionClient:
         self.initialize()
         import flyte
         from flyte.extras import ContainerTask
+        from flyte.remote import Run
         from kubernetes.client import V1Container, V1EnvVar, V1PodSpec
 
         env = {
             "OPEVA_RESULT_URI": result_uri,
             "OPEVA_ARTIFACT_URL_TTL_SECONDS": str(self.config.artifact_url_ttl_seconds),
+            "OPEVA_SIGNER_LOG_GRACE_SECONDS": str(self.config.signer_log_grace_seconds),
             "OPEVA_OBJECT_STORE_CA_B64": self._ca_b64(),
         }
         pod = V1PodSpec(
@@ -489,15 +491,25 @@ class FlyteUnionClient:
         flyte.TaskEnvironment.from_task(f"opeva-sign-{job_id.replace('-', '')[:20]}", task)
         run_name = artifact_signer_run_name(job_id)
         run = flyte.with_runcontext(name=run_name, version=run_name, copy_style="none").run(task)
-        run.wait(quiet=True)
         last_error: Exception | None = None
-        for _ in range(3):
+        terminal_polls = 0
+        for _ in range(300):
             try:
-                for line in run.get_logs(filter_system=True, show_ts=False):
+                current = Run.get(name=run_name)
+                for line in current.get_logs(filter_system=True, show_ts=False):
                     event = parse_event(line)
                     if event and event.get("kind") == "artifact" and isinstance(event.get("artifact"), dict):
                         return dict(event["artifact"])
             except Exception as exc:  # pragma: no cover - remote timing dependent
                 last_error = exc
-                time.sleep(2)
+            try:
+                phase = str(Run.get(name=run_name).phase).rsplit(".", 1)[-1].upper()
+            except Exception as exc:  # pragma: no cover - remote timing dependent
+                last_error = exc
+                phase = ""
+            if phase in {"SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT"}:
+                terminal_polls += 1
+                if terminal_polls >= 3:
+                    break
+            time.sleep(2)
         raise RuntimeError(f"Union signer task did not return artifact URLs: {last_error or run_name}")

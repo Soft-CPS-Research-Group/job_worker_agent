@@ -622,6 +622,35 @@ class UnionExecutor(BaseExecutor):
         self._save_state(state)
         self._replay_terminal_status(state)
 
+    def _record_started(
+        self,
+        state: dict[str, Any],
+        *,
+        started_at: float,
+        gpu_model: str | None,
+        source: str,
+    ) -> None:
+        job_id = str(state["job_id"])
+        state["started_at"] = started_at
+        state["started_at_source"] = source
+        if gpu_model:
+            state["gpu_model"] = gpu_model
+        if str(state.get("requested_terminal_status") or "") in {"stopped", "canceled"}:
+            return
+        delivered = self.runtime._post_status(
+            job_id,
+            "running",
+            details={
+                "executor_stage": "union:running",
+                "started_at": started_at,
+                "gpu_model": state.get("gpu_model"),
+                "union_run_id": state.get("run_name"),
+                "union_run_url": state.get("run_url"),
+            },
+        )
+        if delivered:
+            self.runtime._send_heartbeat(force=True)
+
     def _handle_log_line(self, state: dict[str, Any], log_path: Path, line: str) -> None:
         job_id = str(state["job_id"])
         state["log_line_count"] = int(state.get("log_line_count", 0)) + 1
@@ -645,10 +674,15 @@ class UnionExecutor(BaseExecutor):
             return
 
         sequence = int(event.get("sequence", 0))
-        if sequence <= int(state.get("last_event_sequence", 0)):
-            return
-        state["last_event_sequence"] = sequence
         kind = str(event.get("kind"))
+        missing_critical_event = (
+            (kind == "started" and state.get("started_at_source") != "event")
+            or (kind == "artifact" and not isinstance(state.get("artifact"), dict))
+            or (kind == "terminal" and not state.get("runner_terminal_status"))
+        )
+        if sequence <= int(state.get("last_event_sequence", 0)) and not missing_critical_event:
+            return
+        state["last_event_sequence"] = max(sequence, int(state.get("last_event_sequence", 0)))
         if kind == "setup":
             if isinstance(event.get("cancel_put_url"), str):
                 state["cancel_put_url"] = event["cancel_put_url"]
@@ -658,23 +692,15 @@ class UnionExecutor(BaseExecutor):
         elif kind == "started":
             started_at = float(event.get("started_at") or event.get("timestamp") or self.now_fn())
             gpu_model = _normalize_gpu_model(event.get("gpu_model"))
-            state["started_at"] = started_at
-            if gpu_model:
-                state["gpu_model"] = gpu_model
-            delivered = self.runtime._post_status(
-                job_id,
-                "running",
-                details={
-                    "executor_stage": "union:running",
-                    "started_at": started_at,
-                    "gpu_model": gpu_model,
-                    "union_run_id": state.get("run_name"),
-                    "union_run_url": state.get("run_url"),
-                },
-            )
-            if delivered:
-                self.runtime._send_heartbeat(force=True)
+            self._record_started(state, started_at=started_at, gpu_model=gpu_model, source="event")
         elif kind == "progress" and isinstance(event.get("progress"), dict):
+            if not state.get("started_at"):
+                self._record_started(
+                    state,
+                    started_at=float(event.get("timestamp") or self.now_fn()),
+                    gpu_model=_normalize_gpu_model(state.get("gpu_model")),
+                    source="progress",
+                )
             self._write_progress(job_id, dict(event["progress"]))
         elif kind == "artifact" and isinstance(event.get("artifact"), dict):
             state["artifact"] = dict(event["artifact"])
@@ -682,6 +708,22 @@ class UnionExecutor(BaseExecutor):
             state["runner_terminal_status"] = str(event.get("status") or "failed")
             state["runner_exit_code"] = event.get("exit_code")
         self._save_state(state)
+
+    def _replay_final_events(self, state: dict[str, Any], log_path: Path) -> None:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                for line in self.client.stream_logs(str(state["run_name"])):
+                    value = str(line)
+                    if parse_event(value) is not None:
+                        self._handle_log_line(state, log_path, value)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    self.wait_fn(2)
+        if last_error is not None:
+            self._append_log(log_path, f"[union-worker] Final Union events unavailable: {last_error}")
 
     def _start_log_pump(
         self,
@@ -817,6 +859,8 @@ class UnionExecutor(BaseExecutor):
             return
         if remote is None:
             raise RuntimeError(f"No Union state was returned for run {run_name}")
+        if remote.terminal:
+            self._replay_final_events(state, log_path)
 
         backend_status = self.runtime._fetch_status(job_id)
         if backend_status in _STOP_BACKEND_STATUSES:

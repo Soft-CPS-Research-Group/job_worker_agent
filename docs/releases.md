@@ -29,6 +29,32 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.3 - 2026-07-17
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Recovers Union start and result events that can be missed after long
+provisioning or log-stream reconnections.
+
+### Changed
+
+- Treats the first progress event as proof that Algorithms started when the
+  earlier `started` event was missed, preventing zero-duration completed Runs.
+- Replays structured terminal events after the Union Run finishes so
+  `started`, artifact and terminal metadata can be recovered idempotently.
+- Reads artifact signer events while its pod is still active and keeps the
+  signer alive for a bounded grace period, avoiding post-exit log races.
+- Retains the existing signed-URL download, checksum validation, atomic NFS
+  installation and remote cleanup contract.
+- Worker version is now reported as `0.5.3`.
+
+### Validation
+
+- Live Union signer test recovered the failed Run's existing result metadata.
+- `.venv/bin/pytest`: pass (`137 passed`).
+
 ## v0.5.2 - 2026-07-16
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

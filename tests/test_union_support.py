@@ -39,6 +39,7 @@ def test_union_config_reads_headless_defaults(tmp_path: Path) -> None:
     assert config.gpu_count == 1
     assert config.unreachable_grace_seconds == 900
     assert config.retry_max_backoff_seconds == 60
+    assert config.signer_log_grace_seconds == 30
     assert config.control_plane_ca_file is None
     assert config.read_api_key() == "secret-key"
 
@@ -175,6 +176,63 @@ def test_union_event_round_trip_ignores_invalid_lines() -> None:
     assert parsed["sequence"] == 3
     assert parse_event("normal log line") is None
     assert parse_event("OPEVA_EVENT_V1=not-json") is None
+
+
+def test_union_artifact_signer_reads_event_while_run_is_active(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("worker_agent.union.client._install_device_auth_hooks", lambda _client: None)
+    client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
+    client._initialized = True
+    artifact = {
+        "uri": "s3://bucket/result.tar.gz",
+        "size": 42,
+        "sha256": "a" * 64,
+        "get_url": "https://objects.invalid/get",
+        "delete_url": "https://objects.invalid/delete",
+    }
+
+    class ActiveRun:
+        name = "signer-run"
+        phase = "ActionPhase.RUNNING"
+
+        def get_logs(self, **_kwargs):
+            yield encode_event("artifact", 1, {"artifact": artifact})
+
+    active_run = ActiveRun()
+
+    class RunType:
+        @classmethod
+        def get(cls, name: str):
+            assert name == "signer-run"
+            return active_run
+
+    class RunContext:
+        def run(self, _task):
+            return active_run
+
+    class Value:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    fake_flyte = SimpleNamespace(
+        Resources=Value,
+        PodTemplate=SimpleNamespace(from_spec=lambda *_args, **_kwargs: object()),
+        TaskEnvironment=SimpleNamespace(from_task=lambda *_args, **_kwargs: None),
+        with_runcontext=lambda **_kwargs: RunContext(),
+    )
+    monkeypatch.setitem(sys.modules, "flyte", fake_flyte)
+    monkeypatch.setitem(sys.modules, "flyte.extras", SimpleNamespace(ContainerTask=Value))
+    monkeypatch.setitem(sys.modules, "flyte.remote", SimpleNamespace(Run=RunType))
+    monkeypatch.setitem(
+        sys.modules,
+        "kubernetes.client",
+        SimpleNamespace(V1Container=Value, V1EnvVar=Value, V1PodSpec=Value),
+    )
+    monkeypatch.setattr(
+        "worker_agent.union.client.artifact_signer_run_name",
+        lambda _job_id: "signer-run",
+    )
+
+    assert client.refresh_artifact("s3://bucket/result.tar.gz", "job-1") == artifact
 
 
 def test_input_collection_only_includes_resolved_config_job_info_and_referenced_dataset(tmp_path: Path) -> None:
@@ -402,6 +460,64 @@ class FakeUnionClient:
 
     def abort(self, run_name: str, reason: str) -> None:
         self.aborted_runs.append(run_name)
+
+
+def test_union_progress_recovers_missing_started_event_and_final_replay_corrects_it(
+    tmp_path: Path,
+) -> None:
+    job_id = "job-missed-started"
+    runtime = FakeRuntime(tmp_path)
+
+    class ReplayClient:
+        def stream_logs(self, _run_name: str):
+            yield encode_event(
+                "started",
+                2,
+                {"started_at": 1000.0, "gpu_model": "NVIDIA RTX PRO 6000 Blackwell"},
+            )
+            yield encode_event(
+                "artifact",
+                6,
+                {
+                    "artifact": {
+                        "uri": "s3://bucket/result.tar.gz",
+                        "get_url": "https://objects.invalid/get",
+                        "delete_url": "https://objects.invalid/delete",
+                    }
+                },
+            )
+            yield encode_event("terminal", 7, {"status": "finished", "exit_code": 0})
+
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=lambda _config: ReplayClient(),
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": "run-missed-started",
+        "last_event_sequence": 4,
+        "log_line_count": 5,
+    }
+    log_path = runtime._prepare_log_file(job_id)
+
+    executor._handle_log_line(
+        state,
+        log_path,
+        encode_event("progress", 5, {"timestamp": 1100.0, "progress": {"progress_pct": 25}}),
+    )
+    assert state["started_at"] == 1100.0
+    assert state["started_at_source"] == "progress"
+    assert runtime.statuses[-1][1] == "running"
+
+    executor._replay_final_events(state, log_path)
+
+    assert state["started_at"] == 1000.0
+    assert state["started_at_source"] == "event"
+    assert state["gpu_model"] == "NVIDIA RTX PRO 6000 Blackwell"
+    assert state["artifact"]["uri"] == "s3://bucket/result.tar.gz"
+    assert state["runner_terminal_status"] == "finished"
+    assert state["runner_exit_code"] == 0
 
 
 def test_union_log_pump_reconnects_and_resumes_from_persisted_cursor(tmp_path: Path) -> None:

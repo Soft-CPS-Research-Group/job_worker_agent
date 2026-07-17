@@ -44,6 +44,7 @@ class UnionConfig:
     graceful_stop_timeout_seconds: int
     artifact_url_ttl_seconds: int
     artifact_refresh_attempts: int
+    signer_log_grace_seconds: int
     poll_interval_seconds: int
     status_update_interval_seconds: int
     unreachable_grace_seconds: int
@@ -80,6 +81,10 @@ class UnionConfig:
                 _positive_int(env, "UNION_ARTIFACT_URL_TTL_SECONDS", 3600),
             ),
             artifact_refresh_attempts=_positive_int(env, "UNION_ARTIFACT_REFRESH_ATTEMPTS", 6),
+            signer_log_grace_seconds=min(
+                120,
+                _positive_int(env, "UNION_SIGNER_LOG_GRACE_SECONDS", 30),
+            ),
             poll_interval_seconds=_positive_int(env, "UNION_POLL_INTERVAL_SECONDS", 10),
             status_update_interval_seconds=_positive_int(env, "UNION_STATUS_UPDATE_INTERVAL_SECONDS", 30),
             unreachable_grace_seconds=_positive_int(env, "UNION_UNREACHABLE_GRACE_SECONDS", 900),

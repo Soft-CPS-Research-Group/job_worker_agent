@@ -391,6 +391,7 @@ def sign_artifact() -> int:
     store = S3Store()
     result_uri = _required("OPEVA_RESULT_URI")
     artifact_ttl = min(604800, _positive_int("OPEVA_ARTIFACT_URL_TTL_SECONDS", 3600))
+    log_grace = min(120, _positive_int("OPEVA_SIGNER_LOG_GRACE_SECONDS", 30))
     try:
         artifact = _retry_store_operation(
             "result metadata lookup",
@@ -398,10 +399,12 @@ def sign_artifact() -> int:
         )
         emitter.emit("artifact", artifact=artifact)
         emitter.emit("terminal", status="finished", exit_code=0)
+        time.sleep(log_grace)
         return 0
     except Exception as exc:
         print(f"[union-runner] Unable to sign artifact: {exc}", file=sys.stderr, flush=True)
         emitter.emit("terminal", status="failed", exit_code=1)
+        time.sleep(log_grace)
         return 1
 
 
