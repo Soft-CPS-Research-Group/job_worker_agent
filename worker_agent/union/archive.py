@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import errno
+import json
 import os
 import shutil
 import tarfile
+import tempfile
+import time
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Any, Iterable
 
 import yaml
 
@@ -115,9 +119,115 @@ def merge_job_results(extracted_root: Path, shared_dir: Path, job_id: str) -> No
         if source_path.is_symlink():
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.union.tmp")
-        shutil.copy2(source_path, temporary)
-        os.replace(temporary, destination)
+        try:
+            # Staging lives below the same job directory, so replace avoids a
+            # second full copy of large exports during final installation.
+            os.replace(source_path, destination)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            temporary = destination.with_name(f".{destination.name}.union.tmp")
+            shutil.copy2(source_path, temporary)
+            os.replace(temporary, destination)
+
+
+_STORAGE_CATEGORIES = ("kpis", "timeseries", "checkpoints", "logs", "other")
+
+
+def _storage_category(relative: Path) -> str:
+    parts = tuple(part.lower() for part in relative.parts)
+    name = relative.name.lower()
+    suffix = relative.suffix.lower()
+
+    if "checkpoints" in parts or "checkpoint" in name:
+        return "checkpoints"
+    if "kpi" in name and suffix in {".csv", ".json", ".parquet", ".xlsx"}:
+        return "kpis"
+    if (
+        "timeseries" in parts
+        or "time_series" in parts
+        or name.startswith("exported_")
+        or name.startswith("timeseries_")
+    ) and suffix in {".csv", ".json", ".parquet", ".feather", ".arrow"}:
+        return "timeseries"
+    if "logs" in parts or suffix in {".log", ".out", ".err"}:
+        return "logs"
+    return "other"
+
+
+def measure_job_storage(job_dir: Path) -> dict[str, Any]:
+    categories = {
+        category: {"bytes": 0, "file_count": 0}
+        for category in _STORAGE_CATEGORIES
+    }
+    total_bytes = 0
+    file_count = 0
+
+    if job_dir.is_dir():
+        for path in job_dir.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(job_dir)
+            if relative.parts and relative.parts[0] == ".worker":
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            category = _storage_category(relative)
+            categories[category]["bytes"] += size
+            categories[category]["file_count"] += 1
+            total_bytes += size
+            file_count += 1
+
+    return {
+        "bytes": total_bytes,
+        "file_count": file_count,
+        "categories": categories,
+    }
+
+
+def write_result_storage_manifest(
+    job_dir: Path,
+    *,
+    transferred_bytes: int | None,
+    announced_unpacked_bytes: int,
+    announced_file_count: int,
+) -> dict[str, Any]:
+    installed = measure_job_storage(job_dir)
+    payload = {
+        "schema_version": 1,
+        "measured_at": time.time(),
+        "transfer": {
+            "bytes": max(0, int(transferred_bytes)) if transferred_bytes is not None else None,
+            "announced_unpacked_bytes": max(0, int(announced_unpacked_bytes)),
+            "announced_file_count": max(0, int(announced_file_count)),
+        },
+        "installed": installed,
+    }
+
+    worker_dir = job_dir / ".worker"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    target = worker_dir / "result-storage.json"
+    fd, temporary_path = tempfile.mkstemp(
+        dir=str(worker_dir),
+        prefix=".result-storage.",
+        suffix=".json.tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o666)
+        os.replace(temporary_path, target)
+    finally:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+    return payload
 
 
 def append_missing_algorithm_logs(local_log: Path, extracted_root: Path, job_id: str, relayed_lines: int) -> int:

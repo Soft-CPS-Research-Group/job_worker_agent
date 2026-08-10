@@ -9,12 +9,19 @@ import sys
 import tarfile
 import threading
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from worker_agent.executors.union_executor import UnionExecutor, _gpu_model_from_log
-from worker_agent.union.archive import append_missing_algorithm_logs, collect_input_paths, safe_extract
+from worker_agent.union.archive import (
+    append_missing_algorithm_logs,
+    collect_input_paths,
+    measure_job_storage,
+    merge_job_results,
+    safe_extract,
+    write_result_storage_manifest,
+)
 from worker_agent.union.client import (
     FlyteUnionClient,
     UnionRunSnapshot,
@@ -39,6 +46,10 @@ def test_union_config_reads_headless_defaults(tmp_path: Path) -> None:
     assert config.gpu_count == 1
     assert config.unreachable_grace_seconds == 900
     assert config.retry_max_backoff_seconds == 60
+    assert config.auth_verify_interval_seconds == 300
+    assert config.max_concurrent_recoveries == 1
+    assert config.recovery_min_free_gib == 20
+    assert config.recovery_unknown_size_multiplier == 4
     assert config.signer_log_grace_seconds == 30
     assert config.control_plane_ca_file is None
     assert config.read_api_key() == "secret-key"
@@ -104,6 +115,66 @@ def test_device_auth_state_reopens_and_recovers_during_active_calls(monkeypatch)
 
     client._device_authorization_completed()
     assert client.auth_state()["status"] == "authenticated"
+
+
+def test_periodic_auth_verification_reuses_initialized_client(monkeypatch) -> None:
+    monkeypatch.setattr("worker_agent.union.client._install_device_auth_hooks", lambda _client: None)
+    client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
+    client._initialized = True
+    client._set_auth_state("authenticated", last_verified_at=-100)
+    calls = 0
+
+    class Run:
+        @staticmethod
+        def listall(*, limit: int):
+            nonlocal calls
+            assert limit == 1
+            calls += 1
+            return iter(())
+
+    flyte_module = ModuleType("flyte")
+    flyte_module.__path__ = []
+    remote_module = ModuleType("flyte.remote")
+    remote_module.Run = Run
+    monkeypatch.setitem(sys.modules, "flyte", flyte_module)
+    monkeypatch.setitem(sys.modules, "flyte.remote", remote_module)
+
+    client.ensure_authentication_fresh(1)
+    assert client._auth_thread is not None
+    client._auth_thread.join(timeout=2)
+
+    assert calls == 1
+    assert client.auth_state()["status"] == "authenticated"
+    assert client.auth_state()["last_verified_at"] > 0
+
+
+def test_periodic_auth_verification_does_not_invalidate_on_network_error(monkeypatch) -> None:
+    monkeypatch.setattr("worker_agent.union.client._install_device_auth_hooks", lambda _client: None)
+    client = FlyteUnionClient(UnionConfig.from_env({"UNION_AUTH_MODE": "device_flow"}))
+    client._initialized = True
+    client._set_auth_state("authenticated", last_verified_at=-100)
+
+    class Run:
+        @staticmethod
+        def listall(*, limit: int):
+            assert limit == 1
+            raise RuntimeError("connection reset by peer")
+
+    flyte_module = ModuleType("flyte")
+    flyte_module.__path__ = []
+    remote_module = ModuleType("flyte.remote")
+    remote_module.Run = Run
+    monkeypatch.setitem(sys.modules, "flyte", flyte_module)
+    monkeypatch.setitem(sys.modules, "flyte.remote", remote_module)
+
+    client.ensure_authentication_fresh(1)
+    assert client._auth_thread is not None
+    client._auth_thread.join(timeout=2)
+
+    state = client.auth_state()
+    assert state["status"] == "authenticated"
+    assert state["verification_error"] == "connection reset by peer"
+    assert client._initialized is True
 
 
 def test_union_container_task_runs_without_rebundling_baked_image(monkeypatch) -> None:
@@ -262,6 +333,44 @@ def test_safe_extract_rejects_path_traversal(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Unsafe path"):
         safe_extract(archive_path, tmp_path / "out")
+
+
+def test_result_storage_manifest_breaks_down_installed_job_files(tmp_path: Path) -> None:
+    job_dir = tmp_path / "jobs" / "job-1"
+    files = {
+        "results/exported_kpis.csv": b"k" * 11,
+        "results/exported_building_1.csv": b"t" * 17,
+        "checkpoints/latest_checkpoint.pth": b"c" * 23,
+        "logs/job-1.log": b"l" * 7,
+        "result.json": b"o" * 5,
+        ".worker/union-result.tar.gz": b"x" * 101,
+    }
+    for relative, content in files.items():
+        path = job_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    measured = measure_job_storage(job_dir)
+    manifest = write_result_storage_manifest(
+        job_dir,
+        transferred_bytes=29,
+        announced_unpacked_bytes=63,
+        announced_file_count=5,
+    )
+
+    assert measured["bytes"] == 63
+    assert measured["file_count"] == 5
+    assert measured["categories"] == {
+        "kpis": {"bytes": 11, "file_count": 1},
+        "timeseries": {"bytes": 17, "file_count": 1},
+        "checkpoints": {"bytes": 23, "file_count": 1},
+        "logs": {"bytes": 7, "file_count": 1},
+        "other": {"bytes": 5, "file_count": 1},
+    }
+    assert manifest["transfer"]["bytes"] == 29
+    assert manifest["installed"] == measured
+    persisted = json.loads((job_dir / ".worker" / "result-storage.json").read_text())
+    assert persisted == manifest
 
 
 def test_union_run_helpers_are_deterministic() -> None:
@@ -651,11 +760,52 @@ def test_union_executor_completes_fake_remote_run_and_installs_results(tmp_path:
     assert state["orchestrator_ack"] is True
     assert state["submitted"] is True
     assert state["union_run_id"] == deterministic_run_name(job_id, 1)
+    assert state["result_storage"]["transfer"]["bytes"] == result_archive.stat().st_size
+    assert state["result_storage"]["installed"]["categories"]["logs"]["file_count"] == 1
+    assert (job_dir / ".worker" / "result-storage.json").is_file()
     assert [status for _, status, _ in runtime.statuses][-1] == "finished"
     running = next(extra for _, status, extra in runtime.statuses if status == "running")
     assert running["details"]["started_at"] == 1000.0
     assert running["details"]["gpu_model"] == "NVIDIA H200"
     assert state["gpu_model"] == "NVIDIA H200"
+
+
+def test_union_remote_success_does_not_override_algorithm_failure(tmp_path: Path) -> None:
+    job_id = "01c427ce-union-runner-failed"
+    job_dir = tmp_path / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    config_path = job_dir / "config.resolved.yaml"
+    config_path.write_text("simulator: {}\n", encoding="utf-8")
+    (job_dir / "job_info.json").write_text(json.dumps({"job_id": job_id}), encoding="utf-8")
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+
+    class FailedRunnerClient(FakeUnionClient):
+        def stream_logs(self, run_name: str):
+            yield encode_event("started", 1, {"started_at": 1000.0})
+            yield encode_event("artifact", 2, {"artifact": self.artifact})
+            yield encode_event("terminal", 3, {"status": "failed", "exit_code": 1})
+
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=lambda config: FailedRunnerClient(config, result_archive),
+    )
+    executor.run_job(
+        {
+            "job_id": job_id,
+            "job_name": "union-runner-failed",
+            "config_path": f"jobs/{job_id}/config.resolved.yaml",
+            "image": "calof/opeva_simulator:sha-test",
+            "attempt_number": 1,
+            "env": {},
+        }
+    )
+
+    state = json.loads((job_dir / ".worker" / "union.json").read_text())
+    assert state["terminal_status"] == "failed"
+    assert state.get("compute_succeeded") is not True
+    assert runtime.statuses[-1][1] == "failed"
 
 
 def test_union_executor_aborts_superseded_attempt_before_starting_next(tmp_path: Path) -> None:
@@ -1266,7 +1416,7 @@ def test_union_executor_keeps_active_run_recoverable_during_device_reauthenticat
     def operation() -> str:
         executor.client.calls += 1
         if executor.client.calls == 1:
-            raise RuntimeError("rpc error: unauthenticated: token expired")
+            raise RuntimeError("the server has asked for the client to provide credentials")
         return "recovered"
 
     assert executor._retry_control_plane(state, "polling_run", operation) == "recovered"
@@ -1392,6 +1542,35 @@ def test_union_startup_defers_recovery_while_job_is_queued(tmp_path: Path) -> No
     assert holder["client"].submit_calls == 0
 
 
+def test_union_worker_consumes_durable_recovery_request(tmp_path: Path, monkeypatch) -> None:
+    job_id = "8c6222fd-durable-recovery-request"
+    state_dir = tmp_path / "jobs" / job_id / ".worker"
+    state_dir.mkdir(parents=True)
+    request_path = state_dir / "union-recovery-request.json"
+    request_path.write_text(
+        json.dumps({"action": "union_recover_job", "job_id": job_id, "request_id": "request-1"}),
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(tmp_path)
+    runtime.backend_status = "recovering"
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=lambda _config: object(),
+    )
+    started: list[str] = []
+    monkeypatch.setattr(
+        executor,
+        "_start_requested_recovery",
+        lambda requested_job_id: started.append(requested_job_id) or True,
+    )
+
+    executor._scan_recovery_requests_if_due(force=True)
+
+    assert started == [job_id]
+    assert not request_path.exists()
+
+
 def test_union_terminal_state_remains_recoverable_until_status_is_acknowledged(tmp_path: Path) -> None:
     job_id = "d4bbcb4a-f177-4435-b744-ad87eed93069"
     result_archive = _make_result_archive(tmp_path, job_id)
@@ -1479,3 +1658,214 @@ def test_union_artifact_cleanup_resumes_without_reinstalling_results(tmp_path: P
     persisted = json.loads((job_dir / ".worker" / "union.json").read_text())
     assert persisted["artifact_installed"] is True
     assert persisted["artifact_deleted"] is True
+
+
+def test_union_successful_compute_retries_local_recovery_without_failed_status(tmp_path: Path) -> None:
+    job_id = "f548ad74-b264-47e0-9609-durable-recovery"
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+    holder: dict[str, FakeUnionClient] = {}
+
+    def factory(config: UnionConfig) -> FakeUnionClient:
+        client = FakeUnionClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "FLYTE_API_KEY_FILE": str(tmp_path / "unused"),
+            "UNION_RECOVERY_RETRY_INTERVAL_SECONDS": "1",
+        },
+        client_factory=factory,
+        wait_fn=lambda _seconds: False,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "result_uri": "s3://bucket/run/result.tar.gz",
+        "union_phase": "ActionPhase.SUCCEEDED",
+        "compute_succeeded": True,
+        "compute_finished_at": 1234.0,
+    }
+    artifact = dict(holder["client"].artifact)
+    install_calls = 0
+
+    def install_with_transient_full_disk(current_state, _artifact, _log_path):
+        nonlocal install_calls
+        install_calls += 1
+        if install_calls == 1:
+            raise OSError(errno.ENOSPC, "temporary local space pressure")
+        current_state["artifact_installed"] = True
+        current_state["artifact_deleted"] = True
+        executor._save_state(current_state)
+
+    executor._wait_for_recovery_space = lambda *_args: None
+    executor._install_artifact = install_with_transient_full_disk
+
+    executor._recover_successful_result(state, artifact, runtime._prepare_log_file(job_id))
+
+    assert install_calls == 2
+    assert state["recovery_attempts"] == 1
+    assert state["terminal_status"] == "finished"
+    assert any(status == "recovering" for _, status, _ in runtime.statuses)
+    assert not any(status == "failed" for _, status, _ in runtime.statuses)
+
+
+def test_union_recovery_slot_serializes_result_installation(tmp_path: Path) -> None:
+    runtime = FakeRuntime(tmp_path)
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "FLYTE_API_KEY_FILE": str(tmp_path / "unused"),
+            "UNION_MAX_CONCURRENT_RECOVERIES": "1",
+        },
+        client_factory=lambda _config: object(),
+    )
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def hold_first_slot() -> None:
+        with executor._recovery_slot({"job_id": "recovery-1"}):
+            first_entered.set()
+            release_first.wait(timeout=2)
+
+    def wait_for_second_slot() -> None:
+        with executor._recovery_slot({"job_id": "recovery-2"}):
+            second_entered.set()
+
+    first = threading.Thread(target=hold_first_slot)
+    second = threading.Thread(target=wait_for_second_slot)
+    first.start()
+    assert first_entered.wait(timeout=1)
+    second.start()
+    assert not second_entered.wait(timeout=0.1)
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert second_entered.is_set()
+    assert executor._recovery_active == set()
+    assert executor._recovery_waiting == set()
+
+
+def test_union_recovery_space_includes_archive_extract_and_reserve(tmp_path: Path) -> None:
+    executor = UnionExecutor(
+        FakeRuntime(tmp_path),
+        env={
+            "FLYTE_API_KEY_FILE": str(tmp_path / "unused"),
+            "UNION_RECOVERY_MIN_FREE_GIB": "20",
+            "UNION_RECOVERY_UNKNOWN_SIZE_MULTIPLIER": "4",
+        },
+        client_factory=lambda _config: object(),
+    )
+
+    assert executor._required_recovery_space({"size": 100, "unpacked_size": 500}) == (
+        100,
+        500,
+        100 + 500 + 20 * 1024**3,
+    )
+    assert executor._required_recovery_space({"size": 100}) == (
+        100,
+        400,
+        100 + 400 + 20 * 1024**3,
+    )
+
+
+def test_union_stop_during_recovery_skips_download(tmp_path: Path) -> None:
+    job_id = "e3e45d1d-49ed-4dc5-8fdc-stop-recovery"
+    result_archive = _make_result_archive(tmp_path, job_id)
+    runtime = FakeRuntime(tmp_path)
+    runtime.backend_status = "stop_requested"
+
+    class StopRecoveryClient(FakeUnionClient):
+        def download_artifact(self, get_url: str, destination: Path) -> None:
+            raise AssertionError("stopped recovery must not download the result")
+
+    holder: dict[str, StopRecoveryClient] = {}
+
+    def factory(config: UnionConfig) -> StopRecoveryClient:
+        client = StopRecoveryClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=factory,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "result_uri": "s3://bucket/run/result.tar.gz",
+        "union_phase": "ActionPhase.SUCCEEDED",
+        "compute_succeeded": True,
+        "artifact": dict(holder["client"].artifact),
+    }
+
+    executor._recover_successful_result(
+        state,
+        dict(holder["client"].artifact),
+        runtime._prepare_log_file(job_id),
+    )
+
+    assert holder["client"].deleted is True
+    assert state.get("artifact_installed") is not True
+    assert state["terminal_status"] == "stopped"
+    assert runtime.statuses[-1][1] == "stopped"
+
+
+def test_union_stop_received_during_download_prevents_result_installation(tmp_path: Path) -> None:
+    job_id = "ef66323f-stop-after-download"
+    result_archive = _make_result_archive(tmp_path, job_id)
+
+    class StopAfterDownloadRuntime(FakeRuntime):
+        status_checks = 0
+
+        def _fetch_status(self, current_job_id: str) -> str:
+            self.status_checks += 1
+            return "running" if self.status_checks == 1 else "stop_requested"
+
+    runtime = StopAfterDownloadRuntime(tmp_path)
+    holder: dict[str, FakeUnionClient] = {}
+
+    def factory(config: UnionConfig) -> FakeUnionClient:
+        client = FakeUnionClient(config, result_archive)
+        holder["client"] = client
+        return client
+
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=factory,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "result_uri": "s3://bucket/run/result.tar.gz",
+        "compute_succeeded": True,
+    }
+
+    with pytest.raises(RuntimeError, match="stopped after download"):
+        executor._install_artifact(state, dict(holder["client"].artifact), runtime._prepare_log_file(job_id))
+
+    assert holder["client"].deleted is True
+    assert not (tmp_path / "jobs" / job_id / "results" / "result.json").exists()
+    assert state["terminal_status"] == "stopped"
+
+
+def test_union_result_merge_moves_files_without_a_second_copy(tmp_path: Path, monkeypatch) -> None:
+    job_id = "job-merge-move"
+    extracted = tmp_path / "staging"
+    source = extracted / "jobs" / job_id / "results"
+    source.mkdir(parents=True)
+    (source / "large.bin").write_bytes(b"payload")
+    shared = tmp_path / "shared"
+
+    monkeypatch.setattr(shutil, "copy2", lambda *_args, **_kwargs: pytest.fail("unexpected second copy"))
+
+    merge_job_results(extracted, shared, job_id)
+
+    assert (shared / "jobs" / job_id / "results" / "large.bin").read_bytes() == b"payload"
+    assert not (source / "large.bin").exists()

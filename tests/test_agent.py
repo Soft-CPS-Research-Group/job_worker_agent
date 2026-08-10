@@ -171,6 +171,32 @@ def test_run_job_success(tmp_path):
     assert docker_client.last_kwargs["labels"]["opeva.worker_id"] == "worker-a"
 
 
+def test_finished_job_writes_generic_result_storage_manifest(tmp_path):
+    shared_dir = tmp_path / "shared"
+    result_dir = shared_dir / "jobs" / "job-storage" / "results"
+    result_dir.mkdir(parents=True)
+    (result_dir / "exported_kpis.csv").write_bytes(b"kpi-data")
+    (result_dir / "checkpoint.pt").write_bytes(b"model-data")
+    session = DummySession()
+    agent = WorkerAgent(
+        server_url="http://server",
+        worker_id="worker-a",
+        shared_dir=str(shared_dir),
+        image="my-image",
+        session=session,
+        docker_client_factory=lambda: DummyDockerClient(DummyContainer()),
+    )
+
+    agent._post_status("job-storage", "finished", exit_code=0)
+
+    manifest_path = shared_dir / "jobs" / "job-storage" / ".worker" / "result-storage.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["transfer"]["bytes"] is None
+    assert manifest["installed"]["bytes"] == len(b"kpi-data") + len(b"model-data")
+    assert manifest["installed"]["categories"]["kpis"]["file_count"] == 1
+    assert manifest["installed"]["categories"]["checkpoints"]["file_count"] == 1
+
+
 def test_run_job_pulls_image_before_start(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKER_DOCKER_PULL_POLICY", "always")
     shared_dir = tmp_path / "shared"

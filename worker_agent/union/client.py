@@ -174,7 +174,59 @@ class FlyteUnionClient:
 
     def _set_auth_state(self, status: str, **extra: Any) -> None:
         with self._auth_lock:
-            self._auth_state = {"status": status, "updated_at": time.time(), **extra}
+            previous = dict(self._auth_state)
+            preserved = {
+                key: previous[key]
+                for key in ("last_verified_at", "verified_surfaces")
+                if key in previous
+            }
+            self._auth_state = {"status": status, "updated_at": time.time(), **preserved, **extra}
+
+    def mark_verified(self, surface: str) -> None:
+        if self.config.auth_mode != "device_flow":
+            return
+        now = time.time()
+        with self._auth_lock:
+            surfaces = dict(self._auth_state.get("verified_surfaces") or {})
+            surfaces[str(surface)] = now
+            self._auth_state = {
+                "status": "authenticated",
+                "updated_at": now,
+                "last_verified_at": now,
+                "verified_surfaces": surfaces,
+            }
+
+    def invalidate_authentication(self, exc: Exception) -> None:
+        if self.config.auth_mode != "device_flow":
+            return
+        self._initialized = False
+        previous = self.auth_state()
+        self._set_auth_state(
+            "authentication_required",
+            error=str(exc),
+            **{
+                key: previous[key]
+                for key in ("verification_url", "verification_url_complete", "user_code", "expires_at")
+                if key in previous
+            },
+        )
+
+    @staticmethod
+    def _is_authentication_error(exc: Exception) -> bool:
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) == 401:
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "unauthenticated",
+                "authentication failed",
+                "token expired",
+                "provide credentials",
+                "invalid api key",
+            )
+        )
 
     def _device_authorization_required(self, response: Any) -> None:
         verification_url = str(response.verification_uri)
@@ -208,11 +260,7 @@ class FlyteUnionClient:
         with self._auth_lock:
             if self._auth_thread and self._auth_thread.is_alive():
                 return False
-            self._auth_state = {
-                "status": "checking",
-                "request_id": request_id,
-                "updated_at": time.time(),
-            }
+            self._set_auth_state("checking", request_id=request_id)
             self._auth_thread = threading.Thread(
                 target=self._run_device_authentication,
                 name="union-device-auth",
@@ -220,6 +268,42 @@ class FlyteUnionClient:
             )
             self._auth_thread.start()
         return True
+
+    def ensure_authentication_fresh(self, max_age_seconds: int) -> None:
+        if self.config.auth_mode != "device_flow":
+            return
+        state = self.auth_state()
+        if state.get("status") != "authenticated":
+            return
+        last_verified = float(state.get("last_verified_at") or state.get("updated_at") or 0)
+        if time.time() - last_verified < max(1, int(max_age_seconds)):
+            return
+        with self._auth_lock:
+            if self._auth_thread and self._auth_thread.is_alive():
+                return
+            self._set_auth_state("checking", request_id="periodic-verification")
+            self._auth_thread = threading.Thread(
+                target=self._run_authentication_verification,
+                name="union-auth-verify",
+                daemon=True,
+            )
+            self._auth_thread.start()
+
+    def _run_authentication_verification(self) -> None:
+        try:
+            from flyte.remote import Run
+
+            next(iter(Run.listall(limit=1)), None)
+            self._initialized = True
+            self.mark_verified("api")
+        except Exception as exc:
+            if self._is_authentication_error(exc):
+                _LOGGER.warning("Union credentials are invalid; reopening Device Flow: %s", exc)
+                self.invalidate_authentication(exc)
+                self._run_device_authentication()
+            else:
+                _LOGGER.warning("Union credential verification was inconclusive: %s", exc)
+                self._set_auth_state("authenticated", verification_error=str(exc))
 
     def _run_device_authentication(self) -> None:
         try:
@@ -241,7 +325,7 @@ class FlyteUnionClient:
             # Force an authenticated control-plane call; flyte.init itself is lazy.
             next(iter(Run.listall(limit=1)), None)
             self._initialized = True
-            self._set_auth_state("authenticated")
+            self.mark_verified("api")
         except Exception as exc:
             _LOGGER.warning("Union device authentication did not complete: %s", exc)
             self._initialized = False

@@ -21,6 +21,7 @@ from .executors.base import BaseExecutor, StaleJobAttemptError
 from .executors.deucalion_executor import DeucalionExecutor
 from .executors.docker_executor import DockerExecutor
 from .executors.union_executor import UnionExecutor
+from .union.archive import write_result_storage_manifest
 from .version import __version__
 
 
@@ -610,6 +611,8 @@ class WorkerAgent:
         self._update_active_job(job_id, **updated_fields)
 
     def _post_status(self, job_id: str, status: str, **extra: object) -> bool:
+        if status == "finished":
+            self._ensure_result_storage_manifest(job_id)
         with self._state_lock:
             self._last_job_id = job_id
             if status in _TERMINAL_JOB_STATUSES:
@@ -640,6 +643,23 @@ class WorkerAgent:
         if not result["ok"] and result["retryable"] and status in _TERMINAL_JOB_STATUSES:
             self._enqueue_pending_terminal_status(payload)
         return bool(result["ok"])
+
+    def _ensure_result_storage_manifest(self, job_id: str) -> None:
+        job_dir = Path(self.shared_dir) / "jobs" / job_id
+        manifest_path = job_dir / ".worker" / "result-storage.json"
+        if not job_dir.is_dir() or manifest_path.is_file():
+            return
+        try:
+            write_result_storage_manifest(
+                job_dir,
+                transferred_bytes=None,
+                announced_unpacked_bytes=0,
+                announced_file_count=0,
+            )
+        except OSError as exc:
+            # Storage accounting is informative and must never turn a
+            # successful training run into a failed job.
+            _LOGGER.warning("Unable to measure result storage for job %s: %s", job_id, exc)
 
     def _fetch_status(self, job_id: str) -> Optional[str]:
         _LOGGER.info("GET /status/%s", job_id)

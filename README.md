@@ -24,7 +24,7 @@ queued jobs, executes workloads via the configured executor (`docker`,
   terminates the superseded Docker container, Slurm job or Union Run. Tokens
   are redacted from logs.
 
-Current package version: `0.5.3`. Release notes live in [`docs/releases.md`](docs/releases.md).
+Current package version: `0.5.4`. Release notes live in [`docs/releases.md`](docs/releases.md).
 
 ## Union INESC TEC mode
 
@@ -54,6 +54,11 @@ UNION_RUN_TIMEOUT_SECONDS=2592000
 UNION_ARTIFACT_REFRESH_ATTEMPTS=6
 UNION_UNREACHABLE_GRACE_SECONDS=900
 UNION_RETRY_MAX_BACKOFF_SECONDS=60
+UNION_AUTH_VERIFY_INTERVAL_SECONDS=300
+UNION_MAX_CONCURRENT_RECOVERIES=1
+UNION_RECOVERY_MIN_FREE_GIB=20
+UNION_RECOVERY_UNKNOWN_SIZE_MULTIPLIER=4
+UNION_RECOVERY_RETRY_INTERVAL_SECONDS=60
 ```
 
 `UNION_OBJECT_STORE_CA_FILE` is used only for S3 artifact traffic. Set the
@@ -66,9 +71,22 @@ run by deterministic job/attempt ID, including a restart during upload or
 submission. Temporary Union control-plane failures use bounded exponential
 backoff and keep the job in `setup` or `running`; they do not create a second
 run. Result installation, remote cleanup and final orchestrator acknowledgment
-are persisted as separate idempotent steps. Result metadata is retried with
-bounded backoff after a remote Run reaches terminal state, and final log merging
-streams large logs without loading them entirely into bridge memory.
+are persisted as separate idempotent steps. Successful remote compute moves
+the job to `recovering`; transfer failures keep retrying without rerunning
+Algorithms. A separate recovery limiter defaults to one result at a time;
+recovering jobs remain active within the worker's ten total slots. Expired
+signed URLs are refreshed and retried. Manual recovery requests are also
+persisted on shared storage so an orchestrator restart cannot lose them.
+Before download, compressed and uncompressed artifact metadata is checked
+against local free space plus a reserve. Final log merging streams large logs
+without loading them entirely into bridge memory, and extracted files are moved
+into place without creating another complete result copy.
+After every successful job, the worker writes
+`jobs/<job_id>/.worker/result-storage.json` with installed byte/file totals
+split into KPIs, time series, checkpoints, logs and other files. Union jobs
+also record the downloaded archive size. The manifest is rebuilt from the
+installed job directory if Union recovery resumes after the artifact was
+already installed.
 Union recovery state retains the dispatch attempt fields in its mode-`0600`
 state file so terminal delivery remains fenced after a bridge restart.
 In `device_flow` mode the Flyte keyring must be mounted from a persistent Docker
@@ -76,7 +94,9 @@ volume. The worker refreshes stored credentials automatically and advertises a
 browser URL/code in heartbeat telemetry only when user authentication is needed.
 The same hook covers refresh failure during run monitoring: the remote run is
 left intact, UI authentication is requested, and the blocked reconciliation
-call resumes after login.
+call resumes after login. Authenticated sessions are also verified periodically;
+the SDK reuses the persistent refresh token unless interactive login is truly
+required.
 API-key mode remains available by setting `UNION_AUTH_MODE=api_key` and mounting
 `FLYTE_API_KEY_FILE`. Secrets and CA files must not be baked into either image.
 

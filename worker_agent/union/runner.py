@@ -75,13 +75,26 @@ class S3Store:
         destination.parent.mkdir(parents=True, exist_ok=True)
         self.client.download_file(bucket, key, str(destination))
 
-    def upload(self, source: Path, uri: str, sha256: str) -> None:
+    def upload(
+        self,
+        source: Path,
+        uri: str,
+        sha256: str,
+        *,
+        unpacked_size: int | None = None,
+        file_count: int | None = None,
+    ) -> None:
         bucket, key = self.split_uri(uri)
+        metadata = {"opeva-sha256": sha256}
+        if unpacked_size is not None:
+            metadata["opeva-unpacked-size"] = str(max(0, int(unpacked_size)))
+        if file_count is not None:
+            metadata["opeva-file-count"] = str(max(0, int(file_count)))
         self.client.upload_file(
             str(source),
             bucket,
             key,
-            ExtraArgs={"Metadata": {"opeva-sha256": sha256}},
+            ExtraArgs={"Metadata": metadata},
         )
 
     def delete(self, uri: str) -> None:
@@ -104,7 +117,7 @@ class S3Store:
         bucket, key = self.split_uri(uri)
         head = self.client.head_object(Bucket=bucket, Key=key)
         metadata = head.get("Metadata") if isinstance(head, dict) else {}
-        return {
+        artifact = {
             "uri": uri,
             "size": int(head.get("ContentLength", 0)),
             "sha256": str((metadata or {}).get("opeva-sha256") or ""),
@@ -119,6 +132,15 @@ class S3Store:
                 ExpiresIn=expires,
             ),
         }
+        for metadata_key, artifact_key in (
+            ("opeva-unpacked-size", "unpacked_size"),
+            ("opeva-file-count", "file_count"),
+        ):
+            try:
+                artifact[artifact_key] = int((metadata or {}).get(metadata_key) or 0)
+            except (TypeError, ValueError):
+                artifact[artifact_key] = 0
+        return artifact
 
     def presign_put(self, uri: str, expires: int) -> str:
         bucket, key = self.split_uri(uri)
@@ -209,13 +231,29 @@ def _cancel_object_exists(store: S3Store, cancel_uri: str) -> bool:
         return False
 
 
-def _archive_job(data_root: Path, job_id: str, output: Path) -> None:
+def _job_tree_stats(job_dir: Path) -> tuple[int, int]:
+    total_size = 0
+    file_count = 0
+    for path in job_dir.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            total_size += path.stat().st_size
+        except OSError:
+            continue
+        file_count += 1
+    return total_size, file_count
+
+
+def _archive_job(data_root: Path, job_id: str, output: Path) -> tuple[int, int]:
     job_dir = data_root / "jobs" / job_id
     if not job_dir.is_dir():
         raise FileNotFoundError(f"Job directory was not created: {job_dir}")
+    unpacked_size, file_count = _job_tree_stats(job_dir)
     with tarfile.open(output, "w:gz") as archive:
         archive.dereference = True
         archive.add(job_dir, arcname=f"jobs/{job_id}", recursive=True)
+    return unpacked_size, file_count
 
 
 def _relay_log(log_path: Path, offset: int) -> int:
@@ -354,11 +392,17 @@ def run_job() -> int:
     finally:
         try:
             if (data_root / "jobs" / job_id).is_dir():
-                _archive_job(data_root, job_id, result_archive)
+                unpacked_size, file_count = _archive_job(data_root, job_id, result_archive)
                 digest = _sha256(result_archive)
                 _retry_store_operation(
                     "result upload",
-                    lambda: store.upload(result_archive, result_uri, digest),
+                    lambda: store.upload(
+                        result_archive,
+                        result_uri,
+                        digest,
+                        unpacked_size=unpacked_size,
+                        file_count=file_count,
+                    ),
                 )
                 artifact = _retry_store_operation(
                     "result metadata lookup",

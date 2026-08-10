@@ -49,6 +49,11 @@ class UnionConfig:
     status_update_interval_seconds: int
     unreachable_grace_seconds: int
     retry_max_backoff_seconds: int
+    auth_verify_interval_seconds: int
+    max_concurrent_recoveries: int
+    recovery_min_free_gib: int
+    recovery_unknown_size_multiplier: int
+    recovery_retry_interval_seconds: int
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "UnionConfig":
@@ -89,6 +94,23 @@ class UnionConfig:
             status_update_interval_seconds=_positive_int(env, "UNION_STATUS_UPDATE_INTERVAL_SECONDS", 30),
             unreachable_grace_seconds=_positive_int(env, "UNION_UNREACHABLE_GRACE_SECONDS", 900),
             retry_max_backoff_seconds=_positive_int(env, "UNION_RETRY_MAX_BACKOFF_SECONDS", 60),
+            auth_verify_interval_seconds=_positive_int(
+                env,
+                "UNION_AUTH_VERIFY_INTERVAL_SECONDS",
+                300,
+            ),
+            max_concurrent_recoveries=_positive_int(env, "UNION_MAX_CONCURRENT_RECOVERIES", 1),
+            recovery_min_free_gib=_positive_int(env, "UNION_RECOVERY_MIN_FREE_GIB", 20),
+            recovery_unknown_size_multiplier=_positive_int(
+                env,
+                "UNION_RECOVERY_UNKNOWN_SIZE_MULTIPLIER",
+                4,
+            ),
+            recovery_retry_interval_seconds=_positive_int(
+                env,
+                "UNION_RECOVERY_RETRY_INTERVAL_SECONDS",
+                60,
+            ),
         )
 
     def read_api_key(self) -> str:

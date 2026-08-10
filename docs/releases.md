@@ -29,6 +29,40 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.4 - 2026-08-10
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Separates successful Union compute from durable result recovery so temporary
+transfer, authentication or local-space failures do not turn completed training
+into failed jobs.
+
+### Changed
+
+- Publishes `recovering` after remote compute succeeds and retries result
+  reconciliation indefinitely without resubmitting Algorithms.
+- Supports operator-requested recovery from persisted Union state and resumes it
+  after bridge restarts.
+- Serializes large result installation with a dedicated limiter inside the ten active slots,
+  validates announced compressed/uncompressed sizes against local free space,
+  and avoids a second full result copy during installation.
+- Refreshes and retries expired signed object URLs and deletes the remote result
+  only after successful local installation.
+- Recognizes pod-log `provide credentials` failures, invalidates stale auth
+  telemetry and periodically verifies persisted Device Flow credentials.
+- Stops a recovering job without downloading its result.
+- Records installed result sizes by artefact category for every successful job;
+  Union jobs also record the downloaded archive size.
+- Worker version is now reported as `0.5.4`.
+
+### Validation
+
+- Union-focused tests cover durable retry, signed-URL refresh, auth recovery,
+  stop-without-download and copy-free installation.
+- `.venv/bin/pytest`: pass (`147 passed`).
+
 ## v0.5.3 - 2026-07-17
 
 Release owner: [@calofonseca](https://github.com/calofonseca).
