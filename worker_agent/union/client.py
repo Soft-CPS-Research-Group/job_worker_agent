@@ -229,6 +229,7 @@ class FlyteUnionClient:
         )
 
     def _device_authorization_required(self, response: Any) -> None:
+        previous = self.auth_state()
         verification_url = str(response.verification_uri)
         separator = "&" if "?" in verification_url else "?"
         self._set_auth_state(
@@ -237,6 +238,7 @@ class FlyteUnionClient:
             verification_url_complete=f"{verification_url}{separator}user_code={response.user_code}",
             user_code=str(response.user_code),
             expires_at=time.time() + int(response.expires_in),
+            **({"request_id": previous["request_id"]} if previous.get("request_id") else {}),
         )
 
     def _device_authorization_completed(self) -> None:
@@ -249,7 +251,13 @@ class FlyteUnionClient:
             error=str(exc),
             **{
                 key: previous[key]
-                for key in ("verification_url", "verification_url_complete", "user_code", "expires_at")
+                for key in (
+                    "verification_url",
+                    "verification_url_complete",
+                    "user_code",
+                    "expires_at",
+                    "request_id",
+                )
                 if key in previous
             },
         )
@@ -329,7 +337,12 @@ class FlyteUnionClient:
         except Exception as exc:
             _LOGGER.warning("Union device authentication did not complete: %s", exc)
             self._initialized = False
-            self._set_auth_state("authentication_required", error=str(exc))
+            previous = self.auth_state()
+            self._set_auth_state(
+                "authentication_required",
+                error=str(exc),
+                **({"request_id": previous["request_id"]} if previous.get("request_id") else {}),
+            )
 
     def initialize(self) -> None:
         if self._initialized:

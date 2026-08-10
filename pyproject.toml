@@ -1,6 +1,6 @@
 [project]
 name = "job-worker-agent"
-version = "0.5.4"
+version = "0.5.5"
 description = "Worker agent for the OPEVA job queue"
 authors = [
     {name = "OPEVA Team"}
@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 union = [
     "flyte==2.5.8",
+    "pyqwest==0.6.2",
     "keyrings.alt>=5.0",
     "boto3>=1.35",
     "kubernetes>=31.0",

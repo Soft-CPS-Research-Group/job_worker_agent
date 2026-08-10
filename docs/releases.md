@@ -29,6 +29,27 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.5 - 2026-08-10
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Restores Union control-plane TLS compatibility after an unbounded transitive
+HTTP client upgrade caused valid hosted certificates to fail with
+`UnknownIssuer` inside the bridge image.
+
+### Changed
+
+- Pins `pyqwest` to the previously validated `0.6.2` release used by the live
+  Union integration tests.
+- Worker version is now reported as `0.5.5`.
+
+### Validation
+
+- Builds the dedicated Union image and verifies the installed dependency set.
+- Runs the complete worker test suite.
+
 ## v0.5.4 - 2026-08-10
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

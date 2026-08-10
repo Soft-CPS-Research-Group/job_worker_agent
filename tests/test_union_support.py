@@ -106,11 +106,12 @@ def test_device_auth_state_reopens_and_recovers_during_active_calls(monkeypatch)
         expires_in = 600
 
     client._initialized = True
-    client._set_auth_state("authenticated")
+    client._set_auth_state("checking", request_id="request-1")
     client._device_authorization_required(DeviceResponse())
 
     required = client.auth_state()
     assert required["status"] == "authentication_required"
+    assert required["request_id"] == "request-1"
     assert required["verification_url_complete"].endswith("user_code=ABCD-EFGH")
 
     client._device_authorization_completed()
