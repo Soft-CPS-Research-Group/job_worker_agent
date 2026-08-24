@@ -471,6 +471,7 @@ class FakeRuntime:
         self.statuses: list[tuple[str, str, dict]] = []
         self.active: dict[str, dict] = {}
         self.backend_status = "running"
+        self.backend_exists: bool | None = True
         self.bound_attempts: dict[str, dict] = {}
 
     def _bind_job_attempt(self, job: dict) -> None:
@@ -482,6 +483,9 @@ class FakeRuntime:
 
     def _fetch_status(self, job_id: str) -> str:
         return self.backend_status
+
+    def _fetch_status_with_presence(self, job_id: str) -> tuple[str | None, bool | None]:
+        return self.backend_status, self.backend_exists
 
     def _send_heartbeat(self, force: bool = False) -> None:
         return None
@@ -1601,6 +1605,51 @@ def test_union_startup_defers_recovery_while_job_is_queued(tmp_path: Path) -> No
     assert executor._recovery_threads == {}
     assert runtime.active == {}
     assert holder["client"].submit_calls == 0
+
+
+def test_union_startup_retires_state_for_deleted_orchestrator_job(tmp_path: Path) -> None:
+    job_id = "deleted-union-job"
+    state_dir = tmp_path / "jobs" / job_id / ".worker"
+    state_dir.mkdir(parents=True)
+    state_path = state_dir / "union.json"
+    request_path = state_dir / "union-recovery-request.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "job_id": job_id,
+                "run_name": deterministic_run_name(job_id, 1),
+                "terminal": False,
+                "orchestrator_ack": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_path.write_text(
+        json.dumps({"job_id": job_id, "request_id": "deleted-request"}),
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(tmp_path)
+    runtime.backend_status = None
+    runtime.backend_exists = False
+    executor = UnionExecutor(
+        runtime,
+        env={"FLYTE_API_KEY_FILE": str(tmp_path / "unused")},
+        client_factory=lambda _config: object(),
+    )
+
+    executor.on_startup()
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["terminal"] is True
+    assert persisted["orchestrator_ack"] is True
+    assert persisted["orchestrator_status"] == "deleted"
+    assert persisted["terminal_stage"] == "union:orchestrator_job_missing"
+    assert persisted["recovery_status"] == "discarded"
+    assert executor._recovery_threads == {}
+    assert runtime.active == {}
+    assert runtime.statuses == []
+    assert not request_path.exists()
 
 
 def test_union_worker_consumes_durable_recovery_request(tmp_path: Path, monkeypatch) -> None:

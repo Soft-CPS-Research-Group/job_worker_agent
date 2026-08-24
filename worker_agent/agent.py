@@ -661,19 +661,23 @@ class WorkerAgent:
             # successful training run into a failed job.
             _LOGGER.warning("Unable to measure result storage for job %s: %s", job_id, exc)
 
-    def _fetch_status(self, job_id: str) -> Optional[str]:
+    def _fetch_status_with_presence(self, job_id: str) -> tuple[Optional[str], Optional[bool]]:
         _LOGGER.info("GET /status/%s", job_id)
         try:
             with self._session_lock:
                 response = self._session.get(f"{self.server_url}/status/{job_id}", timeout=10)
             if response.status_code == 404:
-                return None
+                return None, False
             response.raise_for_status()
             payload = response.json()
-            return payload.get("status")
+            return payload.get("status"), True
         except requests.RequestException as exc:  # pragma: no cover
             _LOGGER.warning("Failed to fetch status for %s: %s", job_id, exc)
-            return None
+            return None, None
+
+    def _fetch_status(self, job_id: str) -> Optional[str]:
+        status, _exists = self._fetch_status_with_presence(job_id)
+        return status
 
     # ------------------------------------------------------------------
     # Shared helpers

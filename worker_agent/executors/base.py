@@ -28,6 +28,10 @@ class WorkerRuntime(Protocol):
     def _fetch_status(self, job_id: str) -> str | None:
         ...
 
+    def _fetch_status_with_presence(self, job_id: str) -> tuple[str | None, bool | None]:
+        """Return the status and whether the orchestrator confirmed the job exists."""
+        ...
+
     def _send_heartbeat(self, force: bool = False) -> None:
         ...
 

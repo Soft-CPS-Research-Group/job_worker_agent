@@ -29,6 +29,29 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.7 - 2026-08-24
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Prevents deleted orchestrator jobs from being recovered again from stale local
+Union state after a worker restart.
+
+### Changed
+
+- Distinguishes a confirmed orchestrator `404` from a temporary status lookup
+  failure.
+- Retires local Union recovery state only when the orchestrator confirms that
+  the corresponding terminal job was deleted.
+- Removes durable recovery requests for deleted jobs, avoiding repeated status
+  reports and startup `404` warnings.
+
+### Validation
+
+- Adds regression coverage for deleted Union recovery state.
+- Runs the complete worker test suite.
+
 ## v0.5.6 - 2026-08-24
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

@@ -181,6 +181,29 @@ class UnionExecutor(BaseExecutor):
         except FileNotFoundError:
             pass
 
+    def _fetch_backend_status_with_presence(self, job_id: str) -> tuple[str | None, bool | None]:
+        lookup = getattr(self.runtime, "_fetch_status_with_presence", None)
+        if callable(lookup):
+            return lookup(job_id)
+        status = self.runtime._fetch_status(job_id)
+        return status, True if status is not None else None
+
+    def _retire_missing_job_state(self, state: dict[str, Any]) -> None:
+        job_id = str(state["job_id"])
+        state["terminal"] = True
+        state["orchestrator_ack"] = True
+        state["orchestrator_status"] = "deleted"
+        state["orchestrator_missing_at"] = self.now_fn()
+        state.setdefault("terminal_status", "canceled")
+        state["terminal_stage"] = "union:orchestrator_job_missing"
+        state["recovery_status"] = "discarded"
+        self._save_state(state)
+        self._clear_recovery_request(job_id)
+        _LOGGER.info(
+            "Ignoring persisted Union state for deleted orchestrator job %s",
+            job_id,
+        )
+
     def _scan_recovery_requests_if_due(self, *, force: bool = False) -> None:
         now = self.now_fn()
         interval = max(5, min(30, self.config.recovery_retry_interval_seconds))
@@ -198,7 +221,14 @@ class UnionExecutor(BaseExecutor):
                 if not isinstance(request, dict):
                     continue
                 job_id = str(request.get("job_id") or request_path.parents[1].name)
-                if self.runtime._fetch_status(job_id) != "recovering":
+                backend_status, backend_exists = self._fetch_backend_status_with_presence(job_id)
+                if backend_exists is False:
+                    state = self._load_state(job_id)
+                    if state:
+                        self._retire_missing_job_state(state)
+                    self._clear_recovery_request(job_id, str(request.get("request_id") or ""))
+                    continue
+                if backend_status != "recovering":
                     continue
                 if self._start_requested_recovery(job_id):
                     self._clear_recovery_request(job_id, str(request.get("request_id") or ""))
@@ -435,7 +465,10 @@ class UnionExecutor(BaseExecutor):
             if not isinstance(state, dict) or not state.get("run_name"):
                 continue
             job_id = str(state.get("job_id") or state_path.parents[1].name)
-            backend_status = self.runtime._fetch_status(job_id)
+            backend_status, backend_exists = self._fetch_backend_status_with_presence(job_id)
+            if backend_exists is False:
+                self._retire_missing_job_state(state)
+                continue
             if backend_status == "recovering" and state.get("terminal_status") == "failed":
                 self._reset_recovery_state(state)
             if state.get("terminal") is True and state.get("orchestrator_ack") is True:
