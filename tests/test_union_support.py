@@ -681,6 +681,66 @@ def test_union_log_pump_reconnects_and_resumes_from_persisted_cursor(tmp_path: P
     assert json.loads(progress_path.read_text(encoding="utf-8"))["progress_pct"] == 50
 
 
+def test_union_log_auth_error_does_not_invalidate_control_plane_session(tmp_path: Path) -> None:
+    job_id = "job-pod-log-auth"
+    runtime = FakeRuntime(tmp_path)
+
+    class PodLogAuthClient:
+        def __init__(self, _config: UnionConfig) -> None:
+            self.calls = 0
+            self.invalidations = 0
+            self.auth_starts = 0
+            self.state = {"status": "authenticated"}
+
+        def stream_logs(self, _run_name: str):
+            self.calls += 1
+            raise RuntimeError(
+                "the server has asked for the client to provide credentials (pods/log)"
+            )
+            yield  # pragma: no cover
+
+        def auth_state(self) -> dict:
+            return dict(self.state)
+
+        def invalidate_authentication(self, _exc: Exception) -> None:
+            self.invalidations += 1
+            self.state = {"status": "authentication_required"}
+
+        def start_device_authentication(self, _request_id=None) -> bool:
+            self.auth_starts += 1
+            return True
+
+    executor = UnionExecutor(
+        runtime,
+        env={
+            "UNION_AUTH_MODE": "device_flow",
+            "UNION_POLL_INTERVAL_SECONDS": "1",
+            "UNION_RETRY_MAX_BACKOFF_SECONDS": "1",
+        },
+        client_factory=PodLogAuthClient,
+    )
+    state = {
+        "job_id": job_id,
+        "run_name": deterministic_run_name(job_id, 1),
+        "last_event_sequence": 0,
+        "log_line_count": 0,
+    }
+    log_path = runtime._prepare_log_file(job_id)
+
+    thread, result, stop_event = executor._start_log_pump(state, log_path)
+    deadline = time.monotonic() + 2
+    while executor.client.calls < 1 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    stop_event.set()
+    thread.join(timeout=2)
+
+    assert result["error"] is not None
+    assert executor.client.calls >= 1
+    assert executor.client.invalidations == 0
+    assert executor.client.auth_starts == 0
+    assert executor.client.auth_state()["status"] == "authenticated"
+
+
 @pytest.mark.parametrize(
     ("phase", "normalized", "terminal"),
     [

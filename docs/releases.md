@@ -29,6 +29,27 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.5.6 - 2026-08-24
+
+Release owner: [@calofonseca](https://github.com/calofonseca).
+
+### Summary
+
+Prevents best-effort Union pod-log authorization failures from repeatedly
+invalidating an otherwise healthy control-plane session during active runs.
+
+### Changed
+
+- Keeps Run polling and submission authentication authoritative for the global
+  Union authentication state.
+- Pod-log and final-log authorization errors now reconnect independently
+  without forcing Device Flow or temporarily blocking new submissions.
+
+### Validation
+
+- Adds a regression test for `pods/log` credential errors.
+- Runs the complete worker test suite.
+
 ## v0.5.5 - 2026-08-10
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

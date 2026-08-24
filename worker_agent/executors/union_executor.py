@@ -907,8 +907,9 @@ class UnionExecutor(BaseExecutor):
                 return
             except Exception as exc:
                 last_error = exc
-                if self._is_authentication_error(exc):
-                    self._handle_authentication_error(exc)
+                # Pod-log authorization is a separate Union/Kubernetes surface.
+                # Invalidating the control-plane session here makes healthy Run
+                # polling flap while a best-effort log stream is unavailable.
                 if attempt < 2:
                     self.wait_fn(2)
         if last_error is not None:
@@ -939,8 +940,6 @@ class UnionExecutor(BaseExecutor):
                         self._handle_log_line(state, log_path, str(line))
                 except Exception as exc:  # remote logs are best effort; artifacts remain authoritative
                     result["error"] = exc
-                    if self._is_authentication_error(exc):
-                        self._handle_authentication_error(exc)
                     _LOGGER.warning(
                         "Union log stream interrupted for %s; reconnecting: %s",
                         state["job_id"],
