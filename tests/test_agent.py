@@ -10,6 +10,28 @@ from worker_agent.agent import WorkerAgent
 from worker_agent.executors.base import StaleJobAttemptError
 
 
+def test_worker_keeps_logs_and_storage_manifest_in_its_own_attempt(tmp_path):
+    agent = WorkerAgent('http://unused', 'isolated', str(tmp_path), 'test', session=DummySession(), docker_client_factory=lambda: None)
+    relative = 'jobs/logical/.attempts/1/jobs/logical'
+    root = tmp_path / relative
+    root.mkdir(parents=True)
+    agent._bind_job_attempt({'job_id':'logical','attempt_number':1,'attempt_token':'secret',
+                            'artifact_protocol':'attempt_artifacts_v1','artifact_job_dir':relative})
+    log=agent._prepare_log_file('logical')
+    assert log==root/'logs/logical.log'
+    (root/'bundle').mkdir();(root/'bundle/model.onnx').write_bytes(b'old attempt')
+    agent._ensure_result_storage_manifest('logical')
+    assert (root/'.worker/result-storage.json').is_file()
+    assert not (tmp_path/'jobs/logical/.worker/result-storage.json').exists()
+    assert 'attempt_artifacts_v1' in agent._capabilities()
+
+
+def test_worker_rejects_attempt_output_outside_job(tmp_path):
+    agent = WorkerAgent('http://unused', 'isolated', str(tmp_path), 'test', session=DummySession(), docker_client_factory=lambda: None)
+    with pytest.raises(ValueError,match='outside'):
+        agent._bind_job_attempt({'job_id':'logical','artifact_protocol':'attempt_artifacts_v1','artifact_job_dir':'jobs/foreign'})
+
+
 class DummyResponse:
     def __init__(self, status_code, data=None):
         self.status_code = status_code

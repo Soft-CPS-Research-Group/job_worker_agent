@@ -81,6 +81,7 @@ class WorkerAgent:
         self._session_lock = threading.Lock()
         self._active_jobs: dict[str, dict[str, Any]] = {}
         self._job_attempts: dict[str, dict[str, Any]] = {}
+        self._job_artifact_dirs: dict[str, str] = {}
         self._job_threads: dict[str, threading.Thread] = {}
         self._last_job_id: Optional[str] = None
         self._last_terminal_status: Optional[str] = None
@@ -163,6 +164,14 @@ class WorkerAgent:
         token = job.get("attempt_token")
         attempt_number = job.get("attempt_number")
         with self._state_lock:
+            relative = job.get('artifact_job_dir')
+            if relative and job.get('artifact_protocol') == 'attempt_artifacts_v1':
+                root = (Path(self.shared_dir) / 'jobs' / job_id).resolve()
+                if not (Path(self.shared_dir) / relative).resolve().is_relative_to(root):
+                    raise ValueError('Artifact directory is outside its job')
+                self._job_artifact_dirs[job_id] = str(relative)
+            else:
+                self._job_artifact_dirs.pop(job_id, None)
             if isinstance(token, str) and token and isinstance(attempt_number, int) and not isinstance(attempt_number, bool):
                 self._job_attempts[job_id] = {
                     "attempt_token": token,
@@ -175,6 +184,7 @@ class WorkerAgent:
         with self._state_lock:
             self._active_jobs.pop(job_id, None)
             self._job_attempts.pop(job_id, None)
+            self._job_artifact_dirs.pop(job_id, None)
 
     def _update_active_job(self, job_id: str, **fields: object) -> None:
         with self._state_lock:
@@ -228,7 +238,7 @@ class WorkerAgent:
         info: Dict[str, Any] = {
             "executor": self.executor,
             "worker_version": self._worker_version,
-            "capabilities": list(_WORKER_CAPABILITIES),
+            "capabilities": self._capabilities(),
             "gpu_enabled": self._gpu_request_enabled,
             "gpu_required": self._gpu_request_required,
             "shared_dir": self.shared_dir,
@@ -557,7 +567,7 @@ class WorkerAgent:
     def _request_next_job(self) -> Optional[Dict[str, Any]]:
         request_payload = {
             "worker_id": self.worker_id,
-            "capabilities": list(_WORKER_CAPABILITIES),
+            "capabilities": self._capabilities(),
         }
         _LOGGER.info("POST /api/agent/next-job payload=%s", request_payload)
         try:
@@ -645,7 +655,7 @@ class WorkerAgent:
         return bool(result["ok"])
 
     def _ensure_result_storage_manifest(self, job_id: str) -> None:
-        job_dir = Path(self.shared_dir) / "jobs" / job_id
+        job_dir = self._artifact_directory(job_id)
         manifest_path = job_dir / ".worker" / "result-storage.json"
         if not job_dir.is_dir() or manifest_path.is_file():
             return
@@ -681,6 +691,14 @@ class WorkerAgent:
 
     # ------------------------------------------------------------------
     # Shared helpers
+    def _capabilities(self) -> list[str]:
+        return [*_WORKER_CAPABILITIES, *(['attempt_artifacts_v1'] if self.executor == 'docker' else [])]
+
+    def _artifact_directory(self, job_id: str) -> Path:
+        with self._state_lock:
+            relative = self._job_artifact_dirs.get(job_id)
+        return Path(self.shared_dir) / relative if relative else Path(self.shared_dir) / 'jobs' / job_id
+
     def _build_command(self, job_id: str, config_path: str) -> str:
         return f"--config /data/{config_path} --job_id {job_id}"
 
@@ -746,7 +764,7 @@ class WorkerAgent:
 
     def _prepare_log_file(self, job_id: str) -> Path:
         jobs_dir = Path(self.shared_dir) / "jobs"
-        job_dir = jobs_dir / job_id
+        job_dir = self._artifact_directory(job_id)
         logs_dir = job_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = logs_dir / f"{job_id}.log"

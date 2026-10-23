@@ -29,6 +29,18 @@ Default release owner: [@calofonseca](https://github.com/calofonseca).
    - `calof/job_worker_agent:latest` from `main`
    - `calof/job_worker_agent:vX.Y.Z` from release tags
 
+## v0.6.0 - 2026-10-23
+
+Docker workers advertise `attempt_artifacts_v1`. When the orchestrator supplies
+an isolated attempt directory, worker logs and storage manifests remain in that
+same directory, including delayed completion updates. The command provided by the
+orchestrator selects the corresponding runtime output root. Existing status
+fences continue to reject revoked attempts.
+
+Orchestrator 1.3.0 enables the capability for newly dispatched jobs. Older
+orchestrators and other executor types keep the previous behaviour. Drain active
+jobs before replacing a worker container; no historical output migration is needed.
+
 ## v0.5.7 - 2026-08-24
 
 Release owner: [@calofonseca](https://github.com/calofonseca).
