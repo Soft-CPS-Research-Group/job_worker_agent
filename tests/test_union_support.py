@@ -35,6 +35,32 @@ from worker_agent.union.events import encode_event, parse_event
 from worker_agent.union.runner import _cancel_object_exists, _read_gpu_model, _retry_store_operation
 
 
+@pytest.fixture(autouse=True)
+def simulated_recovery_disk(monkeypatch):
+    # These are fake remote runs; do not wait for a hosted CI runner to have
+    # the production 20 GiB reserve. Space-pressure tests override this probe.
+    monkeypatch.setattr(shutil, 'disk_usage', lambda _path: SimpleNamespace(
+        total=1024**4, used=0, free=1024**4))
+
+
+def test_union_recovery_reports_insufficient_space_then_resumes(tmp_path, monkeypatch):
+    runtime = FakeRuntime(tmp_path)
+    waits = []
+    executor = UnionExecutor(runtime, env={'FLYTE_API_KEY_FILE': str(tmp_path/'unused')},
+                             client_factory=lambda _config: object(), wait_fn=lambda seconds: waits.append(seconds))
+    state = {'job_id': 'space-recovery', 'run_name': 'space-recovery'}
+    runtime._prepare_log_file(state['job_id'])
+    artifact = {'size': 10, 'unpacked_size': 20}
+    required = executor._required_recovery_space(artifact)[2]
+    free = iter([required-1, required])
+    monkeypatch.setattr(shutil, 'disk_usage', lambda _path: SimpleNamespace(free=next(free)))
+    executor._wait_for_recovery_space(state, artifact)
+    assert len(waits) == 1
+    assert any('Insufficient local space' in str(fields) for _, _, fields in runtime.statuses)
+    assert state['recovery_status'] == 'downloading'
+    assert runtime.statuses[-1][2]['details']['recovery_free_bytes'] == required
+
+
 def test_union_config_reads_headless_defaults(tmp_path: Path) -> None:
     key = tmp_path / "key"
     key.write_text("secret-key\n", encoding="utf-8")
