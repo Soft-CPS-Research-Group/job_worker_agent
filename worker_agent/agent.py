@@ -672,11 +672,10 @@ class WorkerAgent:
             _LOGGER.warning("Unable to measure result storage for job %s: %s", job_id, exc)
 
     def _fetch_status_with_presence(self, job_id: str) -> tuple[Optional[str], Optional[bool]]:
-        _LOGGER.info("GET /status/%s", job_id)
+        _LOGGER.info("GET /api/agent/status/%s", job_id)
         try:
             with self._session_lock:
-                prefix = "/api/agent/status" if os.getenv("WORKER_EXECUTION_API_V1") == "1" else "/status"
-                response = self._session.get(f"{self.server_url}{prefix}/{job_id}", timeout=10)
+                response = self._session.get(f"{self.server_url}/api/agent/status/{job_id}", timeout=10)
             if response.status_code == 404:
                 return None, False
             response.raise_for_status()

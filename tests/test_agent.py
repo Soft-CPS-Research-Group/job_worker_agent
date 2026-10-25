@@ -1048,3 +1048,12 @@ def test_heartbeat_payload_counts_union_provisioning_separately_from_running():
     assert info["provisioning_job_count"] == 1
     running = next(row for row in info["active_jobs"] if row["job_id"] == "job-b")
     assert running["gpu_model"] == "NVIDIA H200"
+
+
+def test_status_uses_worker_control_api_without_transition_flag(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORKER_EXECUTION_API_V1", raising=False)
+    session = DummySession()
+    agent = WorkerAgent("http://orchestrator", "test", str(tmp_path), "test", session=session, docker_client_factory=lambda: None)
+    session.status_responses.append("running")
+    assert agent._fetch_status("example") == "running"
+    assert session.calls[-1]["url"] == "http://orchestrator/api/agent/status/example"

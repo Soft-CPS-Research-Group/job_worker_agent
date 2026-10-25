@@ -24,7 +24,7 @@ VPN_CONNECTION=deinet
 VPN_REQUIRED=1
 VPN_WATCHDOG=1
 VPN_TARGET=193.136.62.78
-WORKER_AGENT_IMAGE=job_worker_agent:local
+WORKER_AGENT_IMAGE=calof/job_worker_agent:<published-0.7.0-commit>
 WORKER_JOB_IMAGE=calof/opeva_simulator:latest
 WORKER_EXECUTOR=docker
 WORKER_ENABLE_GPU=true
@@ -110,3 +110,5 @@ sudo scripts/local_worker.sh vpn
   Se os secrets estiverem presos ao user keyring da sessao grafica, o `serve`
   vai falhar ao executar `nmcli connection up`.
 - `WORKER_REQUIRE_GPU=true` evita fallback silencioso para CPU.
+
+The worker uses the current control API without a compatibility environment flag. Pin a published image digest/commit in the private local environment. If NFS returns access denied, compare the current VPN source address with the server export ACL; the VPN may use 10.4.* rather than the older 10.8.* range.
